@@ -109,6 +109,25 @@ function nonEmpty(value: unknown): string | null {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
 }
 
+/**
+ * Select an assistant-stream chunk WITHOUT trimming whitespace.
+ *
+ * OpenClaw streams the assistant message token-by-token, and LLM tokenizers
+ * carry the inter-word space as a LEADING char on the next token
+ * (`"Planning"`, `" work"`, `" completed"`). These chunks are later
+ * concatenated with `join("")`, so trimming each chunk here would delete every
+ * inter-word/bullet/newline space and store `"Planningworkcompleted"`. Only
+ * the final joined summary is trimmed (once). Guard on non-empty string
+ * presence rather than `nonEmpty()` (which trims) so whitespace survives.
+ */
+export function pickAssistantChunk(data: { delta?: unknown; text?: unknown }): string | null {
+  const delta =
+    typeof data.delta === "string" && data.delta.length > 0 ? data.delta : null;
+  if (delta) return delta;
+  const text = typeof data.text === "string" && data.text.length > 0 ? data.text : null;
+  return text;
+}
+
 function parseOptionalPositiveInteger(value: unknown): number | null {
   if (typeof value === "number" && Number.isFinite(value)) {
     return Math.max(1, Math.floor(value));
@@ -1220,12 +1239,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       );
 
       if (stream === "assistant") {
-        const delta = nonEmpty(data.delta);
-        const text = nonEmpty(data.text);
-        if (delta) {
-          assistantChunks.push(delta);
-        } else if (text) {
-          assistantChunks.push(text);
+        const chunk = pickAssistantChunk(data);
+        if (chunk) {
+          assistantChunks.push(chunk);
         }
         return;
       }
