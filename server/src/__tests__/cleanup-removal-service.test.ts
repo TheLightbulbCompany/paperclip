@@ -6,6 +6,8 @@ import {
   agents,
   companies,
   companySkills,
+  companySkillTestRuns,
+  companySkillVersions,
   costEvents,
   createDb,
   documents,
@@ -54,6 +56,8 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await db.delete(issueExecutionDecisions);
     await db.delete(documentRevisions);
     await db.delete(documents);
+    await db.delete(companySkillTestRuns);
+    await db.delete(companySkillVersions);
     await db.delete(companySkills);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
@@ -346,6 +350,38 @@ describeEmbeddedPostgres("cleanup removal services", () => {
       createdByUserId: "user-1",
     });
 
+    // company_skill_test_runs.issueId is notNull with ON DELETE restrict (new
+    // in 2026.7 Skill Studio). Without clearing it the delete throws on the
+    // company_skill_test_runs_issue_id_issues_id_fk constraint and returns 500.
+    const skillId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: "paperclipai/paperclip/skill-studio",
+      slug: "skill-studio",
+      name: "Skill Studio",
+      markdown: "# Skill Studio",
+    });
+
+    const skillVersionId = randomUUID();
+    await db.insert(companySkillVersions).values({
+      id: skillVersionId,
+      companyId,
+      companySkillId: skillId,
+      revisionNumber: 1,
+    });
+
+    const testRunId = randomUUID();
+    await db.insert(companySkillTestRuns).values({
+      id: testRunId,
+      companyId,
+      skillId,
+      inputSnapshot: "input",
+      skillVersionId,
+      agentId,
+      issueId,
+    });
+
     // Without clearing these first the delete throws on the
     // issue_comments_issue_id_issues_id_fk constraint (and the sibling
     // no-ON-DELETE FKs) and DELETE /api/issues/:id returns 500.
@@ -355,6 +391,11 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(issues).where(eq(issues.id, issueId))).resolves.toHaveLength(0);
     await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(0);
     await expect(db.select().from(issueReadStates).where(eq(issueReadStates.issueId, issueId))).resolves.toHaveLength(0);
+
+    // The skill-test run row is gone (it cannot survive — issueId is notNull).
+    await expect(
+      db.select().from(companySkillTestRuns).where(eq(companySkillTestRuns.issueId, issueId)),
+    ).resolves.toHaveLength(0);
 
     // Ledger rows survive with the issue reference detached.
     const [costEvent] = await db.select().from(costEvents).where(eq(costEvents.id, costEventId));

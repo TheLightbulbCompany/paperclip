@@ -40,6 +40,7 @@ import {
   assets,
   companies,
   companyMemberships,
+  companySkillTestRuns,
   documentRevisions,
   documents,
   goals,
@@ -11194,6 +11195,11 @@ export function issueService(db: Db) {
           .select({ documentId: issueDocuments.documentId })
           .from(issueDocuments)
           .where(eq(issueDocuments.issueId, id));
+
+        // company_skill_test_runs.issueId is notNull with ON DELETE restrict
+        // (Skill Studio), so the harness run rows must be deleted before the
+        // issue row — detaching is not possible on a notNull column.
+        await tx.delete(companySkillTestRuns).where(eq(companySkillTestRuns.issueId, id));
 
         // Isol8: sub-issues reference the parent through a self-FK with no
         // ON DELETE rule. Promote them to top-level issues rather than 409ing
