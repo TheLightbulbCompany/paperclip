@@ -6,6 +6,7 @@ import {
   agents,
   companies,
   companySkills,
+  costEvents,
   createDb,
   documents,
   documentRevisions,
@@ -24,6 +25,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.ts";
 import { companyService } from "../services/companies.ts";
+import { issueService } from "../services/issues.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -46,6 +48,7 @@ describeEmbeddedPostgres("cleanup removal services", () => {
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
+    await db.delete(costEvents);
     await db.delete(issueReadStates);
     await db.delete(issueComments);
     await db.delete(issueExecutionDecisions);
@@ -299,5 +302,66 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(routines).where(eq(routines.id, routineId))).resolves.toHaveLength(0);
     await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
     await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
+  });
+
+  it("deletes an issue that has comments, read states, cost events, and sub-issues", async () => {
+    const { agentId, companyId, issueId } = await seedFixture();
+
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      authorUserId: "user-1",
+      body: "Comment that used to block the delete",
+    });
+
+    await db.insert(issueReadStates).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      userId: "user-1",
+    });
+
+    const costEventId = randomUUID();
+    await db.insert(costEvents).values({
+      id: costEventId,
+      companyId,
+      agentId,
+      issueId,
+      provider: "bedrock",
+      model: "sonnet",
+      costCents: 12,
+      occurredAt: new Date(),
+    });
+
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      parentId: issueId,
+      title: "Sub-issue",
+      status: "todo",
+      priority: "medium",
+      createdByUserId: "user-1",
+    });
+
+    // Without clearing these first the delete throws on the
+    // issue_comments_issue_id_issues_id_fk constraint (and the sibling
+    // no-ON-DELETE FKs) and DELETE /api/issues/:id returns 500.
+    const removed = await issueService(db).remove(issueId);
+
+    expect(removed?.id).toBe(issueId);
+    await expect(db.select().from(issues).where(eq(issues.id, issueId))).resolves.toHaveLength(0);
+    await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(0);
+    await expect(db.select().from(issueReadStates).where(eq(issueReadStates.issueId, issueId))).resolves.toHaveLength(0);
+
+    // Ledger rows survive with the issue reference detached.
+    const [costEvent] = await db.select().from(costEvents).where(eq(costEvents.id, costEventId));
+    expect(costEvent?.issueId).toBeNull();
+
+    // Sub-issues survive, promoted to top level.
+    const [child] = await db.select().from(issues).where(eq(issues.id, childIssueId));
+    expect(child?.parentId).toBeNull();
   });
 });

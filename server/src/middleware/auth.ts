@@ -63,6 +63,12 @@ function hashToken(token: string) {
   return createHash("sha256").update(token).digest("hex");
 }
 
+const CANONICAL_UUID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export const RUN_ID_HEADER_ERROR_MESSAGE =
+  "X-Paperclip-Run-Id must be the UUID of the current heartbeat run. " +
+  "If you are not executing inside a heartbeat run, omit this header entirely — do not fabricate a value.";
+
 function normalizeOptionalString(value: string | null | undefined) {
   return value?.trim() || null;
 }
@@ -216,7 +222,7 @@ const publicMcpGatewayProtocolPath = /^\/mcp\/gateways\/gw_[a-f0-9]{32}\/?$/i;
 
 export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHandler {
   const boardAuth = boardAuthService(db);
-  return async (req, _res, next) => {
+  return async (req, res, next) => {
     req.actor =
       opts.deploymentMode === "local_trusted"
         ? {
@@ -229,7 +235,16 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
           }
         : { type: "none", source: "none" };
 
+    // Agents have been observed fabricating this header (e.g.
+    // "startup-kickoff-<epoch>"), and heartbeat_runs lookups keyed on the raw
+    // value blow up inside Postgres uuid casts and surface as opaque 500s.
+    // Validate once here — every actor path below stamps req.actor.runId from
+    // this single read, so rejecting early covers all of them.
     const runIdHeader = req.header("x-paperclip-run-id");
+    if (runIdHeader !== undefined && !CANONICAL_UUID_PATTERN.test(runIdHeader)) {
+      res.status(400).json({ error: RUN_ID_HEADER_ERROR_MESSAGE });
+      return;
+    }
 
     const authHeader = req.header("authorization");
     const hasBearerCredentials = /^bearer(?:\s|$)/i.test(authHeader ?? "");

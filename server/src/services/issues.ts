@@ -11173,6 +11173,15 @@ export function issueService(db: Db) {
           .from(issueDocuments)
           .where(eq(issueDocuments.issueId, id));
 
+        // Isol8: sub-issues reference the parent through a self-FK with no
+        // ON DELETE rule. Promote them to top-level issues rather than 409ing
+        // or deleting a whole subtree the caller never asked to remove. (The
+        // other child tables now cascade / set null upstream.)
+        await tx
+          .update(issues)
+          .set({ parentId: null, updatedAt: new Date() })
+          .where(eq(issues.parentId, id));
+
         let removedIssue;
         try {
           removedIssue = await tx
