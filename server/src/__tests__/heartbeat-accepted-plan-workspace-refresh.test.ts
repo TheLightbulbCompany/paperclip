@@ -834,7 +834,7 @@ describeEmbeddedPostgres("accepted plan workspace refresh", () => {
       otherActiveClaimIssueId: otherPlanningIssueId,
       otherActiveClaimIdentifier: "PAP-9302",
     }));
-    expect(adapterInput.context.paperclipTaskMarkdown).toContain("Make the plan only.");
+    expect(adapterInput.context.paperclipTaskMarkdown).toContain("Write the plan to the Paperclip plan document");
     expect(adapterInput.context.paperclipTaskMarkdown).not.toContain("Create child issues from the approved plan only");
   }, 20_000);
 

@@ -94,7 +94,7 @@ test("renders scoped planning wake authority before the Hermes default workflow"
 
   expect(prompt).toContain("## Paperclip Wake Payload");
   expect(prompt).toContain("- issue: PAP-3404 Plan the Hermes prompt update");
-  expect(prompt).toContain("- planning directive: Make the plan only. Do not write code or perform implementation work.");
+  expect(prompt).toContain("- planning directive: Write the plan to the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.");
   expect(prompt).toContain("- checkout: already claimed by the harness for this run");
   expect(prompt).toContain("The harness already checked out this issue for the current run.");
   expect(prompt).toContain("Issue description:\n```text\nUse the wake payload as runtime authority.\n```");
@@ -181,8 +181,8 @@ test("renders accepted-plan continuation without authorizing implementation on t
   expect(prompt).toContain("- planning directive: Create child issues from the approved plan only. Do not write code or perform implementation work on the planning issue.");
   expect(prompt).toContain("- accepted-plan continuation: you may create child implementation issues from the approved plan");
   expect(prompt).toContain("must not start implementation work on the planning issue itself");
-  expect(prompt).not.toContain("- planning directive: Make the plan only.");
-  expect(prompt).not.toContain("Update the plan only");
+  expect(prompt).not.toContain("- planning directive: Write the plan to the Paperclip plan document");
+  expect(prompt).not.toContain("Update the plan in the Paperclip plan document");
 });
 
 test("keeps authoritative parent and ancestor context from task markdown", () => {

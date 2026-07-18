@@ -2526,10 +2526,10 @@ function renderPaperclipWakePromptBody(
       normalized.commentIds.length > 0 &&
       normalized.fallbackFetchNeeded;
     let directive =
-      "Make the plan only. Do not write code or perform implementation work.";
+      "Write the plan to the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.";
     if (hasWakeComments) {
       directive =
-        "Update the plan only. Do not write code or perform implementation work.";
+        "Update the plan in the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.";
     }
     if (acceptedPlanContinuation) {
       directive = acceptedPlanWithMissingWakeComment

@@ -8624,10 +8624,10 @@ export function buildPaperclipTaskMarkdown(input: {
       );
     } else if (issue.workMode === "planning") {
       let directive =
-        "Make the plan only. Do not write code or perform implementation work.";
+        "Write the plan to the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.";
       if (wakeComment) {
         directive =
-          "Update the plan only. Do not write code or perform implementation work.";
+          "Update the plan in the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.";
       }
       if (acceptedPlanContinuation) {
         directive =

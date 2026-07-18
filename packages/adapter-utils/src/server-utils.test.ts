@@ -2389,7 +2389,7 @@ describe("renderPaperclipWakePrompt", () => {
 
     expect(assignmentPrompt).toContain("- issue work mode: planning");
     expect(assignmentPrompt).toContain(
-      "Make the plan only. Do not write code or perform implementation work.",
+      "Write the plan to the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.",
     );
 
     const commentPrompt = renderPaperclipWakePrompt({
@@ -2409,7 +2409,7 @@ describe("renderPaperclipWakePrompt", () => {
     });
 
     expect(commentPrompt).toContain(
-      "Update the plan only. Do not write code or perform implementation work.",
+      "Update the plan in the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.",
     );
   });
 
@@ -2433,7 +2433,7 @@ describe("renderPaperclipWakePrompt", () => {
     });
 
     expect(prompt).toContain(
-      "Update the plan only. Do not write code or perform implementation work.",
+      "Update the plan in the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.",
     );
     expect(prompt).not.toContain("accepted-plan continuation");
     expect(prompt).not.toContain(
@@ -2489,7 +2489,7 @@ describe("renderPaperclipWakePrompt", () => {
     expect(prompt).toContain(
       "do not create a child merely because a plan was accepted",
     );
-    expect(prompt).not.toContain("Update the plan only");
+    expect(prompt).not.toContain("Update the plan in the Paperclip plan document");
   });
 
   it("renders accepted plan review context with annotation text and comments", () => {
@@ -3265,7 +3265,7 @@ describe("renderPaperclipWakePrompt - task watchdog", () => {
     });
 
     expect(prompt).toContain("## Task Watchdog Mandate");
-    expect(prompt).not.toContain("Make the plan only");
+    expect(prompt).not.toContain("Write the plan to the Paperclip plan document");
     expect(prompt).not.toContain("planning directive:");
   });
 
