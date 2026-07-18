@@ -76,6 +76,7 @@ import {
 } from "./instance-settings.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
+import { applyRoutineOutcome } from "./routine-circuit-breaker.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
 
@@ -1988,6 +1989,9 @@ export function routineService(
           status: "failed",
           nextRunAt,
         }, txDb);
+        // Dispatch-time failure (issue creation threw): no issue exists to
+        // transition, so count the routine failure directly here.
+        if (failed) await applyRoutineOutcome(txDb, failed.routineId, failed.companyId, "failed");
         return failed ?? createdRun;
       }
     });
@@ -2388,6 +2392,11 @@ export function routineService(
             assigneeAgentId: candidate.assigneeAgentId,
             priority: candidate.priority,
             status: candidate.status,
+            // Resume from a circuit-breaker pause: clear failure state when an
+            // operator re-enables a paused routine so it starts fresh.
+            ...(locked.status === "paused" && candidate.status === "active"
+              ? { consecutiveFailureCount: 0, autoPausedAt: null, autoPauseReason: null }
+              : {}),
             concurrencyPolicy: candidate.concurrencyPolicy,
             catchUpPolicy: candidate.catchUpPolicy,
             activityGatePolicy: candidate.activityGatePolicy,
@@ -3184,6 +3193,10 @@ export function routineService(
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       if (!issue || issue.originKind !== "routine_execution" || !issue.originRunId) return null;
+      // NOTE: the circuit-breaker counter is NOT updated here. It fires from the
+      // issue's terminal-status transition in issuesSvc.update (the universal
+      // hook that also covers recovery-driven blocks). Counting here too would
+      // double-count the normal path. This function only finalizes the run row.
       const run = await db
         .select({
           id: routineRuns.id,

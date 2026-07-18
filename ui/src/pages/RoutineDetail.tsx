@@ -893,6 +893,26 @@ export function RoutineDetail() {
                   : "w-full"
             }
           >
+            {routine.status === "paused" && routine.autoPausedAt ? (
+              <div className="mb-6 flex w-full items-start gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                <div className="flex-1">
+                  <p className="font-medium text-amber-200">Automatically paused after repeated failures</p>
+                  <p className="text-muted-foreground">
+                    This routine failed {routine.consecutiveFailureCount} runs in a row and was paused to
+                    stop a pile-up. Fix the underlying issue, then resume.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={automationToggleDisabled}
+                  onClick={() => updateRoutineStatus.mutate("active")}
+                  className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-50"
+                >
+                  Resume
+                </button>
+              </div>
+            ) : null}
             <h2 id="routine-section-title" className="mb-4 text-lg font-semibold">
               {SECTION_TITLES[section]}
             </h2>

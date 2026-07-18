@@ -85,6 +85,11 @@ export interface Routine {
   catchUpPolicy: string;
   activityGatePolicy: string;
   activityGateScope: string;
+  autoPauseEnabled?: boolean | null;
+  autoPauseThreshold?: number | null;
+  consecutiveFailureCount?: number;
+  autoPausedAt?: Date | null;
+  autoPauseReason?: string | null;
   originKind?: string;
   originId?: string | null;
   variables: RoutineVariable[];

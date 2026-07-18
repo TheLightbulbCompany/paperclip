@@ -29,6 +29,10 @@ export const instanceGeneralSettingsSchema = z.object({
     DEFAULT_FEEDBACK_DATA_SHARING_PREFERENCE,
   ),
   backupRetention: backupRetentionPolicySchema.default(DEFAULT_BACKUP_RETENTION),
+  // Circuit breaker: auto-pause a routine after N consecutive failed/blocked
+  // runs. Default-on so every company is protected without per-routine config.
+  autoPauseDefaultEnabled: z.boolean().default(true),
+  autoPauseDefaultThreshold: z.number().int().min(1).max(100).default(3),
   // Execution policy. Absent/"any" = unrestricted; "kubernetes" forces the
   // Kubernetes sandbox provider and denies local/ssh execution (cloud_tenant).
   executionMode: z.enum(["kubernetes", "any"]).optional(),
