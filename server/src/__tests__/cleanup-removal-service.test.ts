@@ -155,6 +155,27 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(0);
   });
 
+  it("removes routines assigned to the agent before deleting it", async () => {
+    const { agentId, companyId } = await seedFixture();
+
+    const routineId = randomUUID();
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Weekly report",
+      assigneeAgentId: agentId,
+    });
+
+    // Without clearing the assigned routine first this throws on the
+    // routines_assignee_agent_id_agents_id_fk constraint (the agent delete
+    // returns 500 to the caller).
+    const removed = await agentService(db).remove(agentId);
+
+    expect(removed?.id).toBe(agentId);
+    await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
+    await expect(db.select().from(routines).where(eq(routines.id, routineId))).resolves.toHaveLength(0);
+  });
+
   it("removes issue read states and activity rows before deleting the company", async () => {
     const { companyId, issueId, runId } = await seedFixture();
     const documentId = randomUUID();

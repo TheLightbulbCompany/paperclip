@@ -16,6 +16,7 @@ import {
   issueExecutionDecisions,
   issues,
   issueComments,
+  routines,
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -1075,6 +1076,11 @@ export function agentService(db: Db) {
         await tx.delete(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, id));
         await tx.delete(agentApiKeys).where(eq(agentApiKeys.agentId, id));
         await tx.delete(agentRuntimeState).where(eq(agentRuntimeState.agentId, id));
+        // Routines assigned to this agent are its own schedules and cannot run
+        // without it. Their FK has no ON DELETE rule, so they must be cleared
+        // before the agent row or the delete fails with a constraint violation.
+        // routine_runs / routine_triggers / routine_revisions cascade from here.
+        await tx.delete(routines).where(eq(routines.assigneeAgentId, id));
         const deleted = await tx
           .delete(agents)
           .where(eq(agents.id, id))
