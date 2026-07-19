@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  awaitRunResilient,
   buildAgentParams,
+  isWaitPending,
   pickAssistantChunk,
   resolveClaimedApiKeyPath,
   resolveSessionKey,
@@ -183,5 +185,242 @@ describe("pickAssistantChunk (whitespace preservation)", () => {
     expect(pickAssistantChunk({ text: " snapshot text " })).toBe(" snapshot text ");
     expect(pickAssistantChunk({ delta: "", text: " fallback" })).toBe(" fallback");
     expect(pickAssistantChunk({})).toBeNull();
+  });
+});
+
+describe("isWaitPending", () => {
+  it("treats a slice-expiry timeout (timeoutPhase, no endedAt) as pending", () => {
+    expect(isWaitPending({ status: "timeout", timeoutPhase: "gateway_draining" })).toBe(true);
+    expect(isWaitPending({ status: "timeout", timeoutPhase: "queue", providerStarted: false })).toBe(true);
+  });
+
+  it("treats a terminated run (ok/error, or timeout WITH endedAt) as not pending", () => {
+    expect(isWaitPending({ status: "ok", endedAt: 10 })).toBe(false);
+    expect(isWaitPending({ status: "error", endedAt: 10, error: "boom" })).toBe(false);
+    expect(isWaitPending({ status: "timeout", endedAt: 10, stopReason: "timeout" })).toBe(false);
+  });
+
+  it("is not pending for empty or terminal-without-marker payloads", () => {
+    expect(isWaitPending(null)).toBe(false);
+    expect(isWaitPending(undefined)).toBe(false);
+    expect(isWaitPending({ status: "ok" })).toBe(false);
+  });
+});
+
+describe("awaitRunResilient", () => {
+  const noopLog = async () => {};
+  const noSleep = async () => {};
+  const HOUR_MS = 60 * 60_000;
+
+  it("calls agent.wait with the runId and the slice timeout", async () => {
+    const calls: Array<{ method: string; params: unknown; opts: unknown }> = [];
+    const client = {
+      request: async <T>(method: string, params: unknown, opts: { timeoutMs: number }): Promise<T> => {
+        calls.push({ method, params, opts });
+        return { status: "ok", endedAt: 1 } as T;
+      },
+      close: () => {},
+    };
+    await awaitRunResilient({
+      client,
+      runId: "run-xyz",
+      waitSliceMs: 5_000,
+      maxRunMs: 1_000_000,
+      stallTimeoutMs: 1_000_000,
+      connectTimeoutMs: 10,
+      connectClient: async () => client,
+      onLog: noopLog,
+      now: () => 0,
+      sleep: noSleep,
+    });
+    expect(calls).toHaveLength(1);
+    expect(calls[0].method).toBe("agent.wait");
+    expect(calls[0].params).toEqual({ runId: "run-xyz", timeoutMs: 5_000 });
+    expect(calls[0].opts).toEqual({ timeoutMs: 5_010 });
+  });
+
+  it("polls agent.wait through slice-expiry timeouts until the run terminates", async () => {
+    const responses: Array<Record<string, unknown>> = [
+      { status: "timeout", timeoutPhase: "gateway_draining" },
+      { status: "timeout", timeoutPhase: "gateway_draining" },
+      { status: "ok", endedAt: 1, result: { text: "done" } },
+    ];
+    let call = 0;
+    const client = {
+      request: async <T>(): Promise<T> => responses[call++] as T,
+      close: () => {},
+    };
+    const result = await awaitRunResilient({
+      client,
+      runId: "run-1",
+      waitSliceMs: 1_000,
+      maxRunMs: 1_000_000,
+      stallTimeoutMs: 1_000_000,
+      connectTimeoutMs: 10,
+      connectClient: async () => client,
+      onLog: noopLog,
+      now: () => 0,
+      sleep: noSleep,
+    });
+    expect(result.status).toBe("ok");
+    expect(call).toBe(3);
+  });
+
+  it("reconnects a fresh connection and resumes agent.wait after a drop", async () => {
+    let reconnects = 0;
+    let closedCount = 0;
+    const makeClient = (failFirst: boolean) => {
+      let asked = false;
+      return {
+        request: async <T>(): Promise<T> => {
+          if (failFirst && !asked) {
+            asked = true;
+            throw new Error("gateway closed (1006): idle");
+          }
+          return { status: "ok", endedAt: 1 } as T;
+        },
+        close: () => {
+          closedCount += 1;
+        },
+      };
+    };
+    const result = await awaitRunResilient({
+      client: makeClient(true),
+      runId: "run-1",
+      waitSliceMs: 1_000,
+      maxRunMs: 1_000_000,
+      stallTimeoutMs: 1_000_000,
+      connectTimeoutMs: 10,
+      connectClient: async () => {
+        reconnects += 1;
+        return makeClient(false);
+      },
+      onLog: noopLog,
+      now: () => 0,
+      sleep: noSleep,
+    });
+    expect(result.status).toBe("ok");
+    expect(reconnects).toBe(1);
+    expect(closedCount).toBeGreaterThanOrEqual(1); // dropped connection was closed
+  });
+
+  it("retries a failed reconnect instead of abandoning a still-live run", async () => {
+    let connectAttempts = 0;
+    const droppedClient = {
+      request: async <T>(): Promise<T> => {
+        throw new Error("gateway closed (1006)");
+      },
+      close: () => {},
+    };
+    const okClient = {
+      request: async <T>(): Promise<T> => ({ status: "ok", endedAt: 1 }) as T,
+      close: () => {},
+    };
+    const result = await awaitRunResilient({
+      client: droppedClient,
+      runId: "run-1",
+      waitSliceMs: 1_000,
+      maxRunMs: 1_000_000,
+      stallTimeoutMs: 1_000_000,
+      connectTimeoutMs: 10,
+      connectClient: async () => {
+        connectAttempts += 1;
+        if (connectAttempts < 3) throw new Error("gateway websocket open timeout");
+        return okClient; // 3rd reconnect succeeds
+      },
+      onLog: noopLog,
+      now: () => 0,
+      sleep: noSleep,
+    });
+    expect(result.status).toBe("ok");
+    // The reconnect itself failed twice and was retried, not escaped as a failure.
+    expect(connectAttempts).toBe(3);
+  });
+
+  it("proactively reconnects before the 2h WS cap and resumes", async () => {
+    let clock = 0;
+    let reconnects = 0;
+    const makeClient = () => ({
+      request: async <T>(): Promise<T> => {
+        clock += HOUR_MS; // each slice advances the injected clock by 1h
+        return (reconnects >= 1
+          ? { status: "ok", endedAt: clock }
+          : { status: "timeout", timeoutPhase: "gateway_draining" }) as T;
+      },
+      close: () => {},
+    });
+    const result = await awaitRunResilient({
+      client: makeClient(),
+      runId: "run-1",
+      waitSliceMs: 5 * 60_000,
+      maxRunMs: 48 * HOUR_MS,
+      stallTimeoutMs: 48 * HOUR_MS, // no stall
+      connectTimeoutMs: 10,
+      connectClient: async () => {
+        reconnects += 1;
+        return makeClient();
+      },
+      onLog: noopLog,
+      now: () => clock,
+      sleep: noSleep,
+    });
+    expect(result.status).toBe("ok");
+    // Connection age crossed the ~110-min proactive-reconnect threshold before 2h.
+    expect(reconnects).toBeGreaterThanOrEqual(1);
+  });
+
+  it("gives up with 'stalled' when a run shows no activity", async () => {
+    let clock = 0;
+    const client = {
+      // A never-started / queued run: no endedAt, not gateway_draining.
+      request: async <T>(): Promise<T> => {
+        clock += 1_000;
+        return { status: "timeout", timeoutPhase: "queue", providerStarted: false } as T;
+      },
+      close: () => {},
+    };
+    const result = await awaitRunResilient({
+      client,
+      runId: "run-1",
+      waitSliceMs: 1_000,
+      maxRunMs: 1_000_000,
+      stallTimeoutMs: 5_000,
+      connectTimeoutMs: 10,
+      connectClient: async () => client,
+      onLog: noopLog,
+      now: () => clock,
+      sleep: noSleep,
+      getLastEventAt: () => 0,
+    });
+    expect(result.status).toBe("timeout");
+    expect(result.timeoutPhase).toBe("stalled");
+  });
+
+  it("gives up with max_run_exceeded after actually looping through slices", async () => {
+    let clock = 0;
+    let sliceCalls = 0;
+    const client = {
+      request: async <T>(): Promise<T> => {
+        sliceCalls += 1;
+        clock += 100; // each slice advances 100ms; run keeps signalling active
+        return { status: "timeout", timeoutPhase: "gateway_draining" } as T;
+      },
+      close: () => {},
+    };
+    const result = await awaitRunResilient({
+      client,
+      runId: "run-1",
+      waitSliceMs: 100,
+      maxRunMs: 300,
+      stallTimeoutMs: 1_000_000,
+      connectTimeoutMs: 10,
+      connectClient: async () => client,
+      onLog: noopLog,
+      now: () => clock,
+      sleep: noSleep,
+    });
+    expect(result.status).toBe("timeout");
+    expect(result.timeoutPhase).toBe("max_run_exceeded");
+    expect(sliceCalls).toBeGreaterThanOrEqual(2); // exercised the slice loop, not a first-iteration exit
   });
 });
