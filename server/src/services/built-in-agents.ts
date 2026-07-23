@@ -798,6 +798,19 @@ function isBuiltInAgentMarkerConflict(error: unknown): boolean {
   return false;
 }
 
+/**
+ * When PAPERCLIP_SKIP_BUILTIN_AGENTS is set, Paperclip's built-in "starter"
+ * agents (Reflection Coach, Summarizer) are never auto-provisioned. Isol8
+ * tenants must contain exactly their own seeded agents (Friday + Atlas), so the
+ * built-in bundle must not be created for them. Default OFF leaves upstream
+ * behavior unchanged. Read per call (not module-cached) so the flag is honored
+ * without special ordering and so tests can toggle it.
+ */
+function shouldSkipBuiltInAgentProvisioning(): boolean {
+  const raw = process.env.PAPERCLIP_SKIP_BUILTIN_AGENTS?.trim().toLowerCase();
+  return raw === "1" || raw === "true";
+}
+
 export function builtInAgentService(db: Db) {
   const agentSvc = agentService(db);
   const accessSvc = accessService(db);
@@ -1923,24 +1936,31 @@ export function builtInAgentService(db: Db) {
     const company = await ensureCompany(companyId);
     let autoEnsured = 0;
     let pendingApprovals = 0;
-    // A fresh company starts with only its own lead agent — the Reflection
-    // Coach and Summarizer are no longer auto-created for new users. They stay
-    // available to enable on demand (via ensure / provision / the built-in
-    // bundle panel). We still reconcile any bundled agent that already exists
-    // (e.g. one an operator enabled) so its instructions/skill/routine keep
-    // tracking stock. Add a key to AUTO_PROVISION_ON_COMPANY_CREATE_KEYS to
-    // restore automatic creation for that definition.
-    for (const definition of DEFINITIONS.filter((entry) => entry.bundle)) {
-      const existing = await findSingleAgent(companyId, definition);
-      const shouldProvision = existing !== null || AUTO_PROVISION_ON_COMPANY_CREATE_KEYS.has(definition.key);
-      if (!shouldProvision) continue;
-      if (company.requireBoardApprovalForNewAgents) {
-        const result = await provision(companyId, definition.key);
-        if (result.approval) pendingApprovals += 1;
-      } else {
-        await ensure(companyId, definition.key);
+    // This is the single chokepoint for built-in bundle creation — reached from
+    // both companyService.create() and the unconditional startup reconcile
+    // (reconcileBuiltInAgentsOnStartup) — so gating here keeps PAPERCLIP_SKIP_BUILTIN_AGENTS
+    // tenants free of built-ins across every path. The root-agent default grants
+    // below are intentionally still ensured (they are not built-in specific).
+    if (!shouldSkipBuiltInAgentProvisioning()) {
+      // A fresh company starts with only its own lead agent — the Reflection
+      // Coach and Summarizer are no longer auto-created for new users. They stay
+      // available to enable on demand (via ensure / provision / the built-in
+      // bundle panel). We still reconcile any bundled agent that already exists
+      // (e.g. one an operator enabled) so its instructions/skill/routine keep
+      // tracking stock. Add a key to AUTO_PROVISION_ON_COMPANY_CREATE_KEYS to
+      // restore automatic creation for that definition.
+      for (const definition of DEFINITIONS.filter((entry) => entry.bundle)) {
+        const existing = await findSingleAgent(companyId, definition);
+        const shouldProvision = existing !== null || AUTO_PROVISION_ON_COMPANY_CREATE_KEYS.has(definition.key);
+        if (!shouldProvision) continue;
+        if (company.requireBoardApprovalForNewAgents) {
+          const result = await provision(companyId, definition.key);
+          if (result.approval) pendingApprovals += 1;
+        } else {
+          await ensure(companyId, definition.key);
+        }
+        autoEnsured += 1;
       }
-      autoEnsured += 1;
     }
     const defaultGrantsEnsured = await ensureCompanyDefaultAgentGrants(companyId);
     return { autoEnsured, pendingApprovals, defaultGrantsEnsured };

@@ -569,6 +569,53 @@ describeEmbeddedPostgres("built-in agents", () => {
     });
   });
 
+  async function builtInAgentKeysForCompany(companyId: string) {
+    const rows = await db.select().from(agents).where(eq(agents.companyId, companyId));
+    return rows
+      .map((row) => readBuiltInAgentMarker(row.metadata)?.key)
+      .filter((key): key is string => Boolean(key))
+      .sort();
+  }
+
+  it("skips built-in bundle provisioning entirely when PAPERCLIP_SKIP_BUILTIN_AGENTS is set", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    // Even a bundled agent that already exists must not be reconciled when the
+    // gate is set — Isol8 tenants stay free of built-in churn on every path.
+    await builtInAgentService(db).ensure(companyId, "reflection-coach");
+    const previous = process.env.PAPERCLIP_SKIP_BUILTIN_AGENTS;
+    process.env.PAPERCLIP_SKIP_BUILTIN_AGENTS = "1";
+    try {
+      const result = await builtInAgentService(db).autoProvisionBundledAgents(companyId);
+      expect(result.autoEnsured).toBe(0);
+      expect(result.pendingApprovals).toBe(0);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_SKIP_BUILTIN_AGENTS;
+      else process.env.PAPERCLIP_SKIP_BUILTIN_AGENTS = previous;
+    }
+
+    expect(await builtInAgentKeysForCompany(companyId)).toEqual(["reflection-coach"]);
+  });
+
+  it("creates nothing for a fresh company but reconciles an existing bundled agent when the gate is unset", async () => {
+    const companyId = await seedCompany({ requireApproval: false });
+    const previous = process.env.PAPERCLIP_SKIP_BUILTIN_AGENTS;
+    delete process.env.PAPERCLIP_SKIP_BUILTIN_AGENTS;
+    try {
+      const fresh = await builtInAgentService(db).autoProvisionBundledAgents(companyId);
+      expect(fresh.autoEnsured).toBe(0);
+      expect(await builtInAgentKeysForCompany(companyId)).toEqual([]);
+
+      await builtInAgentService(db).ensure(companyId, "reflection-coach");
+      const again = await builtInAgentService(db).autoProvisionBundledAgents(companyId);
+      expect(again.autoEnsured).toBe(1);
+    } finally {
+      if (previous === undefined) delete process.env.PAPERCLIP_SKIP_BUILTIN_AGENTS;
+      else process.env.PAPERCLIP_SKIP_BUILTIN_AGENTS = previous;
+    }
+
+    expect(await builtInAgentKeysForCompany(companyId)).toEqual(["reflection-coach"]);
+  });
+
   it("reconciles an enabled Reflection Coach bundle with skill sync and a disabled routine", async () => {
     const companyId = await seedCompany({ requireApproval: false });
     const root = await agentService(db).create(companyId, {
