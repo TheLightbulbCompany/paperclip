@@ -1106,6 +1106,40 @@ export function isWaitPending(waitPayload: Record<string, unknown> | null | unde
 }
 
 /**
+ * Hard daily budget caps. The Isol8 bedrock-gate denies over-budget owners with
+ * a 429 whose message contains "daily free limit reached — resets at midnight
+ * UTC"; OpenClaw surfaces that denial as the gateway run error text. Every
+ * immediate retry is guaranteed to fail until the cap resets, so classify the
+ * failure as provider_quota with retryNotBefore at the next UTC midnight (plus
+ * a small jitter so a fleet does not stampede the gate at 00:00) — the server
+ * then parks scheduled retries and assignment recovery at the reset instead of
+ * re-waking the agent into the same hard cap.
+ */
+export const DAILY_BUDGET_CAP_ERROR_SNIPPET = "daily free limit reached";
+const DAILY_BUDGET_CAP_RETRY_JITTER_MIN_MS = 60 * 1000;
+const DAILY_BUDGET_CAP_RETRY_JITTER_RANGE_MS = 4 * 60 * 1000;
+
+export function nextUtcMidnight(now: Date): Date {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+}
+
+export function classifyDailyBudgetCapDenial(
+  errorMessage: string | null | undefined,
+  now: Date = new Date(),
+  random: () => number = Math.random,
+): { errorCode: "provider_quota"; errorFamily: "provider_quota"; retryNotBefore: string } | null {
+  if (!errorMessage?.toLowerCase().includes(DAILY_BUDGET_CAP_ERROR_SNIPPET)) return null;
+  const sample = Math.min(1, Math.max(0, random()));
+  const jitterMs = DAILY_BUDGET_CAP_RETRY_JITTER_MIN_MS +
+    Math.round(sample * DAILY_BUDGET_CAP_RETRY_JITTER_RANGE_MS);
+  return {
+    errorCode: "provider_quota",
+    errorFamily: "provider_quota",
+    retryNotBefore: new Date(nextUtcMidnight(now).getTime() + jitterMs).toISOString(),
+  };
+}
+
+/**
  * Poll `agent.wait` in slices until the run terminates, reconnecting a fresh
  * WebSocket when the current one drops or approaches AWS's 2-hour cap. The run
  * keeps executing in the gateway regardless of the connection, so this observes
@@ -1547,13 +1581,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       if (acceptedStatus === "error") {
         const errorMessage =
           nonEmpty(acceptedPayload?.summary) ?? lifecycleError ?? "OpenClaw gateway agent request failed";
+        const capDenial = classifyDailyBudgetCapDenial(errorMessage);
         return {
           exitCode: 1,
           signal: null,
           timedOut: false,
           errorMessage,
-          errorCode: "openclaw_gateway_agent_error",
-          resultJson: acceptedPayload,
+          errorCode: capDenial?.errorCode ?? "openclaw_gateway_agent_error",
+          ...(capDenial
+            ? { errorFamily: capDenial.errorFamily, retryNotBefore: capDenial.retryNotBefore }
+            : {}),
+          resultJson: capDenial
+            ? { ...(acceptedPayload ?? {}), gatewayErrorCode: "openclaw_gateway_agent_error" }
+            : acceptedPayload,
         };
       }
 
@@ -1594,16 +1634,23 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         }
 
         if (waitStatus === "error") {
+          const errorMessage =
+            nonEmpty(waitPayload?.error) ??
+            lifecycleError ??
+            "OpenClaw gateway run failed";
+          const capDenial = classifyDailyBudgetCapDenial(errorMessage);
           return {
             exitCode: 1,
             signal: null,
             timedOut: false,
-            errorMessage:
-              nonEmpty(waitPayload?.error) ??
-              lifecycleError ??
-              "OpenClaw gateway run failed",
-            errorCode: "openclaw_gateway_wait_error",
-            resultJson: waitPayload,
+            errorMessage,
+            errorCode: capDenial?.errorCode ?? "openclaw_gateway_wait_error",
+            ...(capDenial
+              ? { errorFamily: capDenial.errorFamily, retryNotBefore: capDenial.retryNotBefore }
+              : {}),
+            resultJson: capDenial
+              ? { ...(waitPayload ?? {}), gatewayErrorCode: "openclaw_gateway_wait_error" }
+              : waitPayload,
           };
         }
 

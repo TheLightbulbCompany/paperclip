@@ -2,7 +2,9 @@ import { describe, expect, it } from "vitest";
 import {
   awaitRunResilient,
   buildAgentParams,
+  classifyDailyBudgetCapDenial,
   isWaitPending,
+  nextUtcMidnight,
   pickAssistantChunk,
   resolveClaimedApiKeyPath,
   resolveSessionKey,
@@ -422,5 +424,55 @@ describe("awaitRunResilient", () => {
     expect(result.status).toBe("timeout");
     expect(result.timeoutPhase).toBe("max_run_exceeded");
     expect(sliceCalls).toBeGreaterThanOrEqual(2); // exercised the slice loop, not a first-iteration exit
+  });
+});
+
+describe("nextUtcMidnight", () => {
+  it("returns the next UTC midnight, rolling over month boundaries", () => {
+    expect(nextUtcMidnight(new Date("2026-07-24T18:31:07.000Z")).toISOString())
+      .toBe("2026-07-25T00:00:00.000Z");
+    expect(nextUtcMidnight(new Date("2026-07-31T23:59:59.999Z")).toISOString())
+      .toBe("2026-08-01T00:00:00.000Z");
+    // Exactly midnight parks at the NEXT midnight — the cap covers the day just started.
+    expect(nextUtcMidnight(new Date("2026-07-25T00:00:00.000Z")).toISOString())
+      .toBe("2026-07-26T00:00:00.000Z");
+  });
+});
+
+describe("classifyDailyBudgetCapDenial", () => {
+  const now = new Date("2026-07-24T18:31:07.000Z");
+
+  it("classifies the daily-cap denial as provider_quota parked just past the next UTC midnight", () => {
+    const result = classifyDailyBudgetCapDenial(
+      "FailoverError: isol8: daily free limit reached — resets at midnight UTC",
+      now,
+      () => 0,
+    );
+    expect(result).toEqual({
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      retryNotBefore: "2026-07-25T00:01:00.000Z",
+    });
+  });
+
+  it("jitters the park time between one and five minutes past midnight", () => {
+    const atMax = classifyDailyBudgetCapDenial("daily free limit reached", now, () => 1);
+    expect(atMax?.retryNotBefore).toBe("2026-07-25T00:05:00.000Z");
+
+    const midway = classifyDailyBudgetCapDenial("daily free limit reached", now, () => 0.5);
+    expect(midway?.retryNotBefore).toBe("2026-07-25T00:03:00.000Z");
+  });
+
+  it("matches the denial snippet case-insensitively", () => {
+    expect(classifyDailyBudgetCapDenial("Daily Free Limit Reached — try tomorrow", now, () => 0))
+      .not.toBeNull();
+  });
+
+  it("leaves ordinary gateway errors unclassified so they keep their normal retry behavior", () => {
+    expect(classifyDailyBudgetCapDenial("OpenClaw gateway run failed", now)).toBeNull();
+    expect(classifyDailyBudgetCapDenial("429 rate limited, please slow down", now)).toBeNull();
+    expect(classifyDailyBudgetCapDenial("", now)).toBeNull();
+    expect(classifyDailyBudgetCapDenial(null, now)).toBeNull();
+    expect(classifyDailyBudgetCapDenial(undefined, now)).toBeNull();
   });
 });

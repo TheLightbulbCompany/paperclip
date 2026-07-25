@@ -127,3 +127,71 @@ describe("classifyAdapterFailureForRecovery", () => {
     })).toBeNull();
   });
 });
+
+describe("classifyAdapterFailureForRecovery (daily budget cap)", () => {
+  const now = new Date("2026-07-24T18:31:07.000Z");
+
+  it("parks a gateway wait error carrying the daily-cap denial at the next UTC midnight", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "openclaw_gateway_wait_error",
+      error: "isol8: daily free limit reached — resets at midnight UTC",
+      resultJson: null,
+    }, now)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-07-25T00:00:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
+  it("parks a gateway agent error carrying the daily-cap denial too", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "openclaw_gateway_agent_error",
+      error: "agent request rejected: daily free limit reached",
+      resultJson: null,
+    }, now)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-07-25T00:00:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
+  it("prefers the adapter's persisted (jittered) retryNotBefore over the computed midnight", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "provider_quota",
+      error: "isol8: daily free limit reached — resets at midnight UTC",
+      resultJson: { retryNotBefore: "2026-07-25T00:03:21.000Z" },
+    }, now)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-07-25T00:03:21.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
+  it("parks adapter_failed runs carrying the daily-cap denial at the next UTC midnight", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "adapter_failed",
+      error: "run failed: daily free limit reached — resets at midnight UTC",
+      resultJson: null,
+    }, now)).toEqual({
+      kind: "provider_quota",
+      retryAt: new Date("2026-07-25T00:00:00.000Z"),
+      parsedResetTime: true,
+    });
+  });
+
+  it("keeps ordinary gateway errors on their existing retry behavior", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "openclaw_gateway_wait_error",
+      error: "OpenClaw gateway run failed",
+      resultJson: null,
+    }, now)).toBeNull();
+  });
+
+  it("does not classify gateway errors as configuration_incomplete from message text alone", () => {
+    expect(classifyAdapterFailureForRecovery({
+      errorCode: "openclaw_gateway_wait_error",
+      error: "bootstrap diagnostics mention a missing api key marker",
+      resultJson: null,
+    }, now)).toBeNull();
+  });
+});
