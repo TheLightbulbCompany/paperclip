@@ -154,18 +154,25 @@ describe("resolveBundledPluginInstalls", () => {
     expect(resolved).toHaveLength(1);
   });
 
-  it("keeps the self-hosted default list to exactly the kubernetes bundle", () => {
-    expect(SELF_HOSTED_AUTO_INSTALL_KEYS).toEqual(["kubernetes"]);
-    const [entry] = resolveBundledPluginInstalls(SELF_HOSTED_AUTO_INSTALL_KEYS, {
+  it("keeps the self-hosted default list to the kubernetes and isol8-notifications bundles", () => {
+    // Isol8 fork: the notifications forwarder ships in the image alongside the
+    // kubernetes bundle and must auto-install on self-hosted instances too.
+    expect(SELF_HOSTED_AUTO_INSTALL_KEYS).toEqual(["kubernetes", "isol8-notifications"]);
+    const [kubernetesEntry, notificationsEntry] = resolveBundledPluginInstalls(SELF_HOSTED_AUTO_INSTALL_KEYS, {
       catalogRoot: resolveBundledCatalogRoot({}),
       env: {},
       enforceCatalogRoot: false,
     });
     // Exactly the pre-refactor default path.
-    expect(entry).toEqual({
+    expect(kubernetesEntry).toEqual({
       key: "kubernetes",
       pluginKey: "paperclip.kubernetes-sandbox-provider",
       localPath: "/app/packages/plugins/sandbox-providers/kubernetes",
+    });
+    expect(notificationsEntry).toEqual({
+      key: "isol8-notifications",
+      pluginKey: "isol8.notifications",
+      localPath: "/app/packages/plugins/plugin-isol8-notifications",
     });
   });
 
