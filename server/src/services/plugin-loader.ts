@@ -120,6 +120,20 @@ const K8S_IN_CLUSTER_ENV_PASSTHROUGH = [
 ];
 
 /**
+ * Instance-wide config for the bundled isol8-notifications forwarder
+ * (isol8 fork). Plugin config rows are per-(pluginId, companyId) with no
+ * instance scope, but the forwarder is one worker serving every company —
+ * its receiver URL + bearer token come from the server's task environment
+ * instead. Gated on the exact plugin id so no third-party worker can read
+ * the token.
+ */
+const ISOL8_NOTIFICATIONS_PLUGIN_ID = "isol8.notifications";
+const ISOL8_NOTIFICATIONS_ENV_PASSTHROUGH = [
+  "PAPERCLIP_ISOL8_NOTIFY_URL",
+  "PAPERCLIP_ISOL8_NOTIFY_TOKEN",
+];
+
+/**
  * Each first-party sandbox provider's documented credential fallback env
  * var. Environment rows may omit `config.apiKey` (managed/platform-
  * provisioned rows always do — see `managed-environments.ts`), in which
@@ -149,6 +163,7 @@ const SANDBOX_PROVIDER_CREDENTIAL_ENV_PASSTHROUGH: Record<
 
 export function buildPluginWorkerEnv(input: {
   manifest: Pick<PaperclipPluginManifestV1, "capabilities"> & {
+    id?: string;
     environmentDrivers?: ReadonlyArray<{ driverKey: string }>;
   };
   packageName?: string;
@@ -164,6 +179,14 @@ export function buildPluginWorkerEnv(input: {
     PAPERCLIP_DEPLOYMENT_MODE: input.instanceInfo.deploymentMode ?? "",
     PAPERCLIP_DEPLOYMENT_EXPOSURE: input.instanceInfo.deploymentExposure ?? "",
   };
+  if (input.manifest.id === ISOL8_NOTIFICATIONS_PLUGIN_ID) {
+    for (const key of ISOL8_NOTIFICATIONS_ENV_PASSTHROUGH) {
+      const value = processEnv[key];
+      if (value && value.trim().length > 0) {
+        env[key] = value;
+      }
+    }
+  }
   const canRegisterEnvironmentDrivers = Array.isArray(input.manifest.capabilities)
     && input.manifest.capabilities.includes("environment.drivers.register");
   if (!canRegisterEnvironmentDrivers) return env;

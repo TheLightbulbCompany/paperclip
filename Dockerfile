@@ -46,6 +46,7 @@ COPY --parents packages/plugins/sandbox-providers/./*/package.json packages/plug
 COPY packages/plugins/paperclip-plugin-fake-sandbox/package.json packages/plugins/paperclip-plugin-fake-sandbox/
 COPY packages/plugins/plugin-llm-wiki/package.json packages/plugins/plugin-llm-wiki/
 COPY packages/plugins/plugin-workspace-diff/package.json packages/plugins/plugin-workspace-diff/
+COPY packages/plugins/plugin-isol8-notifications/package.json packages/plugins/plugin-isol8-notifications/
 COPY patches/ patches/
 COPY scripts/link-plugin-dev-sdk.mjs scripts/
 
@@ -142,6 +143,8 @@ ENV NODE_OPTIONS=--max-old-space-size=4096
 RUN pnpm --filter @paperclipai/server build
 RUN test -f server/dist/index.js || (echo "ERROR: server build output missing" && exit 1)
 RUN rm -rf packages/paperclip-runner/runner/target
+RUN pnpm --filter @paperclipai/plugin-isol8-notifications build
+RUN test -f packages/plugins/plugin-isol8-notifications/dist/manifest.js || (echo "ERROR: isol8-notifications plugin build output missing" && exit 1)
 
 FROM base AS production
 ARG USER_UID=1000

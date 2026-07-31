@@ -188,6 +188,35 @@ describe("buildPluginWorkerEnv", () => {
     });
   });
 
+  it("passes isol8 notify vars only to the isol8-notifications plugin", () => {
+    const processEnv = {
+      PAPERCLIP_ISOL8_NOTIFY_URL: "https://api.example/webhooks",
+      PAPERCLIP_ISOL8_NOTIFY_TOKEN: "notify-token",
+      AWS_SECRET_ACCESS_KEY: "aws-secret",
+    };
+    const forwarder = buildPluginWorkerEnv({
+      manifest: { id: "isol8.notifications", capabilities: ["events.subscribe"] },
+      instanceInfo,
+      processEnv,
+    });
+    expect(forwarder).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+      PAPERCLIP_ISOL8_NOTIFY_URL: "https://api.example/webhooks",
+      PAPERCLIP_ISOL8_NOTIFY_TOKEN: "notify-token",
+    });
+
+    const other = buildPluginWorkerEnv({
+      manifest: { id: "some.other-plugin", capabilities: ["events.subscribe"] },
+      instanceInfo,
+      processEnv,
+    });
+    expect(other).toEqual({
+      PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+      PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+    });
+  });
+
   it("does not pass provider keys to non-environment plugins", () => {
     const env = buildPluginWorkerEnv({
       manifest: { capabilities: ["ui.slots.register"] },

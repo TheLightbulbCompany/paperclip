@@ -82,6 +82,15 @@ export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
     relativePath: "sandbox-providers/exe-dev",
   },
   {
+    // Isol8 fork: outbound notifications forwarder (approvals + run lifecycle
+    // → Isol8 backend). A regular workspace package shipped by the image COPY;
+    // auto-installed on self-hosted instances when its bundle is present.
+    key: "isol8-notifications",
+    pluginKey: "isol8.notifications",
+    relativePath: "plugin-isol8-notifications",
+    pathOverrideEnvVar: "PAPERCLIP_ISOL8_NOTIFICATIONS_PLUGIN_PATH",
+  },
+  {
     key: "kubernetes",
     pluginKey: "paperclip.kubernetes-sandbox-provider",
     relativePath: "sandbox-providers/kubernetes",
@@ -104,7 +113,7 @@ export const BUNDLED_PLUGIN_CATALOG: readonly BundledPluginCatalogEntry[] = [
  * Exactly the pre-refactor behavior: the kubernetes sandbox provider is
  * auto-installed when its bundle is present, nothing else.
  */
-export const SELF_HOSTED_AUTO_INSTALL_KEYS: readonly string[] = ["kubernetes"];
+export const SELF_HOSTED_AUTO_INSTALL_KEYS: readonly string[] = ["kubernetes", "isol8-notifications"];
 
 export function resolveBundledCatalogRoot(
   env: Record<string, string | undefined>,
