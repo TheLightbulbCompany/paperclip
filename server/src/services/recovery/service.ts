@@ -515,6 +515,17 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
 const CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE =
   "issue_continuation_waiting_on_review";
 const INTERACTION_CONTINUATION_REQUEUE_MAX_ATTEMPTS = 3;
+// Isol8 fork: sentinel for summarizeRecentContinuationRetries — count every
+// unsuccessful terminal continuation run regardless of its error code. The
+// accepted-interaction requeue backoff needs the full failure streak; matching
+// a single code would reset the streak whenever the failure mode alternates.
+const ANY_CONTINUATION_ERROR_CODE = Symbol("any_continuation_error_code");
+// Isol8 fork: backoff schedule for accepted-interaction requeues whose runs
+// keep failing. Never a hard stop — an accepted interaction must eventually
+// execute — but each consecutive failure doubles the wait, bounded at 1 hour,
+// so a sick container costs ~24 retry runs/day instead of one per tick.
+const INTERACTION_CONTINUATION_RETRY_BASE_BACKOFF_MS = 5 * 60 * 1000;
+const INTERACTION_CONTINUATION_RETRY_MAX_BACKOFF_MS = 60 * 60 * 1000;
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
@@ -1018,7 +1029,7 @@ export function recoveryService(
     companyId: string,
     issueId: string,
     agentId: string,
-    errorCodeToMatch: string | null,
+    errorCodeToMatch: string | null | typeof ANY_CONTINUATION_ERROR_CODE,
     since: Date | null = null,
   ) {
     const rows = await db
@@ -1062,9 +1073,11 @@ export function recoveryService(
         break;
       }
 
-      const rowErrorCode = readNonEmptyString(row.errorCode);
-      if (errorCodeToMatch !== rowErrorCode) {
-        break;
+      if (errorCodeToMatch !== ANY_CONTINUATION_ERROR_CODE) {
+        const rowErrorCode = readNonEmptyString(row.errorCode);
+        if (errorCodeToMatch !== rowErrorCode) {
+          break;
+        }
       }
 
       consecutive += 1;
@@ -4703,6 +4716,31 @@ export function recoveryService(
               result.skipped += 1;
             }
             continue;
+          }
+
+          // An accepted interaction is a promise: keep requeueing until a run
+          // completes it. But each requeue re-dispatches a full agent run, so
+          // consecutive failures (gateway wait errors, adapter crashes — any
+          // code) stretch the retry interval exponentially up to a 1-hour
+          // ceiling instead of re-firing on every reconcile tick. The streak
+          // resets on any successful or non-continuation run.
+          const failureStreak = await summarizeRecentContinuationRetries(
+            issue.companyId,
+            issue.id,
+            agentId,
+            ANY_CONTINUATION_ERROR_CODE,
+            acceptedInteractionResolvedAt,
+          );
+          if (failureStreak.consecutive > 0 && failureStreak.latestFinishedAt) {
+            const requiredDelayMs = Math.min(
+              INTERACTION_CONTINUATION_RETRY_BASE_BACKOFF_MS *
+                Math.pow(2, Math.max(0, failureStreak.consecutive - 1)),
+              INTERACTION_CONTINUATION_RETRY_MAX_BACKOFF_MS,
+            );
+            if (Date.now() - failureStreak.latestFinishedAt.getTime() < requiredDelayMs) {
+              result.skipped += 1;
+              continue;
+            }
           }
 
           const queued = await enqueueStrandedIssueRecovery({
