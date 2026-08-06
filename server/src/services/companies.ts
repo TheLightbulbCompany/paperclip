@@ -12,6 +12,15 @@ import {
   agentWakeupRequests,
   budgetIncidents,
   budgetPolicies,
+  decisionArchiveNotificationOutbox,
+  decisionBundles,
+  decisionQueueItems,
+  decisionQueues,
+  decisionRetention,
+  decisionTargetIssues,
+  decisionTriage,
+  decisionTriageEvents,
+  decisions,
   issues,
   issueApprovals,
   issueAttachments,
@@ -46,6 +55,7 @@ import {
   approvals,
   activityLog,
   companySecretBindings,
+  companySecretProposals,
   companySecrets,
   joinRequests,
   invites,
@@ -96,6 +106,20 @@ type CompanyScopedTable = PgTable & { companyId: PgColumn };
 // replays this sequence against the live FK graph, so a new table that breaks
 // coverage or ordering fails CI instead of 500ing DELETE /api/companies/:id.
 export const COMPANY_DELETE_SEQUENCE: readonly CompanyScopedTable[] = [
+  // Decisions + queues (children first, then decisions, then bundles). The whole
+  // family lands ahead of heartbeat_runs / agent_api_keys / issues / agents:
+  // every table here holds a NO ACTION reference to at least one of those.
+  // (decision_effect_executions has no company_id — it is emptied by the
+  // ON DELETE CASCADE from decisions below, which still runs ahead of issues.)
+  decisionTargetIssues,
+  decisionTriageEvents,
+  decisionTriage,
+  decisionQueueItems,
+  decisionQueues,
+  decisionRetention,
+  decisionArchiveNotificationOutbox,
+  decisions,
+  decisionBundles,
   // Run + ledger rows (before heartbeat_runs / goals / projects / agents).
   heartbeatRunEvents,
   heartbeatRunWatchdogDecisions,
@@ -118,7 +142,8 @@ export const COMPANY_DELETE_SEQUENCE: readonly CompanyScopedTable[] = [
   // Skill studio (test runs RESTRICT skill versions, agents, and issues).
   companySkillTestRuns,
   companySkills,
-  // Secrets.
+  // Secrets (proposals reference companies with NO ACTION).
+  companySecretProposals,
   companySecretBindings,
   secretAccessEvents,
   companySecrets,
