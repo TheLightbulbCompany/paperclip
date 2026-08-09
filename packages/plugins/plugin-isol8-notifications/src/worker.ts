@@ -2,7 +2,8 @@ import { definePlugin, runWorker } from "@paperclipai/plugin-sdk";
 import type { PluginEvent } from "@paperclipai/plugin-sdk";
 
 /**
- * Forward approval + run-lifecycle events to the Isol8 backend.
+ * Forward the events that mean "a human is needed" to the Isol8 backend:
+ * thread interactions (a paused issue), approvals, and run lifecycle.
  *
  * Deliberately dumb: no filtering beyond the subscription list, no retries,
  * no buffering — the backend decides what becomes a notification, and event
@@ -18,8 +19,14 @@ import type { PluginEvent } from "@paperclipai/plugin-sdk";
  *
  * `approval.decided` is intentionally not subscribed — the deciding human
  * doesn't need a push about their own decision.
+ *
+ * `issue.thread_interaction_created` is the one that actually fires: it is
+ * emitted whenever an agent stops and asks a human to confirm, verify, answer,
+ * or triage, and the issue stays parked until they do. Isol8 production logged
+ * 27 of these — and zero approvals — before anything forwarded them.
  */
 const FORWARDED_EVENTS = [
+  "issue.thread_interaction_created",
   "approval.created",
   "approval.resubmitted",
   "agent.run.finished",

@@ -1696,6 +1696,13 @@ export const PLUGIN_EVENT_TYPES = [
   "issue.checked_out",
   "issue.released",
   "issue.assignment_wakeup_requested",
+  // A thread interaction pauses its issue until someone answers, so an
+  // integration that notifies humans has to hear about it. Only the CREATE is
+  // exposed: accepted/rejected are the answering human's own action (the same
+  // reasoning that keeps approval.decided off notify-shaped subscriptions), and
+  // the expired activity logs no addresseeAgentId, so a subscriber could not
+  // tell an abandoned human wait from a routine agent-to-agent one.
+  "issue.thread_interaction_created",
   "agent.created",
   "agent.updated",
   "agent.status_changed",
