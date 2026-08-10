@@ -31,6 +31,9 @@ const FORWARDED_EVENTS = [
   "approval.resubmitted",
   "agent.run.finished",
   "agent.run.failed",
+  // The circuit breaker parked a routine after consecutive failures; only a
+  // human Resume restarts it, so the owner must be told.
+  "routine.auto_paused",
 ] as const;
 
 const plugin = definePlugin({

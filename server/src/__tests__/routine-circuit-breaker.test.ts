@@ -15,6 +15,9 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
+import type { PluginEvent } from "@paperclipai/plugin-sdk";
+import { setPluginEventBus } from "../services/activity-log.js";
+import type { PluginEventBus } from "../services/plugin-event-bus.js";
 import { applyRoutineOutcome } from "../services/routine-circuit-breaker.js";
 import { issueService } from "../services/issues.js";
 import { routineService } from "../services/routines.js";
@@ -206,6 +209,36 @@ describeEmbeddedPostgres("routine circuit breaker", () => {
     await issuesSvc.update(issue.id, { status: "blocked" });
     const r = await getRoutine(routine.id);
     expect(r.consecutiveFailureCount).toBe(1);
+  });
+
+  // ---- Plugin event bus bridge ----
+
+  it("forwards routine.auto_paused to the plugin event bus with the breaker payload", async () => {
+    const emitted: PluginEvent[] = [];
+    setPluginEventBus({
+      emit: async (event: PluginEvent) => {
+        emitted.push(event);
+        return { errors: [] };
+      },
+      forPlugin: () => {
+        throw new Error("not used in this test");
+      },
+      clearPlugin: () => {},
+    } as unknown as PluginEventBus);
+
+    const { companyId, routine } = await seedRoutine({ consecutiveFailureCount: 2, autoPauseThreshold: 3 });
+    await applyRoutineOutcome(db, routine.id, companyId, "failed");
+
+    const event = emitted.find((e) => e.eventType === "routine.auto_paused");
+    expect(event).toBeDefined();
+    expect(event?.companyId).toBe(companyId);
+    expect(event?.entityType).toBe("routine");
+    expect(event?.entityId).toBe(routine.id);
+    expect(event?.payload).toMatchObject({
+      reason: "consecutive_failures",
+      threshold: 3,
+      consecutiveFailureCount: 3,
+    });
   });
 
   // ---- Resume + scheduler enforcement ----

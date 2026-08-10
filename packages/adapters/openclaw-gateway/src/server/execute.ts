@@ -112,6 +112,187 @@ const WAIT_RECONNECT_BACKOFF_MS = 2_000;
 const WAIT_RECONNECT_BACKOFF_MAX_MS = 30_000;
 const MAX_CONSECUTIVE_WAIT_RECONNECT_FAILURES = 8; // consecutive wait+reconnect failures (with growing backoff) before giving up — enough to ride out a gateway restart, but bounded so a dead gateway does not hang forever.
 
+// A single connect/handshake attempt never waits longer than this, whatever
+// the configured run timeout says.
+export const CONNECT_TIMEOUT_CAP_MS = 15_000;
+
+// --- Transient-failure retry budget ------------------------------------------
+// Isol8 backend deploys and container replacements drain the gateway for
+// multiple minutes; every wake in that window dies with "gateway connect
+// challenge timeout" (or econnrefused/econnreset). The widened budget below
+// applies only BEFORE the agent request is written to the socket — the one
+// window where a resend is provably duplicate-free. One failed attempt can burn up to FOUR sequential
+// connectTimeoutMs waits (ws open, connect challenge, connect request, agent
+// request), so the worst-case window is (retries+1) * 4*CONNECT_TIMEOUT_CAP_MS
+// plus max-jitter backoffs — 336s at this budget, pinned by a test to stay
+// well inside the 600s fleet run timeout.
+export const TRANSIENT_MAX_RETRIES = 4;
+// Once the agent request has been WRITTEN to the socket, the container may
+// have received it and started the run even if the ack never came back — a
+// re-send is no longer known to be idempotent, and another dispatch can
+// duplicate the run's side effects. Post-dispatch failures keep the
+// pre-self-healing budget: 2 retries, linear 2s/4s backoff, no recovery
+// contract on exhaustion.
+export const POST_DISPATCH_MAX_RETRIES = 2;
+const TRANSIENT_BACKOFF_CAP_MS = 30_000;
+const TRANSIENT_BACKOFF_JITTER_RATIO = 0.2;
+
+export function transientRetryBackoffMs(
+  retryCount: number,
+  random: () => number = Math.random,
+): number {
+  const base = Math.min(2 ** retryCount * 1000, TRANSIENT_BACKOFF_CAP_MS);
+  const sample = Math.min(1, Math.max(0, random()));
+  return Math.round(base * (1 + (2 * sample - 1) * TRANSIENT_BACKOFF_JITTER_RATIO));
+}
+
+/**
+ * Decide whether (and after what delay) a transient failure is retried
+ * in-process. `retryCount` is the number of retries already spent. Returns
+ * null when the applicable budget is exhausted.
+ */
+export function transientRetryPlan(
+  agentDispatched: boolean,
+  retryCount: number,
+  random: () => number = Math.random,
+): { backoffMs: number } | null {
+  if (agentDispatched) {
+    return retryCount < POST_DISPATCH_MAX_RETRIES ? { backoffMs: (retryCount + 1) * 2000 } : null;
+  }
+  return retryCount < TRANSIENT_MAX_RETRIES
+    ? { backoffMs: transientRetryBackoffMs(retryCount + 1, random) }
+    : null;
+}
+
+/**
+ * Classify a thrown gateway run error by its message. Transient means "the
+ * gateway itself was unreachable or dropped us" — worth retrying in-process.
+ * An `agent.wait` timeout is excluded: the run was accepted and is bounded by
+ * awaitRunResilient, so its timeout is a run outcome, not a connection blip.
+ */
+export function classifyGatewayRunError(message: string): {
+  timedOut: boolean;
+  pairingRequired: boolean;
+  isTransient: boolean;
+} {
+  const lower = message.toLowerCase();
+  const timedOut = lower.includes("timeout");
+  const pairingRequired = lower.includes("pairing required");
+  return {
+    timedOut,
+    pairingRequired,
+    isTransient:
+      !pairingRequired &&
+      (lower.includes("econnrefused") ||
+        lower.includes("econnreset") ||
+        lower.includes("socket hang up") ||
+        (timedOut && !lower.includes("agent.wait"))),
+  };
+}
+
+/**
+ * The Isol8 backend refuses an agent wake when the owner's budget is exhausted
+ * (subscription inactive, trial expired, daily cap). The refusal frame's
+ * `error.details` carries `reason: "wake_admission_gate"` — a deliberate,
+ * machine-readable contract (see isol8 `_wake_refusal_payload`), unlike the
+ * message-substring matching everywhere else. Classify it as provider_quota so
+ * the server parks the run instead of finalizing it as a plain failure.
+ *
+ * retryNotBefore: an explicit hint in the refusal payload wins; otherwise a
+ * `trial_daily_cap` refusal parks at the next UTC midnight (same jittered
+ * instant as classifyDailyBudgetCapDenial — it is the identical condition,
+ * refused at the door instead of denied in-band). The server's own 2m→2h
+ * retry ladder would exhaust long before the cap resets. Codes with no known
+ * reset instant carry no park.
+ */
+export const WAKE_ADMISSION_GATE_REASON = "wake_admission_gate";
+const WAKE_ADMISSION_DAILY_CAP_CODE = "trial_daily_cap";
+
+export function classifyWakeAdmissionGateRefusal(
+  err: unknown,
+  now: Date = new Date(),
+  random: () => number = Math.random,
+): {
+  errorCode: "provider_quota";
+  errorFamily: "provider_quota";
+  retryNotBefore: string | null;
+} | null {
+  const details = getGatewayErrorDetails(err);
+  if (nonEmpty(details?.reason) !== WAKE_ADMISSION_GATE_REASON) return null;
+  const hinted = nonEmpty(details?.retryNotBefore);
+  return {
+    errorCode: "provider_quota",
+    errorFamily: "provider_quota",
+    retryNotBefore:
+      hinted ??
+      (nonEmpty(details?.code) === WAKE_ADMISSION_DAILY_CAP_CODE
+        ? dailyCapRetryNotBefore(now, random)
+        : null),
+  };
+}
+
+// When the in-process retry budget is spent on a PRE-dispatch transient
+// failure, hand the run to the server's bounded retry
+// (scheduleBoundedRetryForRun) instead of finalizing it failed: errorFamily
+// "transient_upstream" is what readHeartbeatRunErrorFamily engages on, and
+// retryNotBefore parks the next attempt past the tail of a deploy drain.
+// A POST-dispatch failure never gets the label — the request reached the
+// socket, so the container may be executing the run, and a server re-dispatch
+// could duplicate its side effects.
+const TRANSIENT_EXHAUSTION_RETRY_NOT_BEFORE_MS = 120_000;
+
+export function transientExhaustionRecovery(
+  agentDispatched: boolean,
+  now: Date = new Date(),
+): { errorFamily: "transient_upstream"; retryNotBefore: string } | null {
+  if (agentDispatched) return null;
+  return {
+    errorFamily: "transient_upstream",
+    retryNotBefore: new Date(now.getTime() + TRANSIENT_EXHAUSTION_RETRY_NOT_BEFORE_MS).toISOString(),
+  };
+}
+
+/**
+ * Build the terminal failure result once the in-process budget is spent (or
+ * the failure was never retryable).
+ *
+ * When the pre-dispatch recovery contract attaches, `timedOut` is forced
+ * FALSE even for timeout-flavored messages: heartbeat's finalize maps
+ * `timedOut` results to outcome "timed_out" and invokes
+ * scheduleBoundedRetryForRun only for outcome "failed", so timedOut:true
+ * would strand the errorFamily park and finalize the run terminally — exactly
+ * on the deploy-drain "gateway connect challenge timeout" path the park
+ * exists for. Semantically no run was ever dispatched, so nothing "timed
+ * out"; the errorCode keeps the openclaw_gateway_timeout flavor for
+ * observability. Post-dispatch results keep `timedOut` as-is (pre-existing
+ * semantics, no recovery contract).
+ */
+export function buildTerminalFailureResult(input: {
+  message: string;
+  agentDispatched: boolean;
+  latestResultPayload: unknown;
+  now?: Date;
+}): AdapterExecutionResult {
+  const { timedOut, pairingRequired, isTransient } = classifyGatewayRunError(input.message);
+  const recovery = isTransient ? transientExhaustionRecovery(input.agentDispatched, input.now) : null;
+  const detailedMessage = pairingRequired
+    ? `${input.message}. Approve the pending device in OpenClaw (for example: openclaw devices approve --latest --url <gateway-ws-url> --token <gateway-token>) and retry. Ensure this agent has a persisted adapterConfig.devicePrivateKeyPem so approvals are reused.`
+    : input.message;
+  return {
+    exitCode: 1,
+    signal: null,
+    timedOut: recovery ? false : timedOut,
+    errorMessage: detailedMessage,
+    errorCode: timedOut
+      ? "openclaw_gateway_timeout"
+      : pairingRequired
+        ? "openclaw_gateway_pairing_required"
+        : "openclaw_gateway_request_failed",
+    ...(recovery ?? {}),
+    resultJson: asRecord(input.latestResultPayload),
+  };
+}
+
 const SENSITIVE_LOG_KEY_PATTERN =
   /(^|[_-])(auth|authorization|token|secret|password|api[_-]?key|private[_-]?key)([_-]|$)|^x-openclaw-(auth|token)$/i;
 
@@ -1123,19 +1304,23 @@ export function nextUtcMidnight(now: Date): Date {
   return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
 }
 
+function dailyCapRetryNotBefore(now: Date, random: () => number): string {
+  const sample = Math.min(1, Math.max(0, random()));
+  const jitterMs = DAILY_BUDGET_CAP_RETRY_JITTER_MIN_MS +
+    Math.round(sample * DAILY_BUDGET_CAP_RETRY_JITTER_RANGE_MS);
+  return new Date(nextUtcMidnight(now).getTime() + jitterMs).toISOString();
+}
+
 export function classifyDailyBudgetCapDenial(
   errorMessage: string | null | undefined,
   now: Date = new Date(),
   random: () => number = Math.random,
 ): { errorCode: "provider_quota"; errorFamily: "provider_quota"; retryNotBefore: string } | null {
   if (!errorMessage?.toLowerCase().includes(DAILY_BUDGET_CAP_ERROR_SNIPPET)) return null;
-  const sample = Math.min(1, Math.max(0, random()));
-  const jitterMs = DAILY_BUDGET_CAP_RETRY_JITTER_MIN_MS +
-    Math.round(sample * DAILY_BUDGET_CAP_RETRY_JITTER_RANGE_MS);
   return {
     errorCode: "provider_quota",
     errorFamily: "provider_quota",
-    retryNotBefore: new Date(nextUtcMidnight(now).getTime() + jitterMs).toISOString(),
+    retryNotBefore: dailyCapRetryNotBefore(now, random),
   };
 }
 
@@ -1288,7 +1473,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
   const timeoutSec = Math.max(0, Math.floor(asNumber(ctx.config.timeoutSec, 120)));
   const timeoutMs = timeoutSec > 0 ? timeoutSec * 1000 : 0;
-  const connectTimeoutMs = timeoutMs > 0 ? Math.min(timeoutMs, 15_000) : 10_000;
+  const connectTimeoutMs = timeoutMs > 0 ? Math.min(timeoutMs, CONNECT_TIMEOUT_CAP_MS) : 10_000;
   const waitTimeoutMs = parseOptionalPositiveInteger(ctx.config.waitTimeoutMs) ?? (timeoutMs > 0 ? timeoutMs : 30_000);
   // Detached-run waiting: `agent.wait` is polled in `waitSliceMs` slices and the
   // total run is bounded by `maxRunMs`, not by a single wall-clock wait. Defaults
@@ -1401,7 +1586,13 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   let latestResultPayload: unknown = null;
   let retryCount = 0;
   let dispatchReported = false;
-  const MAX_RETRIES = 2;
+  // Flips the moment an agent request is handed to the socket (plus a
+  // belt-and-braces set on any tracked-run event). A dispatched-but-unacked
+  // request may still have reached the container and started the run, so
+  // past that point a re-send may duplicate side effects and the widened
+  // retry/recovery semantics apply only while this is false. Never reset:
+  // one dispatch taints every later attempt.
+  let agentDispatched = false;
 
   const reportDispatch = () => {
     if (dispatchReported) return;
@@ -1436,6 +1627,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // Any event for the tracked run is liveness evidence for awaitRunResilient's
       // stall bound (reliable across reconnects — an active run keeps emitting).
       lastEventAt = Date.now();
+      agentDispatched = true;
 
       const stream = nonEmpty(payload.stream) ?? "unknown";
       const data = asRecord(payload.data) ?? {};
@@ -1563,6 +1755,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       // once it is sent, retrying would be unsafe because the gateway may have
       // accepted work even if the response is lost.
       reportDispatch();
+      // From here the request is on the wire: treat the run as possibly
+      // accepted even if the ack never arrives.
+      agentDispatched = true;
       const acceptedPayload = await client.request<Record<string, unknown>>("agent", agentParams, {
         timeoutMs: connectTimeoutMs,
       });
@@ -1719,9 +1914,29 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
-      const lower = message.toLowerCase();
-      const timedOut = lower.includes("timeout");
-      const pairingRequired = lower.includes("pairing required");
+
+      // Reason-based classification first: a wake-gate refusal is neither
+      // transient (retrying re-hits the same gate) nor a plain failure (it
+      // must park as provider_quota, not finalize the agent into error).
+      const wakeGateRefusal = classifyWakeAdmissionGateRefusal(err);
+      if (wakeGateRefusal) {
+        await ctx.onLog("stderr", `[openclaw-gateway] wake refused by admission gate: ${message}\n`);
+        return {
+          exitCode: 1,
+          signal: null,
+          timedOut: false,
+          errorMessage: message,
+          errorCode: wakeGateRefusal.errorCode,
+          errorFamily: wakeGateRefusal.errorFamily,
+          ...(wakeGateRefusal.retryNotBefore ? { retryNotBefore: wakeGateRefusal.retryNotBefore } : {}),
+          resultJson: {
+            ...(asRecord(latestResultPayload) ?? {}),
+            gatewayErrorCode: "openclaw_gateway_request_failed",
+          },
+        };
+      }
+
+      const { pairingRequired, isTransient } = classifyGatewayRunError(message);
 
       if (
         pairingRequired &&
@@ -1760,42 +1975,21 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       }
 
       // Retry transient errors (connection refused, reset, socket hang up)
-      const isTransient =
-        !pairingRequired &&
-        (lower.includes("econnrefused") ||
-          lower.includes("econnreset") ||
-          lower.includes("socket hang up") ||
-          (timedOut && !lower.includes("agent.wait")));
-
-      if (isTransient && !dispatchReported && retryCount < MAX_RETRIES) {
+      const retryPlan = isTransient ? transientRetryPlan(agentDispatched, retryCount) : null;
+      if (retryPlan) {
         retryCount++;
-        const backoffMs = retryCount * 2000;
+        const retryBudget = agentDispatched ? POST_DISPATCH_MAX_RETRIES : TRANSIENT_MAX_RETRIES;
         await ctx.onLog(
           "stdout",
-          `[openclaw-gateway] transient error, retry ${retryCount}/${MAX_RETRIES} after ${backoffMs}ms: ${message}\n`,
+          `[openclaw-gateway] transient error, retry ${retryCount}/${retryBudget} after ${retryPlan.backoffMs}ms: ${message}\n`,
         );
-        await new Promise((r) => setTimeout(r, backoffMs));
+        await new Promise((r) => setTimeout(r, retryPlan.backoffMs));
         continue;
       }
 
-      const detailedMessage = pairingRequired
-        ? `${message}. Approve the pending device in OpenClaw (for example: openclaw devices approve --latest --url <gateway-ws-url> --token <gateway-token>) and retry. Ensure this agent has a persisted adapterConfig.devicePrivateKeyPem so approvals are reused.`
-        : message;
-
-      await ctx.onLog("stderr", `[openclaw-gateway] request failed: ${detailedMessage}\n`);
-
-      return {
-        exitCode: 1,
-        signal: null,
-        timedOut,
-        errorMessage: detailedMessage,
-        errorCode: timedOut
-          ? "openclaw_gateway_timeout"
-          : pairingRequired
-            ? "openclaw_gateway_pairing_required"
-            : "openclaw_gateway_request_failed",
-        resultJson: asRecord(latestResultPayload),
-      };
+      const terminalResult = buildTerminalFailureResult({ message, agentDispatched, latestResultPayload });
+      await ctx.onLog("stderr", `[openclaw-gateway] request failed: ${terminalResult.errorMessage}\n`);
+      return terminalResult;
     } finally {
       client.close();
     }

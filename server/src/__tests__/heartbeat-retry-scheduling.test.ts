@@ -2012,6 +2012,56 @@ describeEmbeddedPostgres("heartbeat bounded retry scheduling", () => {
     );
   });
 
+  // Contract pair with packages/adapters/openclaw-gateway/src/server/
+  // execute.test.ts ("buildTerminalFailureResult (heartbeat contract, adapter
+  // half)"): the adapter half pins that a pre-dispatch transient exhaustion
+  // (e.g. "gateway connect challenge timeout" during a deploy drain) returns
+  // timedOut:false so finalize maps it to outcome "failed"; this half pins
+  // that such a failed run — errorCode openclaw_gateway_timeout, family only
+  // in resultJson — schedules the bounded retry at the adapter's 120s park.
+  it("openclaw gateway transient exhaustion schedules the bounded retry", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const runId = randomUUID();
+    const now = new Date(2026, 7, 9, 12, 0, 0);
+    const retryNotBefore = new Date(now.getTime() + 120_000);
+
+    await seedRetryFixture({
+      runId,
+      companyId,
+      agentId,
+      now,
+      errorCode: "openclaw_gateway_timeout",
+      errorFamily: "transient_upstream",
+      adapterType: "openclaw_gateway",
+      agentName: "Friday",
+      retryNotBefore: retryNotBefore.toISOString(),
+    });
+
+    const scheduled = await heartbeat.scheduleBoundedRetry(runId, {
+      now,
+      random: () => 0.5,
+    });
+
+    expect(scheduled.outcome).toBe("scheduled");
+    if (scheduled.outcome !== "scheduled") return;
+    // First-attempt base backoff is 2m (jitter-neutral) and the park is 2m,
+    // so the due time is exactly the adapter's retryNotBefore.
+    expect(scheduled.dueAt.getTime()).toBe(retryNotBefore.getTime());
+
+    const retryRun = await db
+      .select({
+        scheduledRetryAt: heartbeatRuns.scheduledRetryAt,
+        contextSnapshot: heartbeatRuns.contextSnapshot,
+      })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, scheduled.run.id))
+      .then((rows) => rows[0] ?? null);
+    expect(retryRun?.scheduledRetryAt?.getTime()).toBe(retryNotBefore.getTime());
+    const contextSnapshot = (retryRun?.contextSnapshot as Record<string, unknown> | null) ?? {};
+    expect(contextSnapshot.transientRetryNotBefore).toBe(retryNotBefore.toISOString());
+  });
+
   it("schedules bounded retries for claude_transient_upstream and honors its retry-not-before hint", async () => {
     const companyId = randomUUID();
     const agentId = randomUUID();

@@ -2,13 +2,28 @@ import { describe, expect, it } from "vitest";
 import {
   awaitRunResilient,
   buildAgentParams,
+  buildTerminalFailureResult,
   classifyDailyBudgetCapDenial,
+  classifyGatewayRunError,
+  classifyWakeAdmissionGateRefusal,
+  CONNECT_TIMEOUT_CAP_MS,
   isWaitPending,
   nextUtcMidnight,
   pickAssistantChunk,
+  POST_DISPATCH_MAX_RETRIES,
   resolveClaimedApiKeyPath,
   resolveSessionKey,
+  TRANSIENT_MAX_RETRIES,
+  transientExhaustionRecovery,
+  transientRetryBackoffMs,
+  transientRetryPlan,
 } from "./execute.js";
+
+function gatewayError(message: string, details?: Record<string, unknown>): Error {
+  const err = new Error(message) as Error & { gatewayDetails?: Record<string, unknown> };
+  if (details) err.gatewayDetails = details;
+  return err;
+}
 
 describe("resolveSessionKey", () => {
   it("prefixes run-scoped session keys with the configured agent", () => {
@@ -474,5 +489,251 @@ describe("classifyDailyBudgetCapDenial", () => {
     expect(classifyDailyBudgetCapDenial("", now)).toBeNull();
     expect(classifyDailyBudgetCapDenial(null, now)).toBeNull();
     expect(classifyDailyBudgetCapDenial(undefined, now)).toBeNull();
+  });
+});
+
+describe("transientRetryBackoffMs", () => {
+  it("doubles per retry and caps at 30s (jitter neutral at random()=0.5)", () => {
+    const noJitter = () => 0.5;
+    expect(transientRetryBackoffMs(1, noJitter)).toBe(2_000);
+    expect(transientRetryBackoffMs(2, noJitter)).toBe(4_000);
+    expect(transientRetryBackoffMs(3, noJitter)).toBe(8_000);
+    expect(transientRetryBackoffMs(4, noJitter)).toBe(16_000);
+    expect(transientRetryBackoffMs(5, noJitter)).toBe(30_000);
+    expect(transientRetryBackoffMs(6, noJitter)).toBe(30_000);
+  });
+
+  it("bounds jitter to ±20% of the base delay", () => {
+    expect(transientRetryBackoffMs(3, () => 0)).toBe(6_400);
+    expect(transientRetryBackoffMs(3, () => 1)).toBe(9_600);
+    for (let retry = 1; retry <= TRANSIENT_MAX_RETRIES; retry += 1) {
+      const base = Math.min(2 ** retry * 1000, 30_000);
+      for (const sample of [0, 0.25, 0.5, 0.75, 1]) {
+        const delay = transientRetryBackoffMs(retry, () => sample);
+        expect(delay).toBeGreaterThanOrEqual(base * 0.8);
+        expect(delay).toBeLessThanOrEqual(base * 1.2);
+      }
+    }
+  });
+
+  it("keeps the worst-case retry window well inside the 600s fleet run timeout", () => {
+    // One pre-acceptance attempt can burn FOUR sequential connectTimeoutMs
+    // waits: ws open, connect challenge, connect request, agent request.
+    const fleetRunTimeoutMs = 600_000;
+    const attempts = TRANSIENT_MAX_RETRIES + 1;
+    const worstPerAttemptMs = 4 * CONNECT_TIMEOUT_CAP_MS;
+    let worstBackoffTotalMs = 0;
+    for (let retry = 1; retry <= TRANSIENT_MAX_RETRIES; retry += 1) {
+      worstBackoffTotalMs += transientRetryBackoffMs(retry, () => 1);
+    }
+    const worstCaseWindowMs = attempts * worstPerAttemptMs + worstBackoffTotalMs;
+    expect(worstCaseWindowMs).toBeLessThanOrEqual(370_000);
+    expect(fleetRunTimeoutMs - worstCaseWindowMs).toBeGreaterThanOrEqual(230_000);
+  });
+});
+
+describe("transientRetryPlan", () => {
+  it("gives pre-dispatch failures the widened exponential budget", () => {
+    const noJitter = () => 0.5;
+    expect(transientRetryPlan(false, 0, noJitter)).toEqual({ backoffMs: 2_000 });
+    expect(transientRetryPlan(false, 2, noJitter)).toEqual({ backoffMs: 8_000 });
+    expect(transientRetryPlan(false, TRANSIENT_MAX_RETRIES - 1, noJitter)).not.toBeNull();
+    expect(transientRetryPlan(false, TRANSIENT_MAX_RETRIES, noJitter)).toBeNull();
+  });
+
+  it("keeps the legacy 2-retry linear budget once the agent request was dispatched", () => {
+    expect(POST_DISPATCH_MAX_RETRIES).toBe(2);
+    expect(transientRetryPlan(true, 0)).toEqual({ backoffMs: 2_000 });
+    expect(transientRetryPlan(true, 1)).toEqual({ backoffMs: 4_000 });
+    expect(transientRetryPlan(true, 2)).toBeNull();
+  });
+});
+
+describe("classifyGatewayRunError", () => {
+  it("classifies connection-level failures as transient", () => {
+    expect(classifyGatewayRunError("connect ECONNREFUSED 10.0.1.12:443").isTransient).toBe(true);
+    expect(classifyGatewayRunError("read ECONNRESET").isTransient).toBe(true);
+    expect(classifyGatewayRunError("socket hang up").isTransient).toBe(true);
+  });
+
+  it("classifies the deploy-drain connect challenge timeout as transient", () => {
+    const classified = classifyGatewayRunError("gateway connect challenge timeout");
+    expect(classified.isTransient).toBe(true);
+    expect(classified.timedOut).toBe(true);
+  });
+
+  it("does not classify an agent.wait timeout as transient", () => {
+    const classified = classifyGatewayRunError("gateway request timeout: agent.wait");
+    expect(classified.isTransient).toBe(false);
+    expect(classified.timedOut).toBe(true);
+  });
+
+  it("does not classify pairing-required as transient", () => {
+    const classified = classifyGatewayRunError("gateway connect failed: pairing required");
+    expect(classified.pairingRequired).toBe(true);
+    expect(classified.isTransient).toBe(false);
+  });
+
+  it("leaves ordinary run errors non-transient", () => {
+    const classified = classifyGatewayRunError("OpenClaw gateway run failed");
+    expect(classified).toEqual({ timedOut: false, pairingRequired: false, isTransient: false });
+  });
+});
+
+describe("classifyWakeAdmissionGateRefusal", () => {
+  const now = new Date("2026-07-24T18:31:07.000Z");
+
+  it("maps an Isol8 wake-gate refusal to provider_quota with no park when the code has no known reset", () => {
+    const refusal = classifyWakeAdmissionGateRefusal(
+      gatewayError("Your subscription is inactive", {
+        reason: "wake_admission_gate",
+        code: "subscription_inactive",
+      }),
+    );
+    expect(refusal).toEqual({
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      retryNotBefore: null,
+    });
+  });
+
+  it("parks a trial_daily_cap refusal at the next UTC midnight like the in-band cap denial", () => {
+    const refusal = classifyWakeAdmissionGateRefusal(
+      gatewayError("You've used today's free allowance", {
+        reason: "wake_admission_gate",
+        code: "trial_daily_cap",
+      }),
+      now,
+      () => 0,
+    );
+    expect(refusal).toEqual({
+      errorCode: "provider_quota",
+      errorFamily: "provider_quota",
+      retryNotBefore: "2026-07-25T00:01:00.000Z",
+    });
+    expect(refusal?.retryNotBefore).toBe(
+      classifyDailyBudgetCapDenial("daily free limit reached", now, () => 0)?.retryNotBefore,
+    );
+  });
+
+  it("carries an explicit retry hint through, ahead of the code-derived park", () => {
+    const refusal = classifyWakeAdmissionGateRefusal(
+      gatewayError("Out for today", {
+        reason: "wake_admission_gate",
+        code: "trial_daily_cap",
+        retryNotBefore: "2026-08-10T00:03:00.000Z",
+      }),
+      now,
+      () => 0,
+    );
+    expect(refusal?.retryNotBefore).toBe("2026-08-10T00:03:00.000Z");
+  });
+
+  it("ignores errors without the wake_admission_gate reason", () => {
+    expect(classifyWakeAdmissionGateRefusal(gatewayError("gateway request failed"))).toBeNull();
+    expect(
+      classifyWakeAdmissionGateRefusal(gatewayError("denied", { reason: "something_else" })),
+    ).toBeNull();
+    expect(classifyWakeAdmissionGateRefusal("not an error")).toBeNull();
+    expect(classifyWakeAdmissionGateRefusal(null)).toBeNull();
+  });
+});
+
+// Contract pair with server/src/__tests__/heartbeat-retry-scheduling.test.ts
+// ("openclaw gateway transient exhaustion schedules the bounded retry"):
+// this half pins that the adapter's exhaustion result maps to heartbeat
+// outcome "failed" (timedOut false, exitCode 1, errorMessage set) — the ONLY
+// outcome scheduleBoundedRetryForRun engages on; the server half pins that a
+// failed run persisted with this metadata actually schedules the retry.
+describe("buildTerminalFailureResult (heartbeat contract, adapter half)", () => {
+  const now = new Date("2026-08-09T12:00:00.000Z");
+
+  it("returns a FAILED-mapping result for challenge-timeout exhaustion: timedOut false, timeout errorCode kept, transient_upstream attached", () => {
+    const result = buildTerminalFailureResult({
+      message: "gateway connect challenge timeout",
+      agentDispatched: false,
+      latestResultPayload: null,
+      now,
+    });
+    expect(result.timedOut).toBe(false);
+    expect(result.exitCode).toBe(1);
+    expect(result.errorMessage).toBe("gateway connect challenge timeout");
+    expect(result.errorCode).toBe("openclaw_gateway_timeout");
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(result.retryNotBefore).toBe("2026-08-09T12:02:00.000Z");
+  });
+
+  it("keeps timedOut true and attaches no recovery for a post-dispatch timeout", () => {
+    const result = buildTerminalFailureResult({
+      message: "gateway request timeout (agent.wait)",
+      agentDispatched: true,
+      latestResultPayload: null,
+      now,
+    });
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("openclaw_gateway_timeout");
+    expect(result.errorFamily).toBeUndefined();
+    expect(result.retryNotBefore).toBeUndefined();
+  });
+
+  it("treats a sent-but-unacknowledged agent request as possibly accepted: legacy retry cap, no transient_upstream", () => {
+    // The agent request frame reached the socket but the ack never came back
+    // (connection dropped / request timeout). The container may have received
+    // it and started the run, so no re-dispatch contract may attach.
+    const result = buildTerminalFailureResult({
+      message: "gateway request timeout (agent)",
+      agentDispatched: true,
+      latestResultPayload: null,
+      now,
+    });
+    expect(result.errorFamily).toBeUndefined();
+    expect(result.retryNotBefore).toBeUndefined();
+    expect(result.timedOut).toBe(true);
+    expect(result.errorCode).toBe("openclaw_gateway_timeout");
+    // In-process retries stay at the legacy cap on this path.
+    expect(transientRetryPlan(true, 0)).toEqual({ backoffMs: 2_000 });
+    expect(transientRetryPlan(true, POST_DISPATCH_MAX_RETRIES)).toBeNull();
+  });
+
+  it("keeps the pairing-required guidance and terminal semantics unchanged", () => {
+    const result = buildTerminalFailureResult({
+      message: "gateway connect failed: pairing required",
+      agentDispatched: false,
+      latestResultPayload: null,
+      now,
+    });
+    expect(result.timedOut).toBe(false);
+    expect(result.errorCode).toBe("openclaw_gateway_pairing_required");
+    expect(result.errorMessage).toContain("pairing required");
+    expect(result.errorMessage).toContain("openclaw devices approve");
+    expect(result.errorFamily).toBeUndefined();
+  });
+
+  it("leaves non-transient failures as plain request failures with the last payload attached", () => {
+    const result = buildTerminalFailureResult({
+      message: "OpenClaw gateway run failed",
+      agentDispatched: false,
+      latestResultPayload: { status: "error" },
+      now,
+    });
+    expect(result.timedOut).toBe(false);
+    expect(result.errorCode).toBe("openclaw_gateway_request_failed");
+    expect(result.errorFamily).toBeUndefined();
+    expect(result.resultJson).toEqual({ status: "error" });
+  });
+});
+
+describe("transientExhaustionRecovery", () => {
+  it("parks a PRE-dispatch exhaustion as transient_upstream with retryNotBefore 120s out, ISO-formatted", () => {
+    const now = new Date("2026-08-09T12:00:00.000Z");
+    expect(transientExhaustionRecovery(false, now)).toEqual({
+      errorFamily: "transient_upstream",
+      retryNotBefore: "2026-08-09T12:02:00.000Z",
+    });
+  });
+
+  it("never labels a post-dispatch failure: a server re-dispatch could duplicate a possibly-started run's side effects", () => {
+    expect(transientExhaustionRecovery(true)).toBeNull();
+    expect(transientExhaustionRecovery(true, new Date("2026-08-09T12:00:00.000Z"))).toBeNull();
   });
 });

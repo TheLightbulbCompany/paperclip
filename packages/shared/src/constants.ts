@@ -1713,6 +1713,12 @@ export const PLUGIN_EVENT_TYPES = [
   "agent.run.cancelled",
   "goal.created",
   "goal.updated",
+  // The routine circuit breaker auto-pauses a routine after N consecutive
+  // failed runs, and nothing re-enables it without a human Resume — so an
+  // integration that notifies humans has to hear about it. The activity-log
+  // bridge forwards the breaker's payload (reason / threshold /
+  // consecutiveFailureCount) as-is.
+  "routine.auto_paused",
   "approval.created",
   "approval.resubmitted",
   "approval.decided",
