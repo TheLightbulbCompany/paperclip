@@ -160,7 +160,15 @@ DELETE /api/routine-triggers/{triggerId}
 POST /api/routine-triggers/{triggerId}/rotate-secret
 ```
 
-Generates a new signing secret for webhook triggers. The previous secret is immediately invalidated.
+Rotates a webhook trigger's signing secret. By default a fresh random secret is generated and the previous one is immediately invalidated.
+
+Board actors may instead supply a specific `secret` in the request body to arm the trigger with a provider-imposed value (e.g. a Stripe endpoint's `whsec_`), so the provider's own signature verifies natively against it. Agents may only rotate to a random secret, never choose a specific value.
+
+Body (optional):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `secret` | string (1–512 chars) | Arm the trigger with this exact value instead of a generated one. Board actors only. |
 
 ## Manual Run
 

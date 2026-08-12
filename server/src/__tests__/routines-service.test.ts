@@ -1279,6 +1279,31 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     await expect(svc.deleteTrigger(created.trigger.id, { agentId })).resolves.toMatchObject({ deleted: true });
   });
 
+  it("arms a webhook trigger with a caller-supplied secret (board), but forbids agents from choosing one", async () => {
+    const { agentId, routine, svc } = await seedFixture();
+    const created = await svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "hmac_sha256",
+      replayWindowSec: 300,
+    }, {});
+
+    // Board actor may arm the trigger with a SPECIFIC secret — the exact value
+    // passed is what gets stored, so a provider-imposed whsec_ can be verified
+    // natively instead of at an edge.
+    const armed = await svc.rotateTriggerSecret(created.trigger.id, {}, "whsec_supplied_value");
+    expect(armed.secretMaterial.webhookSecret).toBe("whsec_supplied_value");
+
+    // An agent may still rotate to a fresh RANDOM secret (escape hatch)...
+    const agentRotated = await svc.rotateTriggerSecret(created.trigger.id, { agentId });
+    expect(agentRotated.secretMaterial.webhookSecret).toBeTruthy();
+    expect(agentRotated.secretMaterial.webhookSecret).not.toBe("whsec_supplied_value");
+
+    // ...but may NOT choose a specific value: knowing it would let the agent
+    // forge externally-signed fires of the trigger.
+    await expect(svc.rotateTriggerSecret(created.trigger.id, { agentId }, "whsec_agent_chosen"))
+      .rejects.toThrow(/board actors/i);
+  });
+
   it("still allows user actors to create and loosen webhook triggers with signing disabled", async () => {
     const { routine, svc } = await seedFixture();
 

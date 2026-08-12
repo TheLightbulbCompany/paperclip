@@ -670,9 +670,9 @@ const responses = {
   },
 };
 
-const jsonBody = (schema: z.ZodTypeAny) => ({
+const jsonBody = (schema: z.ZodTypeAny, required = true) => ({
   content: { "application/json": { schema } },
-  required: true as const,
+  required,
 });
 
 // The company import + preview routes accept the inline JSON body or the raw
@@ -4447,7 +4447,8 @@ registry.registerPath({
   summary: "Rotate a routine trigger secret",
   request: {
     params: z.object({ id: z.string() }),
-    body: jsonBody(rotateRoutineTriggerSecretSchema),
+    // Optional body — an omitted body rotates to a fresh random secret.
+    body: jsonBody(rotateRoutineTriggerSecretSchema, false),
   },
   responses: {
     200: r.ok(),

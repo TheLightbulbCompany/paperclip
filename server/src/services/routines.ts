@@ -2657,6 +2657,7 @@ export function routineService(
     rotateTriggerSecret: async (
       id: string,
       actor: Actor,
+      providedSecret?: string,
     ): Promise<{ trigger: RoutineTrigger; secretMaterial: RoutineTriggerSecretMaterial; revision: RoutineRevision }> => {
       const existing = await getTriggerById(id);
       if (!existing) throw notFound("Routine trigger not found");
@@ -2664,7 +2665,17 @@ export function routineService(
         throw unprocessable("Only webhook triggers can rotate secrets");
       }
 
-      const secretValue = crypto.randomBytes(24).toString("hex");
+      // An agent must not be able to CHOOSE a trigger's signing secret: knowing
+      // it would let the agent forge externally-signed fires of a trigger it
+      // otherwise only reaches from inside the company. Supplying a specific
+      // secret (arming a provider-imposed whsec_) is a board-only action; agents
+      // may still rotate to a fresh RANDOM secret. Same posture as the agent
+      // trigger-auth guard (#15).
+      if (providedSecret !== undefined && actor.agentId) {
+        throw unprocessable("Only board actors may set a specific webhook trigger secret");
+      }
+
+      const secretValue = providedSecret ?? crypto.randomBytes(24).toString("hex");
       await secretsSvc.rotate(existing.secretId, { value: secretValue }, actor);
       const { trigger, revision } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;

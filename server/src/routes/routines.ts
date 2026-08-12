@@ -596,11 +596,15 @@ export function routineRoutes(
         res.status(404).json({ error: "Routine trigger not found" });
         return;
       }
-      const rotated = await svc.rotateTriggerSecret(trigger.id, {
-        agentId: req.actor.type === "agent" ? req.actor.agentId : null,
-        userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
-        runId: req.actor.runId ?? null,
-      });
+      const rotated = await svc.rotateTriggerSecret(
+        trigger.id,
+        {
+          agentId: req.actor.type === "agent" ? req.actor.agentId : null,
+          userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
+          runId: req.actor.runId ?? null,
+        },
+        (req.body as { secret?: string } | undefined)?.secret,
+      );
       const actor = getActorInfo(req);
       await logActivity(db, {
         companyId: routine.companyId,
