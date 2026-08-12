@@ -1,4 +1,4 @@
-import { and, count, eq, gte, inArray, isNull, lt, notInArray, sql } from "drizzle-orm";
+import { and, count, eq, gte, inArray, isNull, like, lt, ne, notInArray, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   companies,
@@ -12,6 +12,7 @@ import {
   agentWakeupRequests,
   budgetIncidents,
   budgetPolicies,
+  cases,
   decisionArchiveNotificationOutbox,
   decisionBundles,
   decisionQueueItems,
@@ -418,23 +419,84 @@ export function companyService(db: Db) {
     return { fromPrefix: locked.issuePrefix, toPrefix: candidate };
   }
 
-  async function createCompanyWithUniquePrefix(data: typeof companies.$inferInsert) {
-    const base = deriveIssuePrefixBase(data.name);
-    let suffix = 1;
-    while (suffix <= MAX_ISSUE_PREFIX_ATTEMPTS) {
-      const candidate = `${base}${issuePrefixSuffixForAttempt(suffix)}`;
+  // Attempts for a prefix conflict the pre-select could not have seen. Small
+  // on purpose: allocations that go through allocateIssuePrefix serialize on
+  // its lock and never contend with each other here — what remains is
+  // allocator-external writers (resolveCloudTenantActor inserts a company
+  // with its own stack-derived prefix without taking the lock).
+  const ISSUE_PREFIX_CONFLICT_ATTEMPTS = 3;
+
+  /** Re-run a whole transaction when it loses the issue-prefix unique index.
+   *
+   * MUST wrap the transaction, never sit inside it: Postgres aborts the
+   * transaction on a constraint violation, so a retry in place fails 25P02
+   * ("current transaction is aborted") instead of trying the next suffix.
+   */
+  async function retryOnIssuePrefixConflict<T>(run: () => Promise<T>): Promise<T> {
+    for (let attempt = 1; ; attempt += 1) {
       try {
-        const rows = await db
+        return await run();
+      } catch (error) {
+        if (attempt >= ISSUE_PREFIX_CONFLICT_ATTEMPTS || !isIssuePrefixConflict(error)) throw error;
+      }
+    }
+  }
+
+  /** The single allocator BOTH the create and rename paths go through.
+   *
+   * Serializes on the derived base, the way nextCaseIdentity serializes case
+   * numbering. Without one shared lock, concurrent allocators each pre-select
+   * the same free candidate and all but one lose the unique index — and a
+   * bounded retry cannot be relied on to converge, because every round can be
+   * stolen again. Holding the lock, each allocation runs after the previous
+   * one committed, sees that prefix as taken, and takes the next suffix.
+   *
+   * Transaction-scoped, so it releases at commit: every caller MUST be inside
+   * a transaction, or the lock drops at statement end and buys nothing.
+   *
+   * ``excludeCompanyId`` is the row being renamed — its own current prefix
+   * must not count as taken.
+   */
+  async function allocateIssuePrefix(
+    tx: Pick<Db, "select" | "execute">,
+    name: string,
+    excludeCompanyId?: string,
+  ) {
+    const base = deriveIssuePrefixBase(name);
+    await tx.execute(sql`select pg_advisory_xact_lock(hashtext(${`paperclip:issue-prefix:${base}`}))`);
+    const takenRows = await tx
+      .select({ issuePrefix: companies.issuePrefix })
+      .from(companies)
+      .where(
+        excludeCompanyId
+          ? and(like(companies.issuePrefix, `${base}%`), ne(companies.id, excludeCompanyId))
+          : like(companies.issuePrefix, `${base}%`),
+      );
+    const taken = new Set(takenRows.map((row) => row.issuePrefix));
+    for (let attempt = 1; attempt < 10000; attempt += 1) {
+      const candidate = `${base}${issuePrefixSuffixForAttempt(attempt)}`;
+      if (!taken.has(candidate)) return candidate;
+    }
+    return null;
+  }
+
+  async function createCompanyWithUniquePrefix(data: typeof companies.$inferInsert) {
+    // The insert runs inside a transaction so the allocator's advisory lock
+    // holds until it commits — that is what stops a create from claiming the
+    // prefix a concurrent rename already selected, and vice versa. The retry
+    // wraps the transaction (see retryOnIssuePrefixConflict) because a
+    // conflict aborts it.
+    return retryOnIssuePrefixConflict(() =>
+      db.transaction(async (tx) => {
+        const allocated = await allocateIssuePrefix(tx, data.name);
+        if (!allocated) throw new Error("Unable to allocate unique issue prefix");
+        const rows = await tx
           .insert(companies)
-          .values({ ...data, issuePrefix: candidate })
+          .values({ ...data, issuePrefix: allocated })
           .returning();
         return rows[0];
-      } catch (error) {
-        if (!isIssuePrefixConflict(error)) throw error;
-      }
-      suffix += 1;
-    }
-    throw new Error("Unable to allocate unique issue prefix");
+      }),
+    );
   }
 
   return {
@@ -475,13 +537,51 @@ export function companyService(db: Db) {
       data: Partial<typeof companies.$inferInsert> & { logoAssetId?: string | null },
       actor: CompanyActivityActor = SYSTEM_COMPANY_ACTOR,
     ) => {
-      const result = await db.transaction(async (tx) => {
+      const runUpdateTx = () => db.transaction(async (tx) => {
         const existing = await getCompanyQuery(tx)
           .where(eq(companies.id, id))
           .then((rows) => rows[0] ?? null);
         if (!existing) return null;
 
         const { logoAssetId, ...companyPatch } = data;
+
+        // Companies are created under a placeholder name and the issue prefix
+        // freezes at insert. A rename that lands before anything has minted an
+        // identifier (no issues, no cases) re-derives the prefix from the name
+        // actually chosen; once identifiers exist the prefix is permanent.
+        //
+        // The emptiness check re-reads the counter under FOR UPDATE: issue
+        // creation increments companies.issueCounter (taking this same row
+        // lock), so a concurrent create either commits first — the re-read
+        // sees a non-zero counter and the prefix stays — or blocks until this
+        // rename commits and mints its identifier from the new prefix. The
+        // pre-lock `existing` read is not trustworthy for this decision.
+        if (
+          companyPatch.issuePrefix === undefined &&
+          typeof companyPatch.name === "string" &&
+          companyPatch.name.trim() !== "" &&
+          companyPatch.name !== existing.name
+        ) {
+          const [locked] = await tx
+            .select({ issueCounter: companies.issueCounter, issuePrefix: companies.issuePrefix })
+            .from(companies)
+            .where(eq(companies.id, id))
+            .for("update");
+          if (locked?.issueCounter === 0) {
+            const [existingCase] = await tx
+              .select({ id: cases.id })
+              .from(cases)
+              .where(eq(cases.companyId, id))
+              .limit(1);
+            if (!existingCase) {
+              const candidate = await allocateIssuePrefix(tx, companyPatch.name, id);
+              if (candidate && candidate !== locked.issuePrefix) {
+                companyPatch.issuePrefix = candidate;
+              }
+            }
+          }
+        }
+
         const willReactivate = existing.status !== "active" && companyPatch.status === "active";
         const willArchive = existing.status !== "archived" && companyPatch.status === "archived";
 
@@ -589,6 +689,12 @@ export function companyService(db: Db) {
           issuePrefixRederived,
         };
       });
+      // Create and rename both serialize on allocateIssuePrefix's per-base
+      // advisory lock, so a candidate chosen under it cannot be claimed by
+      // another allocation before this transaction commits. The retry covers
+      // allocator-external writers only, and wraps the transaction because a
+      // conflict aborts it (see retryOnIssuePrefixConflict).
+      const result = await retryOnIssuePrefixConflict(runUpdateTx);
       if (!result) return null;
       if (result.issuePrefixRederived) {
         await logActivity(db, {

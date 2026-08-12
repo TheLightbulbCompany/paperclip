@@ -86,6 +86,114 @@ describeEmbeddedPostgres("companyService", () => {
     expect(rows.map((row) => row.issuePrefix).sort()).toEqual(["ARO", "AROA"]);
   });
 
+  it("recomputes the issue prefix when renamed before any issue or case exists", async () => {
+    const created = await companyService(db).create({ name: "Prasiddha" });
+    expect(created.issuePrefix).toBe("PRA");
+
+    const renamed = await companyService(db).update(created.id, { name: "GooseTown" });
+    expect(renamed?.issuePrefix).toBe("GOO");
+    expect(renamed?.name).toBe("GooseTown");
+  });
+
+  it("suffixes the recomputed prefix when the new base is already taken", async () => {
+    await db.insert(companies).values({
+      name: "Goose Existing",
+      issuePrefix: "GOO",
+    });
+    const created = await companyService(db).create({ name: "Prasiddha" });
+
+    const renamed = await companyService(db).update(created.id, { name: "GooseTown" });
+    expect(renamed?.issuePrefix).toBe("GOOA");
+  });
+
+  it("allocates distinct prefixes when many empty boards are renamed to the same base at once", async () => {
+    // Codex's scenario: without per-base serialization each of these
+    // pre-selects the same free candidate, and all but one lose the unique
+    // index — a valid rename failing with a constraint error.
+    const svc = companyService(db);
+    const created = await Promise.all([
+      svc.create({ name: "Alpha One" }),
+      svc.create({ name: "Beta Two" }),
+      svc.create({ name: "Gamma Three" }),
+      svc.create({ name: "Delta Four" }),
+    ]);
+
+    const renamed = await Promise.all(
+      created.map((company, index) => svc.update(company.id, { name: `GooseTown ${index}` })),
+    );
+
+    const prefixes = renamed.map((row) => row?.issuePrefix).sort();
+    expect(prefixes).toEqual(["GOO", "GOOA", "GOOAA", "GOOAAA"]);
+    // Every rename kept its own row — no two companies share a prefix.
+    expect(new Set(prefixes).size).toBe(4);
+  });
+
+  it("does not let concurrent creates steal the prefix a rename is allocating", async () => {
+    // Codex's follow-up scenario: creates allocate on the same base while a
+    // rename is choosing one. Both paths go through allocateIssuePrefix, so
+    // they serialize instead of racing the unique index.
+    const svc = companyService(db);
+    const toRename = await svc.create({ name: "Placeholder Name" });
+
+    const [renamed, ...creates] = await Promise.all([
+      svc.update(toRename.id, { name: "GooseTown" }),
+      svc.create({ name: "Goose Feathers" }),
+      svc.create({ name: "Goose Down" }),
+      svc.create({ name: "Goose Eggs" }),
+    ]);
+
+    const prefixes = [renamed?.issuePrefix, ...creates.map((row) => row.issuePrefix)];
+    // Every one succeeded and got a distinct prefix off the same base.
+    expect(prefixes.every((prefix) => prefix?.startsWith("GOO"))).toBe(true);
+    expect(new Set(prefixes).size).toBe(4);
+  });
+
+  it("keeps allocating behind an allocator-external writer that already took the base", async () => {
+    // resolveCloudTenantActor inserts a company with its own stack-derived
+    // prefix without taking the allocator's lock. Whatever such a writer has
+    // committed must simply read as taken.
+    await db.insert(companies).values({ name: "Cloud Stack Tenant", issuePrefix: "GOO" });
+
+    const created = await companyService(db).create({ name: "GooseTown" });
+    expect(created.issuePrefix).toBe("GOOA");
+  });
+
+  it("keeps the issue prefix on rename once issues have been minted", async () => {
+    const created = await companyService(db).create({ name: "Prasiddha" });
+    await db
+      .update(companies)
+      .set({ issueCounter: 3 })
+      .where(eq(companies.id, created.id));
+
+    const renamed = await companyService(db).update(created.id, { name: "GooseTown" });
+    expect(renamed?.issuePrefix).toBe("PRA");
+    expect(renamed?.name).toBe("GooseTown");
+  });
+
+  it("keeps the issue prefix on rename once a case has been minted", async () => {
+    const created = await companyService(db).create({ name: "Prasiddha" });
+    await db.insert(cases).values({
+      companyId: created.id,
+      caseNumber: 1,
+      identifier: "PRA-C1",
+      caseType: "generic",
+      title: "First case",
+    });
+
+    const renamed = await companyService(db).update(created.id, { name: "GooseTown" });
+    expect(renamed?.issuePrefix).toBe("PRA");
+  });
+
+  it("does not touch the issue prefix on updates that keep the same name", async () => {
+    const created = await companyService(db).create({ name: "Prasiddha" });
+
+    const updated = await companyService(db).update(created.id, {
+      name: "Prasiddha",
+      description: "still the same name",
+    });
+    expect(updated?.issuePrefix).toBe("PRA");
+  });
+
   it("does not auto-provision bundled built-in agents for a freshly created company", async () => {
     const created = await companyService(db).create({
       name: "Fresh Company",

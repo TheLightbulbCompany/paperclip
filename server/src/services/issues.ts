@@ -10157,13 +10157,18 @@ export function issueService(db: Db) {
           .from(issues)
           .where(eq(issues.companyId, companyId));
         const currentMax = maxRow?.maxNum ?? 0;
+        // FOR UPDATE: identifiers are minted from this prefix read further
+        // down, and an empty-board rename recomputes the prefix under the
+        // company row lock — an unlocked read here could mint the whole batch
+        // from a prefix a concurrent rename is about to replace.
         const [company] = await tx
           .select({
             issueCounter: companies.issueCounter,
             issuePrefix: companies.issuePrefix,
           })
           .from(companies)
-          .where(eq(companies.id, companyId));
+          .where(eq(companies.id, companyId))
+          .for("update");
         if (!company) throw notFound("Target company not found");
         const base = Math.max(company.issueCounter ?? 0, currentMax);
         await tx
