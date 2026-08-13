@@ -421,6 +421,9 @@ const WEBHOOK_SIGNING_STRENGTH: Record<string, number> = {
   bearer: 1,
   hmac_sha256: 2,
   github_hmac: 2,
+  // SHA-1 is what some providers still sign with (Vercel, Intercom); as an
+  // HMAC it remains collision-irrelevant, so it ranks with the other MACs.
+  hmac_sha1: 2,
 };
 const WEBHOOK_REPLAY_WINDOW_DEFAULT_SEC = 300;
 
@@ -2993,6 +2996,27 @@ export function routineService(
           .update(rawBody)
           .digest("hex");
         const normalizedSignature = providedSignature.replace(/^sha256=/, "");
+        const normalizedBuf = Buffer.from(normalizedSignature);
+        const expectedBuf = Buffer.from(expectedHmac);
+        const valid =
+          normalizedBuf.length === expectedBuf.length &&
+          crypto.timingSafeEqual(normalizedBuf, expectedBuf);
+        if (!valid) throw unauthorized();
+      } else if (trigger.signingMode === "hmac_sha1") {
+        // SHA-1 twin of github_hmac, for providers that sign the raw body
+        // with HMAC-SHA1 (Vercel's x-vercel-signature, Intercom's
+        // X-Hub-Signature). Same header conventions: the generic
+        // X-Paperclip-Signature (operators/proxies normalize into it) or a
+        // hub-style header, with an optional "sha1=" prefix.
+        const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
+        const rawBody = input.rawBody ?? Buffer.from(JSON.stringify(input.payload ?? {}));
+        const providedSignature = (input.signatureHeader ?? input.hubSignatureHeader)?.trim() ?? "";
+        if (!providedSignature) throw unauthorized();
+        const expectedHmac = crypto
+          .createHmac("sha1", secretValue)
+          .update(rawBody)
+          .digest("hex");
+        const normalizedSignature = providedSignature.replace(/^sha1=/, "");
         const normalizedBuf = Buffer.from(normalizedSignature);
         const expectedBuf = Buffer.from(expectedHmac);
         const valid =

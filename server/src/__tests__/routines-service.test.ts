@@ -2535,6 +2535,83 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(run.status).toBe("issue_created");
   });
 
+  it("accepts an HMAC-SHA1 raw-body signature with hmac_sha1 signing mode", async () => {
+    const { routine, svc } = await seedFixture();
+    const { trigger, secretMaterial } = await svc.createTrigger(
+      routine.id,
+      {
+        kind: "webhook",
+        signingMode: "hmac_sha1",
+      },
+      {},
+    );
+
+    const payload = { type: "deployment.succeeded", id: "dpl_1" };
+    const rawBody = Buffer.from(JSON.stringify(payload));
+    // Vercel-style: bare hex in the signature header, no prefix.
+    const signature = createHmac("sha1", secretMaterial!.webhookSecret)
+      .update(rawBody)
+      .digest("hex");
+
+    const run = await svc.firePublicTrigger(trigger.publicId!, {
+      signatureHeader: signature,
+      rawBody,
+      payload,
+    });
+
+    expect(run.source).toBe("webhook");
+    expect(run.status).toBe("issue_created");
+  });
+
+  it("accepts a sha1=-prefixed HMAC-SHA1 signature (Intercom-style X-Hub-Signature)", async () => {
+    const { routine, svc } = await seedFixture();
+    const { trigger, secretMaterial } = await svc.createTrigger(
+      routine.id,
+      {
+        kind: "webhook",
+        signingMode: "hmac_sha1",
+      },
+      {},
+    );
+
+    const payload = { type: "conversation.user.created" };
+    const rawBody = Buffer.from(JSON.stringify(payload));
+    const signature = `sha1=${createHmac("sha1", secretMaterial!.webhookSecret)
+      .update(rawBody)
+      .digest("hex")}`;
+
+    const run = await svc.firePublicTrigger(trigger.publicId!, {
+      hubSignatureHeader: signature,
+      rawBody,
+      payload,
+    });
+
+    expect(run.source).toBe("webhook");
+    expect(run.status).toBe("issue_created");
+  });
+
+  it("rejects invalid signature for hmac_sha1 signing mode", async () => {
+    const { routine, svc } = await seedFixture();
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      {
+        kind: "webhook",
+        signingMode: "hmac_sha1",
+      },
+      {},
+    );
+
+    const rawBody = Buffer.from(JSON.stringify({ ok: true }));
+
+    await expect(
+      svc.firePublicTrigger(trigger.publicId!, {
+        signatureHeader: "0000000000000000000000000000000000000000",
+        rawBody,
+        payload: { ok: true },
+      }),
+    ).rejects.toThrow();
+  });
+
   it("rejects invalid signature for github_hmac signing mode", async () => {
     const { routine, svc } = await seedFixture();
     const { trigger } = await svc.createTrigger(
