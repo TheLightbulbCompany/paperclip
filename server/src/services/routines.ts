@@ -1084,13 +1084,14 @@ export function routineService(
   async function normalizeRoutineExecutionPolicy(
     companyId: string,
     input: unknown,
+    executor: Db = db,
   ): Promise<IssueExecutionPolicy | null> {
     const policy = normalizeIssueExecutionPolicy(input ?? null);
     if (!policy) return null;
     for (const stage of policy.stages) {
       for (const participant of stage.participants) {
         if (participant.type !== "agent") continue;
-        await assertAssignableAgent(db, companyId, participant.agentId, { kind: "work" });
+        await assertAssignableAgent(executor, companyId, participant.agentId, { kind: "work" });
       }
     }
     return policy;
@@ -1800,21 +1801,6 @@ export function routineService(
       throw unprocessable("Default agent required");
     }
     await assertAssignableAgent(db, input.routine.companyId, assigneeAgentId, { kind: "routine" });
-    // Reviewers are as long-lived as the default agent above and go stale the
-    // same way, so they get the same treatment: revalidate the STORED policy
-    // and fail the dispatch when a reviewer has since been terminated or
-    // deleted, instead of minting an issue that cannot leave review.
-    //
-    // Failing is deliberate. Dropping the dead stage and running unreviewed
-    // would silently ship work the owner explicitly gated on review. A failed
-    // run is visible instead, and the circuit breaker auto-pauses the routine
-    // with a reason once failures accumulate — already the designed escalation
-    // for "this routine can no longer run as configured", and exactly what a
-    // terminated default agent does today.
-    const executionPolicy = await normalizeRoutineExecutionPolicy(
-      input.routine.companyId,
-      input.routine.executionPolicy ?? null,
-    );
     const automaticVariables: Record<string, string | number | boolean> = {};
     if (input.executionWorkspaceId && routineUsesWorkspaceBranch(input.routine)) {
       const workspace = await db
@@ -1943,6 +1929,26 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
+        // Reviewers are as long-lived as the default agent and go stale the same
+        // way, so revalidate the STORED policy rather than forwarding it blind:
+        // a reviewer terminated since the routine was saved would otherwise be
+        // stamped onto an issue that can never leave review.
+        //
+        // Deliberately fails the run rather than dropping the dead stage and
+        // running unreviewed — silently shipping work the owner gated on review
+        // is the worse, and invisible, failure.
+        //
+        // Deliberately INSIDE this try, not beside the default-agent check
+        // before the transaction. The catch below is what persists the failed
+        // run and increments the circuit breaker, so throwing earlier would
+        // fail silently: no run row, no breaker tick. Worse, on a scheduled
+        // tick `nextRunAt` has already been advanced and an escaping rejection
+        // aborts every remaining due routine in that tick.
+        const executionPolicy = await normalizeRoutineExecutionPolicy(
+          input.routine.companyId,
+          input.routine.executionPolicy ?? null,
+          txDb,
+        );
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,

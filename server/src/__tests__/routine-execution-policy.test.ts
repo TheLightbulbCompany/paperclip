@@ -278,7 +278,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
       ).rejects.toMatchObject({ status: 422 });
     });
 
-    it("fails the dispatch when a stored reviewer was terminated after the routine was saved", async () => {
+    it("records a FAILED RUN when a stored reviewer was terminated after the routine was saved", async () => {
       const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
       const { svc } = makeService();
 
@@ -286,23 +286,59 @@ describeEmbeddedPostgres("routine execution policy", () => {
       await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerAgentId));
 
       // Deliberately a failure, not a silent downgrade to an unreviewed run:
-      // the owner gated this work on review, and the same thing happens today
-      // when the routine's default agent is terminated.
-      await expect(svc.runRoutine(routine.id, { source: "manual" }, {})).rejects.toMatchObject({ status: 409 });
+      // the owner gated this work on review.
+      const run = await svc.runRoutine(routine.id, { source: "manual" }, {});
 
-      // No run issue was minted, so nothing is left stranded mid-review.
+      // And deliberately a RECORDED failure, not an escaping throw. The run row
+      // is what makes it visible and what the circuit breaker counts; a throw
+      // before the insert would be silent, and on a scheduled tick would also
+      // abort every remaining due routine.
+      expect(run.status).toBe("failed");
+      expect(run.failureReason).toContain("terminated agents");
+      expect(run.linkedIssueId).toBeNull();
+
+      const breaker = await db
+        .select({ count: routines.consecutiveFailureCount })
+        .from(routines)
+        .where(eq(routines.id, routine.id))
+        .then((rows) => rows[0]!);
+      expect(breaker.count).toBe(1);
+
+      // No run issue was minted, so nothing is stranded mid-review.
       const issueCount = await db.select().from(issues).then((rows) => rows.length);
       expect(issueCount).toBe(0);
     });
 
-    it("fails the dispatch when a stored reviewer was deleted after the routine was saved", async () => {
+    it("records a failed run when a stored reviewer was deleted after the routine was saved", async () => {
       const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
       const { svc } = makeService();
 
       const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
       await db.delete(agents).where(eq(agents.id, reviewerAgentId));
 
-      await expect(svc.runRoutine(routine.id, { source: "manual" }, {})).rejects.toMatchObject({ status: 404 });
+      const run = await svc.runRoutine(routine.id, { source: "manual" }, {});
+
+      expect(run.status).toBe("failed");
+      expect(run.failureReason).toContain("Assignee agent not found");
+      expect(run.linkedIssueId).toBeNull();
+    });
+
+    it("keeps dispatching the rest of a scheduler tick past a routine with a dead reviewer", async () => {
+      const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
+      const { svc } = makeService();
+
+      const broken = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
+      const healthy = await createRoutine(svc, companyId, projectId, workerAgentId);
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerAgentId));
+
+      const brokenRun = await svc.runRoutine(broken.id, { source: "schedule" }, {});
+      const healthyRun = await svc.runRoutine(healthy.id, { source: "schedule" }, {});
+
+      // The broken routine's failure is contained to its own run — it does not
+      // escape and take the rest of the tick's routines down with it.
+      expect(brokenRun.status).toBe("failed");
+      expect(healthyRun.status).toBe("issue_created");
+      expect(healthyRun.linkedIssueId).not.toBeNull();
     });
 
     it("rejects restoring a revision whose reviewer has since been terminated", async () => {
