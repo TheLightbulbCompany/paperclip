@@ -277,6 +277,50 @@ describeEmbeddedPostgres("routine execution policy", () => {
         }),
       ).rejects.toMatchObject({ status: 422 });
     });
+
+    it("fails the dispatch when a stored reviewer was terminated after the routine was saved", async () => {
+      const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
+      const { svc } = makeService();
+
+      const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerAgentId));
+
+      // Deliberately a failure, not a silent downgrade to an unreviewed run:
+      // the owner gated this work on review, and the same thing happens today
+      // when the routine's default agent is terminated.
+      await expect(svc.runRoutine(routine.id, { source: "manual" }, {})).rejects.toMatchObject({ status: 409 });
+
+      // No run issue was minted, so nothing is left stranded mid-review.
+      const issueCount = await db.select().from(issues).then((rows) => rows.length);
+      expect(issueCount).toBe(0);
+    });
+
+    it("fails the dispatch when a stored reviewer was deleted after the routine was saved", async () => {
+      const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
+      const { svc } = makeService();
+
+      const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
+      await db.delete(agents).where(eq(agents.id, reviewerAgentId));
+
+      await expect(svc.runRoutine(routine.id, { source: "manual" }, {})).rejects.toMatchObject({ status: 404 });
+    });
+
+    it("rejects restoring a revision whose reviewer has since been terminated", async () => {
+      const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
+      const { svc } = makeService();
+
+      const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
+      const revision1 = await svc.listRevisions(routine.id).then((rows) => rows[0]!);
+      const cleared = await svc.update(routine.id, { executionPolicy: null } as Parameters<typeof svc.update>[1], {});
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerAgentId));
+
+      await expect(svc.restoreRevision(routine.id, revision1.id, {})).rejects.toMatchObject({ status: 409 });
+
+      // The restore must not have half-applied: the routine keeps the cleared policy.
+      const unchanged = await svc.get(routine.id);
+      expect(unchanged!.executionPolicy).toBeNull();
+      expect(unchanged!.latestRevisionId).toBe(cleared!.latestRevisionId);
+    });
   });
 
   describe("dispatch", () => {

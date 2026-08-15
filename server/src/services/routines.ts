@@ -1800,6 +1800,21 @@ export function routineService(
       throw unprocessable("Default agent required");
     }
     await assertAssignableAgent(db, input.routine.companyId, assigneeAgentId, { kind: "routine" });
+    // Reviewers are as long-lived as the default agent above and go stale the
+    // same way, so they get the same treatment: revalidate the STORED policy
+    // and fail the dispatch when a reviewer has since been terminated or
+    // deleted, instead of minting an issue that cannot leave review.
+    //
+    // Failing is deliberate. Dropping the dead stage and running unreviewed
+    // would silently ship work the owner explicitly gated on review. A failed
+    // run is visible instead, and the circuit breaker auto-pauses the routine
+    // with a reason once failures accumulate — already the designed escalation
+    // for "this routine can no longer run as configured", and exactly what a
+    // terminated default agent does today.
+    const executionPolicy = await normalizeRoutineExecutionPolicy(
+      input.routine.companyId,
+      input.routine.executionPolicy ?? null,
+    );
     const automaticVariables: Record<string, string | number | boolean> = {};
     if (input.executionWorkspaceId && routineUsesWorkspaceBranch(input.routine)) {
       const workspace = await db
@@ -1987,8 +2002,8 @@ export function routineService(
             // Cast because the issues.execution_policy column is typed as the
             // open `Record<string, unknown>` jsonb, not the IssueExecutionPolicy
             // interface (which has no index signature).
-            ...(input.routine.executionPolicy
-              ? { executionPolicy: input.routine.executionPolicy as unknown as Record<string, unknown> }
+            ...(executionPolicy
+              ? { executionPolicy: executionPolicy as unknown as Record<string, unknown> }
               : {}),
           });
         } catch (error) {
@@ -2804,6 +2819,17 @@ export function routineService(
       const snapshot = routineRevisionSnapshotSchema.parse(targetRevision.snapshot) as RoutineRevisionSnapshotV1;
       const routineSnapshot = snapshot.routine;
       await assertRestorableAssignee(existingRoutine.companyId, routineSnapshot.assigneeAgentId, actor);
+      // Same reason the assignee is checked above: an old revision can name a
+      // reviewer who has since been terminated or deleted, and restoring it
+      // would report success while installing a policy whose first generated
+      // issue cannot leave review. Re-normalizing here also strips the zod
+      // defaults `routineRevisionSnapshotSchema.parse()` applies
+      // (`maxReviewRounds: null`), which the normalizer omits — storing the
+      // parsed shape verbatim would leave a policy no other write path emits.
+      const restoredExecutionPolicy = await normalizeRoutineExecutionPolicy(
+        existingRoutine.companyId,
+        routineSnapshot.executionPolicy ?? null,
+      );
 
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
@@ -2860,12 +2886,7 @@ export function routineService(
             activityGateScope: routineSnapshot.activityGateScope,
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
-            // Re-normalize: routineRevisionSnapshotSchema.parse() applies the
-            // issue policy schema's zod defaults (e.g. maxReviewRounds: null),
-            // which normalizeIssueExecutionPolicy omits. Storing the parsed
-            // shape verbatim would leave the restored routine holding a policy
-            // no other write path can produce.
-            executionPolicy: normalizeIssueExecutionPolicy(routineSnapshot.executionPolicy ?? null),
+            executionPolicy: restoredExecutionPolicy,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: now,
