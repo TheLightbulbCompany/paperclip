@@ -249,6 +249,7 @@ function makeContext(
     description: routineDetail.description ?? "",
     projectId: routineDetail.projectId ?? "",
     assigneeAgentId: routineDetail.assigneeAgentId ?? "",
+    reviewerAgentId: "",
     priority: routineDetail.priority,
     concurrencyPolicy: routineDetail.concurrencyPolicy,
     catchUpPolicy: routineDetail.catchUpPolicy,

@@ -29,6 +29,7 @@ import {
 import type {
   CreateRoutine,
   CreateRoutineTrigger,
+  IssueExecutionPolicy,
   Routine,
   RoutineDetail,
   RoutineDescriptionDocument,
@@ -62,6 +63,7 @@ import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
+import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
@@ -614,6 +616,10 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     variables: routine.variables ?? [],
     env: routine.env ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
+    // Spread, not `?? null`: a policy-less routine must serialize exactly as it
+    // did before this field existed, or `snapshotsMatch` reports every stored
+    // revision as changed and the next edit mints a spurious revision.
+    ...(routine.executionPolicy ? { executionPolicy: routine.executionPolicy } : {}),
   };
 }
 
@@ -1061,6 +1067,33 @@ export function routineService(
       .then((rows) => rows[0] ?? null);
     if (!project) throw notFound("Project not found");
     if (project.companyId !== companyId) throw unprocessable("Project must belong to same company");
+  }
+
+  /**
+   * Validate + canonicalize the issue execution policy a routine stamps onto
+   * every run issue it generates.
+   *
+   * Shape validation is `normalizeIssueExecutionPolicy` — the same function the
+   * issue routes use, so a routine policy and a hand-set issue policy are
+   * byte-identical once stored. On top of that, every agent reviewer/approver
+   * is put through `assertAssignableAgent`, which is what rejects an agent from
+   * another company (or a terminated / unapproved one) everywhere else.
+   *
+   * Returns null for a policy-less routine, which is the pre-existing state.
+   */
+  async function normalizeRoutineExecutionPolicy(
+    companyId: string,
+    input: unknown,
+  ): Promise<IssueExecutionPolicy | null> {
+    const policy = normalizeIssueExecutionPolicy(input ?? null);
+    if (!policy) return null;
+    for (const stage of policy.stages) {
+      for (const participant of stage.participants) {
+        if (participant.type !== "agent") continue;
+        await assertAssignableAgent(db, companyId, participant.agentId, { kind: "work" });
+      }
+    }
+    return policy;
   }
 
   async function assertGoal(companyId: string, goalId: string) {
@@ -1949,6 +1982,14 @@ export function routineService(
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+            // Spread, not `?? null`: a policy-less routine must hand issueSvc.create
+            // exactly the input it got before this field existed.
+            // Cast because the issues.execution_policy column is typed as the
+            // open `Record<string, unknown>` jsonb, not the IssueExecutionPolicy
+            // interface (which has no index signature).
+            ...(input.routine.executionPolicy
+              ? { executionPolicy: input.routine.executionPolicy as unknown as Record<string, unknown> }
+              : {}),
           });
         } catch (error) {
           const isOpenExecutionConflict =
@@ -2223,6 +2264,7 @@ export function routineService(
       await assertProject(companyId, input.projectId ?? null);
       await assertRoutineFolder(companyId, input.folderId ?? null);
       await assertAssignableAgent(db, companyId, input.assigneeAgentId ?? null, { kind: "routine" });
+      const executionPolicy = await normalizeRoutineExecutionPolicy(companyId, input.executionPolicy ?? null);
       if (input.goalId) await assertGoal(companyId, input.goalId);
       if (input.parentIssueId) await assertParentIssue(companyId, input.parentIssueId);
       const env = input.env === undefined || input.env === null
@@ -2262,6 +2304,7 @@ export function routineService(
             activityGateScope: input.activityGateScope ?? "company",
             variables,
             env,
+            executionPolicy,
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
@@ -2301,6 +2344,9 @@ export function routineService(
               strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
               fieldPath: "env",
             });
+      const nextExecutionPolicy = patch.executionPolicy === undefined
+        ? undefined
+        : await normalizeRoutineExecutionPolicy(existing.companyId, patch.executionPolicy);
       const requestedStatus = patch.status ?? existing.status;
       if (patch.status === "active") {
         assertRoutineCanEnable(patch.status, nextAssigneeAgentId);
@@ -2377,6 +2423,7 @@ export function routineService(
           activityGateScope: patch.activityGateScope ?? locked.activityGateScope,
           variables: nextVariables,
           env: nextEnv,
+          executionPolicy: nextExecutionPolicy === undefined ? locked.executionPolicy : nextExecutionPolicy,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
@@ -2447,6 +2494,7 @@ export function routineService(
             activityGateScope: candidate.activityGateScope,
             variables: candidate.variables,
             env: candidate.env,
+            executionPolicy: candidate.executionPolicy,
             responsibleUserId: candidate.responsibleUserId,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
@@ -2812,6 +2860,12 @@ export function routineService(
             activityGateScope: routineSnapshot.activityGateScope,
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
+            // Re-normalize: routineRevisionSnapshotSchema.parse() applies the
+            // issue policy schema's zod defaults (e.g. maxReviewRounds: null),
+            // which normalizeIssueExecutionPolicy omits. Storing the parsed
+            // shape verbatim would leave the restored routine holding a policy
+            // no other write path can produce.
+            executionPolicy: normalizeIssueExecutionPolicy(routineSnapshot.executionPolicy ?? null),
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: now,

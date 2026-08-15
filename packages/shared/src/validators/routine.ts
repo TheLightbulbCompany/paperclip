@@ -12,6 +12,7 @@ import {
 } from "../constants.js";
 import {
   ISSUE_EXECUTION_WORKSPACE_PREFERENCES,
+  issueExecutionPolicySchema,
   issueExecutionWorkspaceSettingsSchema,
 } from "./issue.js";
 import { envConfigSchema } from "./secret.js";
@@ -80,6 +81,9 @@ export const createRoutineSchema = z.object({
   autoPauseThreshold: z.number().int().min(1).max(100).optional().nullable(),
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
+  // Stamped onto every run issue this routine generates, so routine work can be
+  // reviewed by the same issue execution-stage lifecycle as hand-created work.
+  executionPolicy: issueExecutionPolicySchema.optional().nullable(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
@@ -110,6 +114,12 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   variables: z.array(routineVariableSchema),
   env: envConfigSchema.nullable().default(null),
   responsibleUserId: z.string().nullable().default(null),
+  // Omitted (not null) when the routine has no policy, so snapshots of
+  // policy-less routines stay byte-identical to the ones written before this
+  // field existed — `snapshotsMatch` compares JSON.stringify output, and a
+  // stray `"executionPolicy":null` would make every pre-existing revision
+  // look changed and mint a spurious revision on the next edit.
+  executionPolicy: issueExecutionPolicySchema.optional(),
 }).strict();
 
 export const routineRevisionSnapshotTriggerV1Schema = z.object({

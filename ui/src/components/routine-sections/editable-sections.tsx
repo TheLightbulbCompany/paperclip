@@ -238,6 +238,38 @@ export function OverviewSection({
               );
             }}
           />
+          <span>reviewed by</span>
+          <InlineEntitySelector
+            value={editDraft.reviewerAgentId}
+            options={assigneeOptions}
+            recentOptionIds={recentAssigneeIds}
+            placeholder="Reviewer"
+            noneLabel="No reviewer"
+            searchPlaceholder="Search reviewers..."
+            emptyMessage="No reviewers found."
+            onChange={(reviewerAgentId) => setEditDraft((current) => ({ ...current, reviewerAgentId }))}
+            renderTriggerValue={(option) => {
+              const reviewer = option ? agentById.get(option.id) : null;
+              return option ? (
+                <>
+                  {reviewer ? <AgentIcon icon={reviewer.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                  <span className="truncate">{option.label}</span>
+                </>
+              ) : (
+                <span className="text-muted-foreground">Reviewer</span>
+              );
+            }}
+            renderOption={(option) => {
+              if (!option.id) return <span className="truncate">{option.label}</span>;
+              const reviewer = agentById.get(option.id);
+              return (
+                <>
+                  {reviewer ? <AgentIcon icon={reviewer.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                  <span className="truncate">{option.label}</span>
+                </>
+              );
+            }}
+          />
         </div>
       </div>
 

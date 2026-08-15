@@ -17,6 +17,7 @@ import { cn } from "../lib/utils";
 import { queryKeys } from "../lib/queryKeys";
 import { groupBy } from "../lib/groupBy";
 import { createIssueDetailLocationState } from "../lib/issueDetailBreadcrumb";
+import { buildExecutionPolicy, selectionValueFromPrincipal } from "../lib/issue-execution-policy";
 import { collectLiveIssueIds } from "../lib/liveIssueIds";
 import { getRecentAssigneeIds, sortAgentsByRecency, trackRecentAssignee } from "../lib/recent-assignees";
 import { getRecentProjectIds, trackRecentProject } from "../lib/recent-projects";
@@ -139,23 +140,31 @@ function compareNullableText(left: string | null | undefined, right: string | nu
 
 type RoutineFolderGroupMeta = { name: string; position?: number | null };
 
-function buildRoutineMutationPayload(input: {
+export function buildRoutineMutationPayload(input: {
   title: string;
   description: string;
   projectId: string;
   folderId: string | null;
   assigneeAgentId: string;
+  reviewerAgentId: string;
   priority: string;
   concurrencyPolicy: string;
   catchUpPolicy: string;
   variables: RoutineVariable[];
 }) {
+  const { reviewerAgentId, ...rest } = input;
   return {
-    ...input,
+    ...rest,
     description: input.description.trim() || null,
     projectId: input.projectId || null,
     folderId: input.folderId || null,
     assigneeAgentId: input.assigneeAgentId || null,
+    // Same stage shape the issue form builds. The run issue this routine
+    // generates inherits it and flows through the ordinary review lifecycle.
+    executionPolicy: buildExecutionPolicy({
+      reviewerValues: reviewerAgentId ? [selectionValueFromPrincipal({ type: "agent", agentId: reviewerAgentId, userId: null })] : [],
+      approverValues: [],
+    }),
   };
 }
 
@@ -343,6 +352,7 @@ export function Routines() {
     projectId: string;
     folderId: string | null;
     assigneeAgentId: string;
+    reviewerAgentId: string;
     priority: string;
     concurrencyPolicy: string;
     catchUpPolicy: string;
@@ -353,6 +363,7 @@ export function Routines() {
     projectId: "",
     folderId: null,
     assigneeAgentId: "",
+    reviewerAgentId: "",
     priority: "medium",
     concurrencyPolicy: "coalesce_if_active",
     catchUpPolicy: "skip_missed",
@@ -440,6 +451,7 @@ export function Routines() {
         projectId: "",
         folderId: null,
         assigneeAgentId: "",
+        reviewerAgentId: "",
         priority: "medium",
         concurrencyPolicy: "coalesce_if_active",
         catchUpPolicy: "skip_missed",
@@ -704,6 +716,7 @@ export function Routines() {
     [agentById, folderById, projectById, routineViewState.groupBy, sortedRoutines],
   );
   const currentAssignee = draft.assigneeAgentId ? agentById.get(draft.assigneeAgentId) ?? null : null;
+  const reviewerAgent = draft.reviewerAgentId ? agentById.get(draft.reviewerAgentId) ?? null : null;
   const currentProject = draft.projectId ? projectById.get(draft.projectId) ?? null : null;
   const activeFolder = selectedFolderFromList(routineFolders?.folders ?? [], folderSelection);
   const hasRoutineFolders = (routineFolders?.folders.length ?? 0) > 0;
@@ -1158,6 +1171,39 @@ export function Routines() {
                       ))}
                     </SelectContent>
                   </Select>
+                  <span>reviewed by</span>
+                  <InlineEntitySelector
+                    value={draft.reviewerAgentId}
+                    options={assigneeOptions}
+                    recentOptionIds={recentAssigneeIds}
+                    placeholder="Reviewer"
+                    noneLabel="No reviewer"
+                    searchPlaceholder="Search reviewers..."
+                    emptyMessage="No reviewers found."
+                    onChange={(reviewerAgentId) => setDraft((current) => ({ ...current, reviewerAgentId }))}
+                    renderTriggerValue={(option) =>
+                      option ? (
+                        <>
+                          {reviewerAgent ? (
+                            <AgentIcon icon={reviewerAgent.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
+                          ) : null}
+                          <span className="truncate">{option.label}</span>
+                        </>
+                      ) : (
+                        <span className="text-muted-foreground">Reviewer</span>
+                      )
+                    }
+                    renderOption={(option) => {
+                      if (!option.id) return <span className="truncate">{option.label}</span>;
+                      const reviewer = agentById.get(option.id);
+                      return (
+                        <>
+                          {reviewer ? <AgentIcon icon={reviewer.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                          <span className="truncate">{option.label}</span>
+                        </>
+                      );
+                    }}
+                  />
                 </div>
               </div>
             </div>
