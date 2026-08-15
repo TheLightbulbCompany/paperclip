@@ -107,12 +107,23 @@ export function buildExecutionPolicy(input: {
     });
   }
 
-  if (stages.length === 0 && !monitor) return null;
+  // Carried through, never rebuilt: no form that calls this has a control for
+  // these, so rebuilding the policy without them lets an unrelated reviewer or
+  // approver edit silently delete governance that was set through the API,
+  // weakening every issue the policy subsequently gates.
+  const reviewPreset = input.existingPolicy?.reviewPreset;
+  const authorizationPolicy = input.existingPolicy?.authorizationPolicy;
+  const maxReviewRounds = input.existingPolicy?.maxReviewRounds;
+
+  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy) return null;
 
   return {
     mode,
     commentRequired: true,
     stages,
     ...(monitor ? { monitor } : {}),
+    ...(reviewPreset ? { reviewPreset } : {}),
+    ...(authorizationPolicy ? { authorizationPolicy } : {}),
+    ...(maxReviewRounds != null ? { maxReviewRounds } : {}),
   };
 }

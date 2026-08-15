@@ -123,12 +123,11 @@ export function routineReviewerAgentId(policy: IssueExecutionPolicy | null | und
 
 export function buildRoutineMutationPayload(input: RoutineEditDraft, existingPolicy: IssueExecutionPolicy | null) {
   const { reviewerAgentId, ...rest } = input;
-  // Omit executionPolicy entirely unless the reviewer actually changed. This
-  // form edits one stage, but buildExecutionPolicy rebuilds the whole policy
-  // from stage participants and drops everything it has no input for
-  // (reviewPreset, authorizationPolicy, maxReviewRounds — all API-only on a
-  // routine). Sending it on an unrelated title edit would silently wipe them;
-  // an absent key means "leave the policy alone".
+  // Omit executionPolicy entirely unless the reviewer actually changed — an
+  // absent key means "leave the policy alone", so a title edit does not rewrite
+  // the policy or churn a new revision out of freshly minted stage ids.
+  // (buildExecutionPolicy is what guarantees the API-only fields survive a
+  // reviewer change; this only keeps unrelated edits off the field at all.)
   const reviewerChanged = reviewerAgentId !== routineReviewerAgentId(existingPolicy);
   return {
     ...rest,

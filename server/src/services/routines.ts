@@ -1944,11 +1944,10 @@ export function routineService(
         // fail silently: no run row, no breaker tick. Worse, on a scheduled
         // tick `nextRunAt` has already been advanced and an escaping rejection
         // aborts every remaining due routine in that tick.
-        const executionPolicy = await normalizeRoutineExecutionPolicy(
-          input.routine.companyId,
-          input.routine.executionPolicy ?? null,
-          txDb,
-        );
+        //
+        // It also sits AFTER the coalesce/skip return below, because those
+        // paths mint no issue and so need no reviewer — a dead reviewer must
+        // not turn a run that would have coalesced into a failure.
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
@@ -1979,6 +1978,12 @@ export function routineService(
           }, txDb);
           return updated ?? createdRun;
         }
+
+        const executionPolicy = await normalizeRoutineExecutionPolicy(
+          input.routine.companyId,
+          input.routine.executionPolicy ?? null,
+          txDb,
+        );
 
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {

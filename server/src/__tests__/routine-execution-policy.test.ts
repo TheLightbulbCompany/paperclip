@@ -105,13 +105,46 @@ describeEmbeddedPostgres("routine execution policy", () => {
     return { companyId, workerAgentId, reviewerAgentId, projectId, defaultResponsibleUserId };
   }
 
-  function makeService() {
+  /**
+   * Mirrors the wakeup stub in routines-service.test.ts: queues a heartbeat run
+   * and takes the issue's execution lock. Without the lock a generated issue is
+   * not "live", so concurrency coalescing would never engage.
+   */
+  function makeService(companyId: string) {
     const wakeups: Array<{ agentId: string; opts: Record<string, unknown> }> = [];
     const svc = routineService(db, {
       heartbeat: {
         wakeup: async (agentId: string, opts: Record<string, unknown>) => {
           wakeups.push({ agentId, opts });
-          return null;
+          const payload = opts.payload as Record<string, unknown> | undefined;
+          const snapshot = opts.contextSnapshot as Record<string, unknown> | undefined;
+          const issueId =
+            (typeof payload?.issueId === "string" && payload.issueId)
+            || (typeof snapshot?.issueId === "string" && snapshot.issueId)
+            || null;
+          if (!issueId) return null;
+          // Routines require a responsible user, so a generated issue always
+          // carries one — no fallback needed.
+          const issue = await db
+            .select({ responsibleUserId: issues.responsibleUserId })
+            .from(issues)
+            .where(eq(issues.id, issueId))
+            .then((rows) => rows[0] ?? null);
+          const queuedRunId = randomUUID();
+          await db.insert(heartbeatRuns).values({
+            id: queuedRunId,
+            companyId,
+            agentId,
+            invocationSource: (opts.source as string) ?? "assignment",
+            status: "queued",
+            responsibleUserId: issue!.responsibleUserId,
+            contextSnapshot: { ...(snapshot ?? {}), issueId },
+          });
+          await db
+            .update(issues)
+            .set({ executionRunId: queuedRunId, executionLockedAt: new Date() })
+            .where(eq(issues.id, issueId));
+          return { id: queuedRunId };
         },
       },
     });
@@ -167,7 +200,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
   describe("persistence + revisions", () => {
     it("round-trips the policy through create, update, and revision restore", async () => {
       const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
 
@@ -208,7 +241,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
 
     it("omits executionPolicy from the snapshot when the routine has none", async () => {
       const { companyId, workerAgentId, projectId } = await seedCompany();
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       const routine = await createRoutine(svc, companyId, projectId, workerAgentId);
       expect(routine.executionPolicy).toBeNull();
@@ -230,7 +263,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
     it("rejects a reviewer agent from another company on create", async () => {
       const { companyId, workerAgentId, projectId } = await seedCompany();
       const other = await seedCompany("Other Co");
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       await expect(
         createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(other.reviewerAgentId)),
@@ -239,7 +272,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
 
     it("rejects an unknown reviewer agent on create", async () => {
       const { companyId, workerAgentId, projectId } = await seedCompany();
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       await expect(
         createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(randomUUID())),
@@ -249,7 +282,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
     it("rejects a cross-company reviewer on update", async () => {
       const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
       const other = await seedCompany("Other Co");
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
 
@@ -269,7 +302,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
 
     it("rejects a malformed policy", async () => {
       const { companyId, workerAgentId, projectId } = await seedCompany();
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       await expect(
         createRoutine(svc, companyId, projectId, workerAgentId, {
@@ -280,7 +313,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
 
     it("records a FAILED RUN when a stored reviewer was terminated after the routine was saved", async () => {
       const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
       await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerAgentId));
@@ -311,7 +344,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
 
     it("records a failed run when a stored reviewer was deleted after the routine was saved", async () => {
       const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
       await db.delete(agents).where(eq(agents.id, reviewerAgentId));
@@ -323,9 +356,26 @@ describeEmbeddedPostgres("routine execution policy", () => {
       expect(run.linkedIssueId).toBeNull();
     });
 
+    it("still coalesces onto a live issue when the stored reviewer is dead", async () => {
+      const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
+      const { svc } = makeService(companyId);
+
+      const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
+      const first = await svc.runRoutine(routine.id, { source: "manual" }, {});
+      expect(first.status).toBe("issue_created");
+
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerAgentId));
+
+      // Coalescing mints no issue, so it needs no reviewer. A dead reviewer
+      // must not convert a run that would have coalesced into a failure.
+      const second = await svc.runRoutine(routine.id, { source: "manual" }, {});
+      expect(second.status).toBe("coalesced");
+      expect(second.linkedIssueId).toBe(first.linkedIssueId);
+    });
+
     it("keeps dispatching the rest of a scheduler tick past a routine with a dead reviewer", async () => {
       const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       const broken = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
       const healthy = await createRoutine(svc, companyId, projectId, workerAgentId);
@@ -343,7 +393,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
 
     it("rejects restoring a revision whose reviewer has since been terminated", async () => {
       const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
       const revision1 = await svc.listRevisions(routine.id).then((rows) => rows[0]!);
@@ -362,7 +412,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
   describe("dispatch", () => {
     it("stamps the policy onto the generated run issue", async () => {
       const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
       const run = await svc.runRoutine(routine.id, { source: "manual" }, {});
@@ -376,7 +426,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
 
     it("leaves the generated issue's policy null when the routine has none", async () => {
       const { companyId, workerAgentId, projectId } = await seedCompany();
-      const { svc } = makeService();
+      const { svc } = makeService(companyId);
 
       const routine = await createRoutine(svc, companyId, projectId, workerAgentId);
       const run = await svc.runRoutine(routine.id, { source: "manual" }, {});
@@ -399,7 +449,7 @@ describeEmbeddedPostgres("routine execution policy", () => {
      */
     async function generatedIssue() {
       const seed = await seedCompany();
-      const { svc } = makeService();
+      const { svc } = makeService(seed.companyId);
       const routine = await createRoutine(
         svc,
         seed.companyId,
