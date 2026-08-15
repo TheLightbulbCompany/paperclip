@@ -57,6 +57,17 @@ describe("routine create payload", () => {
 });
 
 describe("routine edit payload", () => {
+  it("omits the policy entirely when the reviewer is unchanged", () => {
+    const existing = policyWith([
+      { id: "stage-1", type: "review", approvalsNeeded: 1, participants: [{ id: "p1", type: "agent", agentId: reviewerAgentId, userId: null }] },
+    ]);
+    // An absent key means "leave the policy alone", which is what protects
+    // reviewPreset / authorizationPolicy / maxReviewRounds — fields this form
+    // has no control for — from an unrelated title edit.
+    expect(buildEditPayload({ ...editDraft, reviewerAgentId }, existing)).not.toHaveProperty("executionPolicy");
+    expect(buildEditPayload(editDraft, null)).not.toHaveProperty("executionPolicy");
+  });
+
   it("clears the policy when the reviewer is removed", () => {
     const existing = policyWith([
       { id: "stage-1", type: "review", approvalsNeeded: 1, participants: [{ id: "p1", type: "agent", agentId: reviewerAgentId, userId: null }] },
@@ -75,15 +86,15 @@ describe("routine edit payload", () => {
     expect(policy?.stages[1]?.participants[0]).toMatchObject({ id: "p2", type: "user", userId: approverUserId });
   });
 
-  it("preserves participant ids when the reviewer is unchanged", () => {
+  it("reuses the review stage id when the reviewer is swapped", () => {
     const existing = policyWith([
       { id: "stage-1", type: "review", approvalsNeeded: 1, participants: [{ id: "p1", type: "agent", agentId: reviewerAgentId, userId: null }] },
     ]);
 
-    const policy = buildEditPayload({ ...editDraft, reviewerAgentId }, existing).executionPolicy;
+    const policy = buildEditPayload({ ...editDraft, reviewerAgentId: workerAgentId }, existing).executionPolicy;
 
     expect(policy?.stages[0]?.id).toBe("stage-1");
-    expect(policy?.stages[0]?.participants[0]?.id).toBe("p1");
+    expect(policy?.stages[0]?.participants[0]).toMatchObject({ type: "agent", agentId: workerAgentId });
   });
 });
 

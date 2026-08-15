@@ -123,21 +123,32 @@ export function routineReviewerAgentId(policy: IssueExecutionPolicy | null | und
 
 export function buildRoutineMutationPayload(input: RoutineEditDraft, existingPolicy: IssueExecutionPolicy | null) {
   const { reviewerAgentId, ...rest } = input;
+  // Omit executionPolicy entirely unless the reviewer actually changed. This
+  // form edits one stage, but buildExecutionPolicy rebuilds the whole policy
+  // from stage participants and drops everything it has no input for
+  // (reviewPreset, authorizationPolicy, maxReviewRounds — all API-only on a
+  // routine). Sending it on an unrelated title edit would silently wipe them;
+  // an absent key means "leave the policy alone".
+  const reviewerChanged = reviewerAgentId !== routineReviewerAgentId(existingPolicy);
   return {
     ...rest,
     description: input.description.trim() || null,
     projectId: input.projectId || null,
     assigneeAgentId: input.assigneeAgentId || null,
     env: input.env && Object.keys(input.env).length > 0 ? input.env : null,
-    // existingPolicy carries the approval stage (and monitor) through untouched
-    // — this form only edits the review stage.
-    executionPolicy: buildExecutionPolicy({
-      existingPolicy,
-      reviewerValues: reviewerAgentId
-        ? [selectionValueFromPrincipal({ type: "agent", agentId: reviewerAgentId, userId: null })]
-        : [],
-      approverValues: stageParticipantValues(existingPolicy, "approval"),
-    }),
+    ...(reviewerChanged
+      ? {
+        // existingPolicy still carries the approval stage through — this form
+        // has no control for it, so it must not drop it either.
+        executionPolicy: buildExecutionPolicy({
+          existingPolicy,
+          reviewerValues: reviewerAgentId
+            ? [selectionValueFromPrincipal({ type: "agent", agentId: reviewerAgentId, userId: null })]
+            : [],
+          approverValues: stageParticipantValues(existingPolicy, "approval"),
+        }),
+      }
+      : {}),
   };
 }
 
