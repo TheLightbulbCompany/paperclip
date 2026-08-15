@@ -1262,8 +1262,15 @@ export function IssueProperties({
       onUpdate({ executionPolicy: null });
       return;
     }
+    // Spread basePolicy instead of hand-picking mode/stages off it: it also
+    // carries reviewPreset / authorizationPolicy / maxReviewRounds, and naming
+    // fields one by one silently drops them, so scheduling a monitor would
+    // weaken governance set through the API. `monitor` is stripped first
+    // because a null nextMonitor is how the monitor gets CLEARED.
+    const { monitor: _clearedMonitor, ...baseWithoutMonitor } = basePolicy ?? {};
     onUpdate({
       executionPolicy: {
+        ...baseWithoutMonitor,
         mode: basePolicy?.mode ?? issue.executionPolicy?.mode ?? "normal",
         commentRequired: true,
         stages: basePolicy?.stages ?? [],
