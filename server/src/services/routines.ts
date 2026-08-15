@@ -654,8 +654,25 @@ async function buildRoutineRevisionSnapshot(
   };
 }
 
+// Key-order-insensitive: one side of a snapshot compare is often a fresh JS
+// object (normalizer insertion order) and the other a Postgres jsonb round-trip
+// (jsonb sorts keys), so raw JSON.stringify reports every echoed-back policy as
+// changed — minting a revision, and a 409, on every GET→PATCH echo. Arrays keep
+// their order; only object keys are sorted.
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, entry]) => [key, sortKeysDeep(entry)]),
+    );
+  }
+  return value;
+}
+
 function canonicalSnapshot(value: RoutineRevisionSnapshotV1) {
-  return JSON.stringify(value);
+  return JSON.stringify(sortKeysDeep(value));
 }
 
 function snapshotsMatch(left: RoutineRevisionSnapshotV1, right: RoutineRevisionSnapshotV1) {
@@ -1088,9 +1105,27 @@ export function routineService(
   ): Promise<IssueExecutionPolicy | null> {
     const policy = normalizeIssueExecutionPolicy(input ?? null);
     if (!policy) return null;
+    if (policy.monitor) {
+      // A monitor can only attach to an in_progress/in_review issue, and every
+      // routine run issue is born "todo" — a stored monitor would make
+      // buildInitialIssueMonitorFields throw on EVERY dispatch, fail-looping
+      // the routine into an auto-pause. Reject up front rather than stripping
+      // silently: the saver should know the monitor will not be honored.
+      throw unprocessable("Routine execution policies cannot schedule a monitor", {
+        field: "executionPolicy.monitor",
+      });
+    }
     for (const stage of policy.stages) {
       for (const participant of stage.participants) {
-        if (participant.type !== "agent") continue;
+        if (participant.type !== "agent") {
+          // ponytail: v1 restriction — agent participants only. No membership
+          // check exists on this path, so a typo'd or departed userId would
+          // pass save and park every generated run in_review forever. Lift
+          // when user participants can be validated like agents are.
+          throw unprocessable("Routine execution policies support agent participants only", {
+            field: "executionPolicy.stages.participants",
+          });
+        }
         await assertAssignableAgent(executor, companyId, participant.agentId, { kind: "work" });
       }
     }
@@ -2370,12 +2405,29 @@ export function routineService(
               strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
               fieldPath: "env",
             });
+      // Same posture as assertAgentCannotWeakenWebhookAuth: the review gate is
+      // the owner's control over the agent's output, so the assignee agent must
+      // not be able to remove (or rewrite) it on its own routine. Board/user
+      // actors are unrestricted; setting AND clearing are both blocked because
+      // a swap to a friendlier reviewer weakens the gate as surely as null.
+      if (actor.agentId && patch.executionPolicy !== undefined) {
+        throw forbidden("Agents cannot modify routine execution policies", {
+          code: "agent_cannot_modify_execution_policy",
+        });
+      }
       const nextExecutionPolicy = patch.executionPolicy === undefined
         ? undefined
         : await normalizeRoutineExecutionPolicy(existing.companyId, patch.executionPolicy);
       const requestedStatus = patch.status ?? existing.status;
       if (patch.status === "active") {
         assertRoutineCanEnable(patch.status, nextAssigneeAgentId);
+        // Re-enabling puts the stored policy back in force, and its reviewers
+        // may have died while the routine was paused — the assignee gets
+        // revalidated below, so the reviewers must be too, or the routine
+        // re-enables straight into a dispatch fail-loop.
+        if (patch.executionPolicy === undefined && existing.executionPolicy) {
+          await normalizeRoutineExecutionPolicy(existing.companyId, existing.executionPolicy);
+        }
       }
       const nextStatus = patch.assigneeAgentId === undefined
         ? requestedStatus
@@ -2457,6 +2509,19 @@ export function routineService(
 
         const folderChanged = patch.folderId !== undefined && locked.folderId !== candidate.folderId;
         if (locked.latestRevisionId && routineCurrentFieldsMatch(locked, candidate)) {
+          // Same repair the snapshot-match no-op below performs: an echoed env
+          // must still re-sync secret bindings (drift repair). This guard used
+          // to be unreachable for echoed jsonb because the raw stringify never
+          // matched key order; now that the compare is canonical it is the
+          // common no-op path, so it must not skip the sync.
+          if (patch.env !== undefined) {
+            await secretsSvc.syncEnvBindingsForTarget(
+              locked.companyId,
+              { targetType: "routine", targetId: locked.id },
+              candidate.env,
+              { db: tx },
+            );
+          }
           if (!folderChanged) return locked;
           const [updated] = await txDb
             .update(routines)

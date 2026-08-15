@@ -414,7 +414,15 @@ export function RoutineDetail() {
       ]);
     },
     onError: (mutationError) => {
-      if (mutationError instanceof ApiError && mutationError.status === 409) {
+      // Only a REVISION conflict is "someone else edited this" — its body
+      // carries details.currentRevisionId. Other 409s (e.g. a terminated or
+      // cross-company reviewer, code "agent_not_assignable") must not latch
+      // the reload-and-discard-draft UI: the draft is exactly what the user
+      // needs to correct, so surface the server's message instead.
+      const errorBody = mutationError instanceof ApiError && mutationError.body && typeof mutationError.body === "object"
+        ? (mutationError.body as { details?: { currentRevisionId?: unknown } })
+        : null;
+      if (mutationError instanceof ApiError && mutationError.status === 409 && errorBody?.details?.currentRevisionId) {
         setSaveConflict(true);
         pushToast({
           title: "Routine changed",

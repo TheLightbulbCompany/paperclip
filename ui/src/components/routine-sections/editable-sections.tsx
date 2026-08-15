@@ -239,6 +239,14 @@ export function OverviewSection({
             }}
           />
           <span>reviewed by</span>
+          {(routine.executionPolicy?.stages.find((stage) => stage.type === "review")?.participants.length ?? 0) > 1 ? (
+            // This single-select can only express one reviewer, so saving it
+            // over an API-set multi-participant stage would silently delete the
+            // other reviewers. Render the fact read-only instead.
+            <span className="rounded bg-muted/50 px-2 py-1 text-muted-foreground">
+              Multiple reviewers (managed via API)
+            </span>
+          ) : (
           <InlineEntitySelector
             value={editDraft.reviewerAgentId}
             options={assigneeOptions}
@@ -270,6 +278,7 @@ export function OverviewSection({
               );
             }}
           />
+          )}
         </div>
       </div>
 

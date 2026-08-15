@@ -106,4 +106,16 @@ describe("buildExecutionPolicy advanced-field preservation", () => {
   it("still returns null when there is nothing to preserve", () => {
     expect(buildExecutionPolicy({ existingPolicy: null, reviewerValues: [], approverValues: [] })).toBeNull();
   });
+
+  it("keeps a policy alive for maxReviewRounds alone", () => {
+    // Collapsing to null here would delete an API-set round cap when the last
+    // stage is removed.
+    const policy = buildExecutionPolicy({
+      existingPolicy: { mode: "normal", commentRequired: true, stages: [], maxReviewRounds: 4 },
+      reviewerValues: [],
+      approverValues: [],
+    });
+    expect(policy).not.toBeNull();
+    expect(policy?.maxReviewRounds).toBe(4);
+  });
 });

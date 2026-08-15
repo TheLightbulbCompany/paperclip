@@ -115,7 +115,9 @@ export function buildExecutionPolicy(input: {
   const authorizationPolicy = input.existingPolicy?.authorizationPolicy;
   const maxReviewRounds = input.existingPolicy?.maxReviewRounds;
 
-  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy) return null;
+  // maxReviewRounds counts as content: collapsing to null here would delete an
+  // API-set round cap when the last stage/monitor is removed.
+  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy && maxReviewRounds == null) return null;
 
   return {
     mode,

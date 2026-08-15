@@ -43,6 +43,14 @@ describe("normalizeIssueExecutionPolicy", () => {
     expect(normalizeIssueExecutionPolicy({ stages: [] })).toBeNull();
   });
 
+  it("keeps a stage-less policy that only carries maxReviewRounds", () => {
+    // Collapsing to null here would delete an API-set round cap when the last
+    // stage is removed.
+    const policy = normalizeIssueExecutionPolicy({ stages: [], maxReviewRounds: 5 });
+    expect(policy).not.toBeNull();
+    expect(policy?.maxReviewRounds).toBe(5);
+  });
+
   it("throws when all participants are invalid (missing agentId)", () => {
     expect(() =>
       normalizeIssueExecutionPolicy({

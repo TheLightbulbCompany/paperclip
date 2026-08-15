@@ -311,6 +311,100 @@ describeEmbeddedPostgres("routine execution policy", () => {
       ).rejects.toMatchObject({ status: 422 });
     });
 
+    it("rejects a policy carrying a monitor", async () => {
+      const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
+      const { svc } = makeService(companyId);
+
+      // Run issues are born "todo" and a monitor only attaches to
+      // in_progress/in_review, so a stored monitor would fail-loop every
+      // dispatch. Rejected at save, honestly, rather than silently stripped.
+      await expect(
+        createRoutine(svc, companyId, projectId, workerAgentId, {
+          stages: [{ type: "review", participants: [{ type: "agent", agentId: reviewerAgentId }] }],
+          monitor: { nextCheckAt: new Date(Date.now() + 3_600_000).toISOString() },
+        }),
+      ).rejects.toMatchObject({ status: 422, message: expect.stringContaining("monitor") });
+    });
+
+    it("rejects user participants (v1: agent reviewers only)", async () => {
+      const { companyId, workerAgentId, projectId } = await seedCompany();
+      const { svc } = makeService(companyId);
+
+      await expect(
+        createRoutine(svc, companyId, projectId, workerAgentId, {
+          stages: [{ type: "review", participants: [{ type: "user", userId: "some-user" }] }],
+        }),
+      ).rejects.toMatchObject({ status: 422, message: expect.stringContaining("agent participants only") });
+    });
+
+    it("blocks agent actors from modifying the execution policy", async () => {
+      const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
+      const { svc } = makeService(companyId);
+
+      const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
+
+      // The review gate is the owner's control over the agent's output — the
+      // agent must not clear it, nor swap in a friendlier reviewer.
+      await expect(
+        svc.update(routine.id, { executionPolicy: null } as Parameters<typeof svc.update>[1], { agentId: workerAgentId }),
+      ).rejects.toMatchObject({ status: 403 });
+      await expect(
+        svc.update(
+          routine.id,
+          { executionPolicy: reviewPolicy(workerAgentId) } as Parameters<typeof svc.update>[1],
+          { agentId: workerAgentId },
+        ),
+      ).rejects.toMatchObject({ status: 403 });
+
+      const unchanged = await svc.get(routine.id);
+      expect((unchanged!.executionPolicy as IssueExecutionPolicy).stages[0]!.participants[0]!.agentId).toBe(
+        reviewerAgentId,
+      );
+
+      // Board actors stay unrestricted.
+      const cleared = await svc.update(routine.id, { executionPolicy: null } as Parameters<typeof svc.update>[1], {
+        userId: "board-user",
+      });
+      expect(cleared!.executionPolicy).toBeNull();
+    });
+
+    it("does not mint a revision when a PATCH echoes the stored policy back", async () => {
+      const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
+      const { svc } = makeService(companyId);
+
+      const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
+      // Read back through Postgres so the policy carries jsonb key order, not
+      // the normalizer's insertion order — the exact GET→PATCH echo agents do.
+      const stored = await svc.get(routine.id);
+
+      const echoed = await svc.update(
+        routine.id,
+        { executionPolicy: stored!.executionPolicy } as Parameters<typeof svc.update>[1],
+        {},
+      );
+
+      expect(echoed!.latestRevisionNumber).toBe(routine.latestRevisionNumber);
+      expect(echoed!.latestRevisionId).toBe(routine.latestRevisionId);
+    });
+
+    it("refuses to re-enable a routine whose stored reviewer has died", async () => {
+      const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
+      const { svc } = makeService(companyId);
+
+      const routine = await createRoutine(svc, companyId, projectId, workerAgentId, reviewPolicy(reviewerAgentId));
+      await svc.update(routine.id, { status: "paused" } as Parameters<typeof svc.update>[1], {});
+      await db.update(agents).set({ status: "terminated" }).where(eq(agents.id, reviewerAgentId));
+
+      // Re-enabling puts the stored policy back in force; without this check
+      // the routine re-enables straight into a dispatch fail-loop.
+      await expect(
+        svc.update(routine.id, { status: "active" } as Parameters<typeof svc.update>[1], {}),
+      ).rejects.toMatchObject({ status: 409 });
+
+      const unchanged = await svc.get(routine.id);
+      expect(unchanged!.status).toBe("paused");
+    });
+
     it("records a FAILED RUN when a stored reviewer was terminated after the routine was saved", async () => {
       const { companyId, workerAgentId, reviewerAgentId, projectId } = await seedCompany();
       const { svc } = makeService(companyId);
