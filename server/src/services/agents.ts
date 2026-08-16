@@ -10,12 +10,29 @@ import {
   agentTaskSessions,
   agentWakeupRequests,
   activityLog,
+  approvalComments,
+  approvals,
+  assets,
   costEvents,
+  decisionArchiveNotificationOutbox,
+  decisionBundles,
+  decisionQueueItems,
+  decisionQueues,
+  decisionRetention,
+  decisions,
+  decisionTriage,
+  decisionTriageEvents,
+  financeEvents,
+  goals,
   heartbeatRunEvents,
   heartbeatRuns,
   issueExecutionDecisions,
   issues,
   issueComments,
+  issueThreadInteractions,
+  issueWatchdogs,
+  joinRequests,
+  projects,
   routines,
 } from "@paperclipai/db";
 import {
@@ -1062,6 +1079,67 @@ export function agentService(db: Db) {
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
           .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
+        // Every remaining FK on agents.id has no ON DELETE rule, so each
+        // referencing table must be handled here or the final delete fails
+        // with a constraint violation (the assets FK bit first in prod).
+        // Nullable attribution columns are nulled — the record itself is
+        // business evidence (an asset, an approval, a goal) and outlives its
+        // author. NOT NULL agent columns are operational rows owned by the
+        // agent and are deleted with it.
+        await tx.update(assets).set({ createdByAgentId: null }).where(eq(assets.createdByAgentId, id));
+        await tx
+          .update(approvals)
+          .set({ requestedByAgentId: null })
+          .where(eq(approvals.requestedByAgentId, id));
+        await tx
+          .update(approvalComments)
+          .set({ authorAgentId: null })
+          .where(eq(approvalComments.authorAgentId, id));
+        await tx.update(financeEvents).set({ agentId: null }).where(eq(financeEvents.agentId, id));
+        await tx.update(goals).set({ ownerAgentId: null }).where(eq(goals.ownerAgentId, id));
+        await tx.update(projects).set({ leadAgentId: null }).where(eq(projects.leadAgentId, id));
+        await tx
+          .update(joinRequests)
+          .set({ createdAgentId: null })
+          .where(eq(joinRequests.createdAgentId, id));
+        await tx
+          .update(issueThreadInteractions)
+          .set({ createdByAgentId: null })
+          .where(eq(issueThreadInteractions.createdByAgentId, id));
+        await tx
+          .update(issueThreadInteractions)
+          .set({ resolvedByAgentId: null })
+          .where(eq(issueThreadInteractions.resolvedByAgentId, id));
+        await tx
+          .update(decisionQueues)
+          .set({ createdByAgentId: null })
+          .where(eq(decisionQueues.createdByAgentId, id));
+        await tx
+          .update(decisionQueueItems)
+          .set({ addedByAgentId: null })
+          .where(eq(decisionQueueItems.addedByAgentId, id));
+        await tx
+          .update(decisionTriage)
+          .set({ setByAgentId: null })
+          .where(eq(decisionTriage.setByAgentId, id));
+        await tx
+          .update(decisionTriageEvents)
+          .set({ actorAgentId: null })
+          .where(eq(decisionTriageEvents.actorAgentId, id));
+        await tx
+          .update(decisionRetention)
+          .set({ archivedByAgentId: null })
+          .where(eq(decisionRetention.archivedByAgentId, id));
+        // Decisions carry a NOT NULL origin agent AND a NOT NULL origin run,
+        // so they must go before heartbeatRuns below; their target/effect
+        // children cascade from decisions.id.
+        await tx.delete(decisions).where(eq(decisions.originAgentId, id));
+        await tx.delete(decisionBundles).where(eq(decisionBundles.originAgentId, id));
+        await tx
+          .delete(decisionArchiveNotificationOutbox)
+          .where(eq(decisionArchiveNotificationOutbox.originAgentId, id));
+        await tx.delete(issueWatchdogs).where(eq(issueWatchdogs.watchdogAgentId, id));
+        await tx.delete(costEvents).where(eq(costEvents.agentId, id));
         await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
         await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
         await tx.delete(activityLog).where(
