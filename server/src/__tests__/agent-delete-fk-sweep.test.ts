@@ -6,6 +6,9 @@ import {
   approvals,
   assets,
   companies,
+  companySkills,
+  companySkillTestRuns,
+  companySkillVersions,
   costEvents,
   createDb,
   decisionBundles,
@@ -43,6 +46,9 @@ describeEmbeddedPostgres("agent delete FK sweep", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(companySkillTestRuns);
+    await db.delete(companySkillVersions);
+    await db.delete(companySkills);
     await db.delete(decisions);
     await db.delete(decisionBundles);
     await db.delete(issueWatchdogs);
@@ -177,6 +183,32 @@ describeEmbeddedPostgres("agent delete FK sweep", () => {
       status: "pending",
     });
 
+    // Skill Studio test run — the ON DELETE RESTRICT reference.
+    const skillId = randomUUID();
+    const skillVersionId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: "k",
+      slug: "s",
+      name: "skill",
+      markdown: "# skill",
+    });
+    await db.insert(companySkillVersions).values({
+      id: skillVersionId,
+      companyId,
+      companySkillId: skillId,
+      revisionNumber: 1,
+    });
+    await db.insert(companySkillTestRuns).values({
+      companyId,
+      skillId,
+      inputSnapshot: "{}",
+      skillVersionId,
+      agentId,
+      issueId,
+    });
+
     const removed = await agentService(db).remove(agentId);
     expect(removed).not.toBeNull();
 
@@ -195,5 +227,9 @@ describeEmbeddedPostgres("agent delete FK sweep", () => {
     expect(await db.select().from(decisions)).toHaveLength(0);
     expect(await db.select().from(decisionBundles)).toHaveLength(0);
     expect(await db.select().from(issueWatchdogs)).toHaveLength(0);
+    expect(await db.select().from(companySkillTestRuns)).toHaveLength(0);
+    // The skill and its version survive the agent.
+    expect(await db.select().from(companySkills)).toHaveLength(1);
+    expect(await db.select().from(companySkillVersions)).toHaveLength(1);
   });
 });

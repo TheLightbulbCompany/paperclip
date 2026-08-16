@@ -13,6 +13,7 @@ import {
   approvalComments,
   approvals,
   assets,
+  companySkillTestRuns,
   costEvents,
   decisionArchiveNotificationOutbox,
   decisionBundles,
@@ -1139,6 +1140,10 @@ export function agentService(db: Db) {
           .delete(decisionArchiveNotificationOutbox)
           .where(eq(decisionArchiveNotificationOutbox.originAgentId, id));
         await tx.delete(issueWatchdogs).where(eq(issueWatchdogs.watchdogAgentId, id));
+        // Skill Studio test runs carry an ON DELETE RESTRICT agent FK — the
+        // harness rows are operational QA records owned by the executing
+        // agent and go with it (the skill and its versions survive).
+        await tx.delete(companySkillTestRuns).where(eq(companySkillTestRuns.agentId, id));
         await tx.delete(costEvents).where(eq(costEvents.agentId, id));
         await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
         await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
