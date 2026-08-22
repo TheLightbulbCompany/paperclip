@@ -2125,6 +2125,11 @@ export function recoveryService(
         identifier: issues.identifier,
         status: issues.status,
         createdByAgentId: issues.createdByAgentId,
+        blockedAssigneeAgentId: sql<string | null>`(
+          select blocked_issue.assignee_agent_id
+          from issues blocked_issue
+          where blocked_issue.id = ${issueRelations.relatedIssueId}
+        )`,
       })
       .from(issueRelations)
       .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -2147,8 +2152,17 @@ export function recoveryService(
 
     let assigned = 0;
     let skipped = 0;
+    let needingBoardOwner = 0;
     const issueIds: string[] = [];
     const seen = new Set<string>();
+    // A blocker created by the very agent it blocks is that agent declaring
+    // "I cannot do this". Handing it back re-runs the agent, which files
+    // another unassigned blocker, which the next tick hands back — forever.
+    const createdByBlockedAssignee = new Set(
+      candidates
+        .filter((row) => row.createdByAgentId && row.createdByAgentId === row.blockedAssigneeAgentId)
+        .map((row) => row.id),
+    );
 
     for (const candidate of candidates) {
       if (seen.has(candidate.id)) continue;
@@ -2157,6 +2171,11 @@ export function recoveryService(
       const creatorAgentId = candidate.createdByAgentId;
       if (!creatorAgentId) {
         skipped += 1;
+        continue;
+      }
+      if (createdByBlockedAssignee.has(candidate.id)) {
+        needingBoardOwner += 1;
+        await ensureOrphanBlockerNeedsBoardOwnerComment(candidate);
         continue;
       }
       const creatorAgent = await getAgent(creatorAgentId);
@@ -2241,7 +2260,57 @@ export function recoveryService(
       }
     }
 
-    return { assigned, skipped, issueIds };
+    return { assigned, skipped, needingBoardOwner, issueIds };
+  }
+
+  async function ensureOrphanBlockerNeedsBoardOwnerComment(candidate: {
+    id: string;
+    companyId: string;
+    identifier: string | null;
+  }) {
+    const source = "recovery.orphan_blocker_needs_board_owner";
+    const [prior] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, candidate.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, candidate.id),
+          sql`${activityLog.details} ->> 'source' = ${source}`,
+        ),
+      )
+      .limit(1);
+    if (prior) return;
+
+    const relations = await issuesSvc.getRelationSummaries(candidate.id);
+    const blockingLinks = formatIssueLinksForComment(relations.blocks);
+    await issuesSvc.addComment(
+      candidate.id,
+      [
+        "## Orphan Blocker Needs a Board Owner",
+        "",
+        `Paperclip found this issue is blocking ${blockingLinks} but has no assignee.`,
+        "",
+        "- It was created by the agent assigned to the work it blocks, so that agent has already said it cannot resolve it. Paperclip will not hand it back.",
+        "- Next action: assign a human owner, or add an approval card on the blocked issue so a board operator can unblock it.",
+      ].join("\n"),
+      {},
+    );
+    await logActivity(db, {
+      companyId: candidate.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.orphan_blocker_needs_board_owner",
+      entityType: "issue",
+      entityId: candidate.id,
+      details: {
+        identifier: candidate.identifier,
+        source,
+      },
+    });
   }
 
   async function getCompanyIssuePrefix(companyId: string) {
@@ -4215,6 +4284,7 @@ export function recoveryService(
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
+      orphanBlockersNeedingBoardOwner: 0,
       successfulRunHandoffEscalated: 0,
       reviewParticipantRequeued: 0,
       escalated: 0,
@@ -5262,6 +5332,7 @@ export function recoveryService(
 
     const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
+    result.orphanBlockersNeedingBoardOwner = orphanBlockerRecovery.needingBoardOwner;
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
 

@@ -10443,6 +10443,167 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  async function seedOrphanBlockerFixture(input: {
+    blockedAssignees: string[];
+  }) {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values(
+      [
+        { id: creatorAgentId, name: "Forge" },
+        { id: otherAgentId, name: "Other" },
+      ].map((agent) => ({
+        ...agent,
+        companyId,
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      })),
+    );
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Unblock Forge",
+      status: "todo",
+      priority: "high",
+      createdByAgentId: creatorAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    const blockedIssueIds: string[] = [];
+    for (const [index, assignee] of input.blockedAssignees.entries()) {
+      const blockedIssueId = randomUUID();
+      blockedIssueIds.push(blockedIssueId);
+      await db.insert(issues).values({
+        id: blockedIssueId,
+        companyId,
+        title: `Blocked work ${index + 1}`,
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: assignee === "creator" ? creatorAgentId : otherAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: index + 2,
+        identifier: `${issuePrefix}-${index + 2}`,
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+        createdByAgentId: creatorAgentId,
+      });
+    }
+    return { companyId, creatorAgentId, otherAgentId, blockerIssueId, blockedIssueIds, issuePrefix };
+  }
+
+  it("never hands an orphan blocker back to the assignee it blocks", async () => {
+    const { creatorAgentId, blockerIssueId, issuePrefix } = await seedOrphanBlockerFixture({
+      blockedAssignees: ["creator"],
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.orphanBlockersAssigned).toBe(0);
+    expect(first.orphanBlockersNeedingBoardOwner).toBe(1);
+    expect(first.issueIds).not.toContain(blockerIssueId);
+
+    const blocker = await db.select().from(issues).where(eq(issues.id, blockerIssueId)).then((rows) => rows[0]);
+    expect(blocker?.assigneeAgentId).toBeNull();
+
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId));
+    expect(wakeups).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Orphan Blocker Needs a Board Owner");
+    expect(comments[0]?.body).toContain(`[${issuePrefix}-2](/${issuePrefix}/issues/${issuePrefix}-2)`);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, blockerIssueId),
+          sql`${activityLog.details} ->> 'source' = 'recovery.orphan_blocker_needs_board_owner'`,
+        ),
+      );
+    expect(activities).toHaveLength(1);
+
+    // Second tick: still skipped, nothing new posted.
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.orphanBlockersAssigned).toBe(0);
+    expect(second.orphanBlockersNeedingBoardOwner).toBe(1);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId))).toHaveLength(1);
+    expect(
+      await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, blockerIssueId),
+            sql`${activityLog.details} ->> 'source' = 'recovery.orphan_blocker_needs_board_owner'`,
+          ),
+        ),
+    ).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId))).toHaveLength(0);
+  });
+
+  it("still reassigns an orphan blocker whose creator is not the blocked assignee", async () => {
+    const { creatorAgentId, blockerIssueId } = await seedOrphanBlockerFixture({
+      blockedAssignees: ["other"],
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.orphanBlockersAssigned).toBe(1);
+    expect(result.orphanBlockersNeedingBoardOwner).toBe(0);
+
+    const blocker = await db.select().from(issues).where(eq(issues.id, blockerIssueId)).then((rows) => rows[0]);
+    expect(blocker?.assigneeAgentId).toBe(creatorAgentId);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Assigned Orphan Blocker");
+
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId));
+    expect(wakeups).toHaveLength(1);
+    const runId = wakeups[0]?.runId;
+    if (runId) {
+      await waitForRunToSettle(heartbeat, runId);
+    }
+  });
+
+  it("treats a blocker of several issues as needing a board owner when any is assigned to its creator", async () => {
+    const { creatorAgentId, blockerIssueId } = await seedOrphanBlockerFixture({
+      blockedAssignees: ["other", "creator"],
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.orphanBlockersAssigned).toBe(0);
+    expect(result.orphanBlockersNeedingBoardOwner).toBe(1);
+
+    const blocker = await db.select().from(issues).where(eq(issues.id, blockerIssueId)).then((rows) => rows[0]);
+    expect(blocker?.assigneeAgentId).toBeNull();
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Orphan Blocker Needs a Board Owner");
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId))).toHaveLength(0);
+  });
+
   it("re-enqueues continuation for stranded in-progress work with no active run", async () => {
     const { companyId, agentId, issueId, runId } =
       await seedStrandedIssueFixture({
