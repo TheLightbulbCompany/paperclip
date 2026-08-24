@@ -13,6 +13,8 @@ import {
   approvalComments,
   approvals,
   assets,
+  budgetIncidents,
+  budgetPolicies,
   companySkillTestRuns,
   costEvents,
   decisionArchiveNotificationOutbox,
@@ -1144,6 +1146,20 @@ export function agentService(db: Db) {
         // harness rows are operational QA records owned by the executing
         // agent and go with it (the skill and its versions survive).
         await tx.delete(companySkillTestRuns).where(eq(companySkillTestRuns.agentId, id));
+        // Budget policies + incidents are scoped by `(scope_type, scope_id)`,
+        // a POLYMORPHIC text pair with no FK to agents.id — so unlike every
+        // other table here the final delete succeeds without clearing them and
+        // the rows are silently orphaned. That is not cosmetic: `budgets
+        // .overview()` resolves each policy's scope and used to throw
+        // notFound("Agent not found") on a dangling one, which 404'd
+        // /dashboard and /sidebar-badges for the whole company, permanently.
+        // Incidents go first — their policy_id references the policy row.
+        await tx
+          .delete(budgetIncidents)
+          .where(and(eq(budgetIncidents.scopeType, "agent"), eq(budgetIncidents.scopeId, id)));
+        await tx
+          .delete(budgetPolicies)
+          .where(and(eq(budgetPolicies.scopeType, "agent"), eq(budgetPolicies.scopeId, id)));
         await tx.delete(costEvents).where(eq(costEvents.agentId, id));
         await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
         await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));

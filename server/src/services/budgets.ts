@@ -79,7 +79,28 @@ function normalizeScopeName(scopeType: BudgetScopeType, name: string) {
   return name.trim().length > 0 ? name : scopeType;
 }
 
-async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: string): Promise<ScopeRecord> {
+const SCOPE_NOT_FOUND_MESSAGE: Record<BudgetScopeType, string> = {
+  company: "Company not found",
+  agent: "Agent not found",
+  project: "Project not found",
+};
+
+/**
+ * Resolve a policy/incident scope, or null when the scoped row is gone.
+ *
+ * `budget_policies.scope_id` is polymorphic text with NO foreign key, so
+ * deleting an agent or a project leaves its policies (and any open incidents)
+ * behind. Read paths must treat a dangling scope as "skip this row" — one
+ * orphan used to make `overview()` throw `notFound("Agent not found")`, which
+ * 404'd `/dashboard` AND `/sidebar-badges` for the entire company, forever.
+ * Write paths keep using `resolveScopeRecord`, where a missing scope is a
+ * genuine 404.
+ */
+async function resolveScopeRecordOrNull(
+  db: Db,
+  scopeType: BudgetScopeType,
+  scopeId: string,
+): Promise<ScopeRecord | null> {
   if (scopeType === "company") {
     const row = await db
       .select({
@@ -92,7 +113,7 @@ async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: s
       .from(companies)
       .where(eq(companies.id, scopeId))
       .then((rows) => rows[0] ?? null);
-    if (!row) throw notFound("Company not found");
+    if (!row) return null;
     return {
       companyId: row.companyId,
       name: row.name,
@@ -112,7 +133,7 @@ async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: s
       .from(agents)
       .where(eq(agents.id, scopeId))
       .then((rows) => rows[0] ?? null);
-    if (!row) throw notFound("Agent not found");
+    if (!row) return null;
     return {
       companyId: row.companyId,
       name: row.name,
@@ -131,13 +152,19 @@ async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: s
     .from(projects)
     .where(eq(projects.id, scopeId))
     .then((rows) => rows[0] ?? null);
-  if (!row) throw notFound("Project not found");
+  if (!row) return null;
   return {
     companyId: row.companyId,
     name: row.name,
     paused: Boolean(row.pausedAt),
     pauseReason: (row.pauseReason as ScopeRecord["pauseReason"]) ?? null,
   };
+}
+
+async function resolveScopeRecord(db: Db, scopeType: BudgetScopeType, scopeId: string): Promise<ScopeRecord> {
+  const scope = await resolveScopeRecordOrNull(db, scopeType, scopeId);
+  if (!scope) throw notFound(SCOPE_NOT_FOUND_MESSAGE[scopeType]);
+  return scope;
 }
 
 async function computeObservedAmount(
@@ -314,8 +341,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       .orderBy(desc(budgetPolicies.updatedAt));
   }
 
-  async function buildPolicySummary(policy: PolicyRow): Promise<BudgetPolicySummary> {
-    const scope = await resolveScopeRecord(db, policy.scopeType as BudgetScopeType, policy.scopeId);
+  async function buildPolicySummary(policy: PolicyRow, scope: ScopeRecord): Promise<BudgetPolicySummary> {
     const observedAmount = await computeObservedAmount(db, policy);
     const { start, end } = resolveWindow(policy.windowKind as BudgetWindowKind);
     const amount = policy.isActive ? policy.amount : 0;
@@ -466,9 +492,12 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
       : [];
     const approvalStatusById = new Map(approvalRows.map((row) => [row.id, row.status]));
 
-    return Promise.all(
+    // Same orphan tolerance as `overview` — an open incident for a deleted
+    // agent must not take the read path down with it.
+    return (await Promise.all(
       rows.map(async (row) => {
-        const scope = await resolveScopeRecord(db, row.scopeType as BudgetScopeType, row.scopeId);
+        const scope = await resolveScopeRecordOrNull(db, row.scopeType as BudgetScopeType, row.scopeId);
+        if (!scope) return null;
         return {
           id: row.id,
           companyId: row.companyId,
@@ -491,7 +520,7 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
           updatedAt: row.updatedAt,
         };
       }),
-    );
+    )).filter((incident): incident is BudgetIncident => incident !== null);
   }
 
   return {
@@ -624,12 +653,20 @@ export function budgetService(db: Db, hooks: BudgetServiceHooks = {}) {
         },
       });
 
-      return buildPolicySummary(row);
+      return buildPolicySummary(row, scope);
     },
 
     overview: async (companyId: string): Promise<BudgetOverview> => {
       const rows = await listPolicyRows(companyId);
-      const policies = await Promise.all(rows.map((row) => buildPolicySummary(row)));
+      // A policy whose scope row is gone is dead data, not an error — see
+      // `resolveScopeRecordOrNull`. Skip it so one orphan cannot 404 the
+      // dashboard for the whole company.
+      const policies = (await Promise.all(
+        rows.map(async (row) => {
+          const scope = await resolveScopeRecordOrNull(db, row.scopeType as BudgetScopeType, row.scopeId);
+          return scope ? buildPolicySummary(row, scope) : null;
+        }),
+      )).filter((policy): policy is BudgetPolicySummary => policy !== null);
       const activeIncidentRows = await db
         .select()
         .from(budgetIncidents)

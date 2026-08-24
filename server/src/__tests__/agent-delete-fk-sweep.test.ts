@@ -5,6 +5,8 @@ import {
   agents,
   approvals,
   assets,
+  budgetIncidents,
+  budgetPolicies,
   companies,
   companySkills,
   companySkillTestRuns,
@@ -26,6 +28,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.ts";
+import { budgetService } from "../services/budgets.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -46,6 +49,8 @@ describeEmbeddedPostgres("agent delete FK sweep", () => {
   }, 20_000);
 
   afterEach(async () => {
+    await db.delete(budgetIncidents);
+    await db.delete(budgetPolicies);
     await db.delete(companySkillTestRuns);
     await db.delete(companySkillVersions);
     await db.delete(companySkills);
@@ -231,5 +236,79 @@ describeEmbeddedPostgres("agent delete FK sweep", () => {
     // The skill and its version survive the agent.
     expect(await db.select().from(companySkills)).toHaveLength(1);
     expect(await db.select().from(companySkillVersions)).toHaveLength(1);
+  });
+
+  it("clears the deleted agent's budget policy so the company dashboard keeps loading", async () => {
+    // budget_policies.scope_id is polymorphic text with NO FK to agents.id, so
+    // the delete succeeds without touching it and the row is orphaned. That
+    // orphan then made budgets.overview() throw notFound("Agent not found"),
+    // which 404'd /dashboard AND /sidebar-badges for the whole company —
+    // permanently, since nothing ever cleans the row up.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `B${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Budgeted",
+      role: "general",
+      status: "idle",
+      adapterType: "openclaw_gateway",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // Exactly what agent-create writes when budgetMonthlyCents > 0.
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 5_000,
+    });
+
+    expect(await agentService(db).remove(agentId)).not.toBeNull();
+
+    const leftover = await db
+      .select({ id: budgetPolicies.id })
+      .from(budgetPolicies)
+      .where(eq(budgetPolicies.scopeId, agentId));
+    expect(leftover).toEqual([]);
+
+    await expect(budgetService(db).overview(companyId)).resolves.toMatchObject({ companyId });
+  });
+
+  it("skips a budget policy already orphaned by an earlier delete", async () => {
+    // The rows in prod today predate the sweep above, so overview() has to
+    // tolerate them on its own or those owners stay broken forever.
+    const companyId = randomUUID();
+    const issuePrefix = `O${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: randomUUID(), // agent row is already gone
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 5_000,
+    });
+
+    const overview = await budgetService(db).overview(companyId);
+    expect(overview.policies).toEqual([]);
+    expect(overview.pausedAgentCount).toBe(0);
   });
 });
