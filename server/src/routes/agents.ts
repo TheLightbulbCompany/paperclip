@@ -14,10 +14,11 @@ import { Router, type NextFunction, type Request, type Response } from "express"
 import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { readFile, rm } from "node:fs/promises";
 import path from "node:path";
+import { z } from "zod";
 import type { Db } from "@paperclipai/db";
 import type { ChatChannelService } from "../services/chat-channels.js";
-import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
-import { and, desc, eq, inArray, not, sql } from "drizzle-orm";
+import { activityLog, agents as agentsTable, chatConversations, companies, heartbeatRuns, idempotentOperations, issues as issuesTable, projects as projectsTable } from "@paperclipai/db";
+import { and, desc, eq, inArray, lt, not, sql } from "drizzle-orm";
 import { sha256Digest } from "../services/feedback-redaction.js";
 import {
   agentSkillSyncSchema,
@@ -26,9 +27,11 @@ import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
   createAgentKeySchema,
   createAgentHireSchema,
+  createAgentInstructionsBundleSchema,
   createAgentSchema,
   deriveAgentUrlKey,
   isUuidLike,
+  normalizeAgentApiKeyScope,
   normalizeIssueIdentifier,
   resetAgentSessionSchema,
   testAdapterEnvironmentSchema,
@@ -234,6 +237,14 @@ import { readObject } from "../lib/objects.js";
 import { listInvalidOrgChainDescendantIds } from "../services/agent-invokability.js";
 import { logger } from "../middleware/logger.js";
 import {
+  completeIdempotentOperation,
+  readIdempotencyHeaders,
+  rebindIdempotentOperation,
+  runIdempotentOperation,
+  type IdempotencyRequest,
+  type IdempotentOperationRecord,
+} from "../services/idempotent-operations.js";
+import {
   AGENT_PROFILE_CHANGE_CONSENT_FIELDS,
   agentInstructionsChangeTargetKey,
   agentProfileChangeTargetKey,
@@ -248,6 +259,22 @@ import { managedAgentProfileService } from "../services/managed-agent-profiles.j
 import { remoteAgentProfileService } from "../services/remote-agent-profiles.js";
 
 const AGENT_SKILL_ASSIGNMENT_MODES = ["add", "remove", "replace"] as const;
+
+// Isol8: the post-create inputs a keyed agent create freezes so a replay
+// finishes the ORIGINAL request, not the retry's body.
+const agentCreateCompletionPayloadSchema = z.object({
+  version: z.literal(1),
+  instructionsBundle: createAgentInstructionsBundleSchema.nullable(),
+  desiredSkills: z.array(z.string()).nullable(),
+  grantedByUserId: z.string().nullable(),
+  actor: z.object({
+    actorType: z.enum(["agent", "user"]),
+    actorId: z.string(),
+    agentId: z.string().nullable(),
+    runId: z.string().nullable(),
+    agentApiKeyId: z.string().nullable(),
+  }).strict(),
+}).strict();
 
 function requireAgentSkillAssignmentMode(req: Request, _res: Response, next: NextFunction) {
   if (!AGENT_SKILL_ASSIGNMENT_MODES.includes(req.body?.mode)) {
@@ -2434,8 +2461,10 @@ export function agentRoutes(
     adapterType: string | null | undefined;
     adapterConfig: Record<string, unknown>;
     constraintAdapterConfig?: Record<string, unknown>;
+    targetDb?: Db;
   }): Promise<Record<string, unknown>> {
-    const normalizedAdapterConfig = await secretsSvc.normalizeAdapterConfigForPersistence(
+    const targetSecretsSvc = input.targetDb ? secretService(input.targetDb) : secretsSvc;
+    const normalizedAdapterConfig = await targetSecretsSvc.normalizeAdapterConfigForPersistence(
       input.companyId,
       input.adapterConfig,
       {
@@ -2997,8 +3026,9 @@ export function agentRoutes(
     adapterConfig: Record<string, unknown>,
     requestedDesiredSkills: AgentDesiredSkillEntry[] | undefined,
     mode: AgentSkillAssignmentMode,
-    options: { tolerateUnknownDesiredSkills?: boolean } = {},
+    options: { tolerateUnknownDesiredSkills?: boolean; targetDb?: Db } = {},
   ) {
+    const targetCompanySkills = options.targetDb ? companySkillService(options.targetDb) : companySkills;
     if (!requestedDesiredSkills) {
       return {
         adapterConfig,
@@ -3016,7 +3046,7 @@ export function agentRoutes(
     }
 
     const { resolved: resolvedRequestedSkillEntries, unresolved: unresolvedDesiredSkillKeys } =
-      await companySkills.resolveRequestedSkillEntries(companyId, requestedDesiredSkills, {
+      await targetCompanySkills.resolveRequestedSkillEntries(companyId, requestedDesiredSkills, {
         tolerateUnknownReferences: options.tolerateUnknownDesiredSkills,
       });
     const requestedSkillEntries = [
@@ -3029,7 +3059,7 @@ export function agentRoutes(
     const currentPreference = readPaperclipSkillSyncPreference(adapterConfig);
     const { resolved: resolvedCurrentSkillEntries, unresolved: unresolvedCurrentSkillKeys } =
       currentPreference.desiredSkillEntries.length > 0
-        ? await companySkills.resolveRequestedSkillEntries(
+        ? await targetCompanySkills.resolveRequestedSkillEntries(
           companyId,
           currentPreference.desiredSkillEntries,
           { tolerateUnknownReferences: true },
@@ -3058,7 +3088,7 @@ export function agentRoutes(
     // Runtime materialization + version selection only ever consider final
     // assignments that resolve to the company library; stale keys remain
     // persisted and explicitly removable without reaching adapter runtimes.
-    const runtimeSkillEntries = await companySkills.listRuntimeSkillEntries(companyId, {
+    const runtimeSkillEntries = await targetCompanySkills.listRuntimeSkillEntries(companyId, {
       materializeMissing: shouldMaterializeRuntimeSkillsForAdapter(adapterType),
       versionSelections: skillVersionSelectionMap(
         desiredSkillEntries.filter((entry) => resolvedKeys.has(entry.key)),
@@ -4695,6 +4725,7 @@ export function agentRoutes(
       );
     }
 
+    const idempotency = readIdempotencyHeaders(req);
     const {
       desiredSkills: requestedDesiredSkills,
       instructionsBundle,
@@ -4710,140 +4741,222 @@ export function agentRoutes(
       onboardingFirstAgent: createOnboardingFirstAgent,
       ...createInput
     } = req.body;
-    createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
-    const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
-    assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
-    await assertFreshPaperclipRunnerProvider(
-      companyId,
-      createInput.adapterType,
-      rawCreateAdapterConfig,
-    );
-    assertNoNewAgentLegacyPromptTemplate(
-      createInput.adapterType,
-      rawCreateAdapterConfig,
-    );
-    assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
-    const agentId = randomUUID();
-    const requestedAdapterConfig = applyCodexLocalKeyIsolation(
-      companyId,
-      agentId,
-      createInput.adapterType,
-      applyCreateDefaultsByAdapterType(
+    const actor = getActorInfo(req);
+    const grantedByUserId = req.actor.type === "board" ? (req.actor.userId ?? null) : null;
+
+    // Isol8: everything that writes the agent row (and the secrets and skills
+    // it references) runs against `createDb`, which is the idempotency
+    // transaction when an Idempotency-Key is present, so a keyed agent never
+    // commits without its record.
+    const createAgent = async (createDb: Db) => {
+      createInput.adapterType = await assertSelectableAdapterType(createInput.adapterType);
+      const rawCreateAdapterConfig = (createInput.adapterConfig ?? {}) as Record<string, unknown>;
+      assertProviderTraceSettingTransition(req, createInput.runtimeConfig);
+      await assertFreshPaperclipRunnerProvider(
+        companyId,
         createInput.adapterType,
         rawCreateAdapterConfig,
-      ),
-    );
-    assertExternalInstructionsAdmin(req, {
-      id: agentId,
-      companyId,
-      name: createInput.name,
-      adapterConfig: requestedAdapterConfig,
-    });
-    const desiredSkillAssignment = await resolveDesiredSkillAssignment(
-      companyId,
-      createInput.adapterType,
-      requestedAdapterConfig,
-      withDefaultRoleSkillSelections(
-        normalizeDesiredSkillSelections(Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined),
-        defaultRoleSkillSelections(
-          createInput.role,
+      );
+      assertNoNewAgentLegacyPromptTemplate(
+        createInput.adapterType,
+        rawCreateAdapterConfig,
+      );
+      assertNoAgentAdapterConfigMutation(req, rawCreateAdapterConfig);
+      const agentId = randomUUID();
+      const requestedAdapterConfig = applyCodexLocalKeyIsolation(
+        companyId,
+        agentId,
+        createInput.adapterType,
+        applyCreateDefaultsByAdapterType(
           createInput.adapterType,
-          createOnboardingFirstAgent === true && req.actor.type === "board",
+          rawCreateAdapterConfig,
         ),
-      ),
-      "add",
-    );
-    const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
-      companyId,
-      adapterType: createInput.adapterType,
-      adapterConfig: desiredSkillAssignment.adapterConfig,
-    });
-    const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, createInput.adapterType, normalizedAdapterConfig, createInput.runtimeConfig);
-    await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
-    await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
-      allowedDrivers: allowedEnvironmentDriversForAgent(createInput.adapterType),
-      allowedSandboxProviders: allowedSandboxProvidersForAgent(createInput.adapterType),
-    });
-
-    const managedBinding = normalizedRuntimeConfig.aiConnection ? aiConnectionBindingSchema.parse(normalizedRuntimeConfig.aiConnection) : undefined;
-    const managedConnectionId = managedBinding ? await validateManagedAgentBinding(req, companyId, agentId, createInput.adapterType, normalizedAdapterConfig, managedBinding, createInput.defaultEnvironmentId, false, true) : undefined;
-    const createdAgent = await svc.create(
-      companyId,
-      {
+      );
+      assertExternalInstructionsAdmin(req, {
         id: agentId,
-        ...createInput,
-        adapterConfig: normalizedAdapterConfig,
-        runtimeConfig: normalizedRuntimeConfig,
-        status: "idle",
-        spentMonthlyCents: 0,
-        lastHeartbeatAt: null,
-      },
-      {
-        aiConnectionInstall: managedConnectionId ? { connectionId: managedConnectionId, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
-        claudeLogin: {
-          storedSessionId: createStoredSessionId ?? null,
-          ownerUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),
-          // The apply-existing path runs only for a user actor. The owner comes
-          // from the actor, so an agent actor never reaches the no-claim bind.
-          applyExistingWithoutClaim:
-            req.actor.type !== "agent" && createApplyStoredClaudeLogin === true,
-        },
-      },
-    );
-    const onboardingFirstAgentBundle = await resolveOnboardingFirstAgentBundle({
-      onboardingFirstAgent: createOnboardingFirstAgent,
-      actorType: req.actor.type,
-      agentName: createdAgent.name,
-      organizationName: company.name ?? null,
-    });
-    const agent = await materializeDefaultInstructionsBundleForNewAgent(
-      createdAgent,
-      onboardingFirstAgentBundle ?? instructionsBundle,
-    );
+        companyId,
+        name: createInput.name,
+        adapterConfig: requestedAdapterConfig,
+      });
+      const desiredSkillAssignment = await resolveDesiredSkillAssignment(
+        companyId,
+        createInput.adapterType,
+        requestedAdapterConfig,
+        withDefaultRoleSkillSelections(
+          normalizeDesiredSkillSelections(Array.isArray(requestedDesiredSkills) ? requestedDesiredSkills : undefined),
+          defaultRoleSkillSelections(
+            createInput.role,
+            createInput.adapterType,
+            createOnboardingFirstAgent === true && req.actor.type === "board",
+          ),
+        ),
+        "add",
+        { targetDb: createDb },
+      );
+      const normalizedAdapterConfig = await normalizeMediatedAdapterConfigForPersistence({
+        companyId,
+        adapterType: createInput.adapterType,
+        adapterConfig: desiredSkillAssignment.adapterConfig,
+        targetDb: createDb,
+      });
+      const normalizedRuntimeConfig = await normalizeCreatedAgentRuntimeConfig(req, companyId, createInput.adapterType, normalizedAdapterConfig, createInput.runtimeConfig);
+      await assertAgentEnvironmentSelection(companyId, createInput.adapterType, createInput.defaultEnvironmentId);
+      await assertAgentDefaultEnvironmentSelection(companyId, createInput.defaultEnvironmentId, {
+        allowedDrivers: allowedEnvironmentDriversForAgent(createInput.adapterType),
+        allowedSandboxProviders: allowedSandboxProvidersForAgent(createInput.adapterType),
+      });
 
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "agent.created",
-      entityType: "agent",
-      entityId: agent.id,
-      details: {
-        name: agent.name,
-        role: agent.role,
-        desiredSkills: desiredSkillAssignment.desiredSkills,
-      },
-    });
-    const telemetryClient = getTelemetryClient();
-    if (telemetryClient) {
-      trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
-    }
-
-    await applyDefaultAgentTaskAssignGrant(
-      companyId,
-      agent.id,
-      req.actor.type === "board" ? (req.actor.userId ?? null) : null,
-    );
-    await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
-
-    if (agent.budgetMonthlyCents > 0) {
-      await budgets.upsertPolicy(
+      const managedBinding = normalizedRuntimeConfig.aiConnection ? aiConnectionBindingSchema.parse(normalizedRuntimeConfig.aiConnection) : undefined;
+      const managedConnectionId = managedBinding ? await validateManagedAgentBinding(req, companyId, agentId, createInput.adapterType, normalizedAdapterConfig, managedBinding, createInput.defaultEnvironmentId, false, true) : undefined;
+      const createdAgent = await agentService(createDb).create(
         companyId,
         {
-          scopeType: "agent",
-          scopeId: agent.id,
-          amount: agent.budgetMonthlyCents,
-          windowKind: "calendar_month_utc",
+          id: agentId,
+          ...createInput,
+          adapterConfig: normalizedAdapterConfig,
+          runtimeConfig: normalizedRuntimeConfig,
+          status: "idle",
+          spentMonthlyCents: 0,
+          lastHeartbeatAt: null,
         },
-        actor.actorType === "user" ? actor.actorId : null,
+        {
+          aiConnectionInstall: managedConnectionId ? { connectionId: managedConnectionId, createdByUserId: responsibleUserForAiRequest(req) } : undefined,
+          claudeLogin: {
+            storedSessionId: createStoredSessionId ?? null,
+            ownerUserId: req.actor.type === "agent" ? null : (req.actor.userId ?? null),
+            // The apply-existing path runs only for a user actor. The owner comes
+            // from the actor, so an agent actor never reaches the no-claim bind.
+            applyExistingWithoutClaim:
+              req.actor.type !== "agent" && createApplyStoredClaudeLogin === true,
+          },
+        },
       );
+      const onboardingFirstAgentBundle = await resolveOnboardingFirstAgentBundle({
+        onboardingFirstAgent: createOnboardingFirstAgent,
+        actorType: req.actor.type,
+        agentName: createdAgent.name,
+        organizationName: company.name ?? null,
+      });
+      return {
+        agent: createdAgent,
+        // Everything the post-create steps need, frozen from THIS request so a
+        // replay finishes the original create rather than the retry's body.
+        completionPayload: agentCreateCompletionPayloadSchema.parse({
+          version: 1,
+          instructionsBundle: onboardingFirstAgentBundle ?? instructionsBundle ?? null,
+          desiredSkills: desiredSkillAssignment.desiredSkills,
+          grantedByUserId,
+          actor: {
+            actorType: actor.actorType,
+            actorId: actor.actorId,
+            agentId: actor.agentId,
+            runId: actor.runId,
+            agentApiKeyId: actor.agentApiKeyId,
+          },
+        }) as Record<string, unknown>,
+      };
+    };
+
+    const completeAgentCreate = async (
+      createdAgent: NonNullable<Awaited<ReturnType<typeof svc.getById>>>,
+      rawCompletionPayload: Record<string, unknown>,
+    ) => {
+      const completionPayload = agentCreateCompletionPayloadSchema.parse(rawCompletionPayload);
+      const agent = await materializeDefaultInstructionsBundleForNewAgent(
+        createdAgent,
+        completionPayload.instructionsBundle ?? undefined,
+      );
+      // A keyed create may be finishing an interrupted earlier attempt; the
+      // activity row is the one side effect that is not naturally idempotent.
+      const activityExists = idempotency
+        ? await db
+          .select({ id: activityLog.id })
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, companyId),
+            eq(activityLog.action, "agent.created"),
+            eq(activityLog.entityType, "agent"),
+            eq(activityLog.entityId, agent.id),
+          ))
+          .limit(1)
+          .then((rows) => rows.length > 0)
+        : false;
+      if (!activityExists) {
+        await logActivity(db, {
+          companyId,
+          actorType: completionPayload.actor.actorType,
+          actorId: completionPayload.actor.actorId,
+          agentId: completionPayload.actor.agentId,
+          runId: completionPayload.actor.runId,
+          agentApiKeyId: completionPayload.actor.agentApiKeyId,
+          action: "agent.created",
+          entityType: "agent",
+          entityId: agent.id,
+          details: {
+            name: agent.name,
+            role: agent.role,
+            desiredSkills: completionPayload.desiredSkills,
+          },
+        });
+        const telemetryClient = getTelemetryClient();
+        if (telemetryClient) {
+          try {
+            trackAgentCreated(telemetryClient, { agentRole: agent.role, agentId: agent.id });
+          } catch (error) {
+            logger.warn({ error, agentId: agent.id }, "Failed to emit agent-created telemetry");
+          }
+        }
+      }
+
+      await applyDefaultAgentTaskAssignGrant(
+        companyId,
+        agent.id,
+        completionPayload.grantedByUserId,
+      );
+      await builtInAgentService(db).ensureCompanyDefaultAgentGrants(companyId);
+
+      if (agent.budgetMonthlyCents > 0) {
+        await budgets.upsertPolicy(
+          companyId,
+          {
+            scopeType: "agent",
+            scopeId: agent.id,
+            amount: agent.budgetMonthlyCents,
+            windowKind: "calendar_month_utc",
+          },
+          completionPayload.actor.actorType === "user" ? completionPayload.actor.actorId : null,
+        );
+      }
+      return agent;
+    };
+
+    if (!idempotency) {
+      const { agent: createdAgent, completionPayload } = await createAgent(db);
+      const agent = await completeAgentCreate(createdAgent, completionPayload);
+      res.status(201).json(redactAgentRowForResponse(agent));
+      return;
     }
 
-    res.status(201).json(redactAgentRowForResponse(agent));
+    const target = { operation: "agent.create" as const, key: idempotency.key, companyId };
+    const { replayed } = await runIdempotentOperation(db, target, { replayOnly: idempotency.replayOnly }, {
+      replay: async (record, tx) => (record.agentId ? agentService(tx).getById(record.agentId) : null),
+      create: async (tx) => {
+        const { agent, completionPayload } = await createAgent(tx);
+        return { result: agent, resourceId: agent.id, companyId, agentId: agent.id, completionPayload };
+      },
+    });
+    const loadAgent = async (record: IdempotentOperationRecord) => {
+      const agent = record.agentId ? await svc.getById(record.agentId) : null;
+      if (!agent) throw conflict("Idempotent agent create target no longer exists");
+      return agent;
+    };
+    const agent = await completeIdempotentOperation(
+      db,
+      target,
+      async (record) => completeAgentCreate(await loadAgent(record), record.completionPayload),
+      loadAgent,
+    );
+    res.status(replayed ? 200 : 201).json(redactAgentRowForResponse(agent));
   });
 
   router.patch("/agents/:id/permissions", validate(updateAgentPermissionsSchema), async (req, res) => {
@@ -5603,6 +5716,79 @@ export function agentRoutes(
     res.json(keys);
   });
 
+  // Isol8: a keyed agent API-key create replays the SAME plaintext token for
+  // AGENT_KEY_REPLAY_WINDOW_MS, so a lost response or a concurrent duplicate
+  // request both end holding the one live key. The token is the only way a
+  // key is usable, so replaying it means storing it: it sits in the record's
+  // completion payload for the window and is scrubbed after. A same-key
+  // request after that (the caller evidently lost the key) rotates: the old
+  // key is revoked and a fresh one is minted under the same record.
+  const AGENT_KEY_REPLAY_WINDOW_MS = 24 * 60 * 60 * 1000;
+
+  async function runIdempotentAgentKeyCreate(
+    agent: { id: string; companyId: string },
+    idempotency: IdempotencyRequest,
+    mintKey: (keyDb: Db) => ReturnType<typeof svc.createApiKey>,
+  ) {
+    await db
+      .update(idempotentOperations)
+      .set({ completionPayload: {} })
+      .where(and(
+        eq(idempotentOperations.operation, "agent_key.create"),
+        lt(idempotentOperations.createdAt, new Date(Date.now() - AGENT_KEY_REPLAY_WINDOW_MS)),
+        sql`${idempotentOperations.completionPayload} <> '{}'::jsonb`,
+      ));
+    return runIdempotentOperation(
+      db,
+      { operation: "agent_key.create", key: idempotency.key, companyId: agent.companyId },
+      { replayOnly: idempotency.replayOnly },
+      {
+        replay: async (record, tx) => {
+          if (record.agentId !== agent.id) {
+            throw conflict("Idempotency-Key was already used to create a key for a different agent", {
+              code: "agent_key_create_idempotency_agent_mismatch",
+            });
+          }
+          const keySvc = agentService(tx);
+          const existing = record.resourceId ? await keySvc.getKeyById(record.resourceId) : null;
+          const token = record.completionPayload.token;
+          if (
+            existing
+            && !existing.revokedAt
+            && typeof token === "string"
+            && Date.now() - record.createdAt.getTime() < AGENT_KEY_REPLAY_WINDOW_MS
+          ) {
+            return {
+              id: existing.id,
+              name: existing.name,
+              scope: normalizeAgentApiKeyScope(existing.scopeConfig),
+              responsibleUserId: existing.responsibleUserId,
+              token,
+              createdAt: existing.createdAt,
+            };
+          }
+          if (existing && !existing.revokedAt) await keySvc.revokeKey(agent.id, existing.id);
+          const rotated = await mintKey(tx);
+          await rebindIdempotentOperation(tx, record.id, {
+            resourceId: rotated.id,
+            completionPayload: { token: rotated.token },
+          });
+          return rotated;
+        },
+        create: async (tx) => {
+          const created = await mintKey(tx);
+          return {
+            result: created,
+            resourceId: created.id,
+            companyId: agent.companyId,
+            agentId: agent.id,
+            completionPayload: { token: created.token },
+          };
+        },
+      },
+    );
+  }
+
   router.post("/agents/:id/keys", validate(createAgentKeySchema), async (req, res) => {
     assertBoard(req);
     const id = req.params.id as string;
@@ -5610,9 +5796,22 @@ export function agentRoutes(
     if (!agent) {
       return;
     }
-    const key = await svc.createApiKey(id, req.body.name, req.body.scope, {
-      responsibleUserId: req.actor.userId ?? null,
-    });
+    const mintKey = (keyDb: Db) =>
+      agentService(keyDb).createApiKey(id, req.body.name, req.body.scope, {
+        responsibleUserId: req.actor.userId ?? null,
+      });
+    const idempotency = readIdempotencyHeaders(req);
+    let key: Awaited<ReturnType<typeof svc.createApiKey>>;
+    if (idempotency) {
+      const outcome = await runIdempotentAgentKeyCreate(agent, idempotency, mintKey);
+      if (outcome.replayed) {
+        res.status(200).json(outcome.result);
+        return;
+      }
+      key = outcome.result;
+    } else {
+      key = await mintKey(db);
+    }
 
     await logActivity(db, {
       companyId: agent.companyId,

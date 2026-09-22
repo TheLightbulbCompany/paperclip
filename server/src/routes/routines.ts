@@ -16,6 +16,7 @@ import { validate, validateIssueMutationBody } from "../middleware/validate.js";
 import { accessService, documentAnnotationService, logActivity, routineService } from "../services/index.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { forbidden, unauthorized } from "../errors.js";
+import { readIdempotencyHeaders, runIdempotentOperation } from "../services/idempotent-operations.js";
 import { getTelemetryClient } from "../telemetry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -158,11 +159,38 @@ export function routineRoutes(
     const companyId = req.params.companyId as string;
     await assertBoardCanAssignTasks(req, companyId);
     assertCanManageCompanyRoutine(req, companyId, req.body.assigneeAgentId);
-    const created = await svc.create(companyId, req.body, {
+    const createActor = {
       agentId: req.actor.type === "agent" ? req.actor.agentId : null,
       userId: req.actor.type === "board" ? req.actor.userId ?? "board" : null,
       runId: req.actor.runId ?? null,
-    });
+    };
+    // Isol8: with an Idempotency-Key the routine commits with the key's record
+    // and a retry replays it (200) instead of creating a duplicate.
+    const idempotency = readIdempotencyHeaders(req);
+    type CreatedRoutine = Awaited<ReturnType<typeof svc.create>>;
+    let created: CreatedRoutine;
+    if (idempotency) {
+      const outcome = await runIdempotentOperation<CreatedRoutine>(
+        db,
+        { operation: "routine.create", key: idempotency.key, companyId },
+        { replayOnly: idempotency.replayOnly },
+        {
+          replay: async (record, tx) => (record.resourceId ? routineService(tx).get(record.resourceId) : null),
+          create: async (tx) => {
+            const routine = await routineService(tx, { pluginWorkerManager: options.pluginWorkerManager })
+              .create(companyId, req.body, createActor);
+            return { result: routine, resourceId: routine.id, companyId };
+          },
+        },
+      );
+      if (outcome.replayed) {
+        res.status(200).json(outcome.result);
+        return;
+      }
+      created = outcome.result;
+    } else {
+      created = await svc.create(companyId, req.body, createActor);
+    }
     const actor = getActorInfo(req);
     await logActivity(db, {
       companyId,

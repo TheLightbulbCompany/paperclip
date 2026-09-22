@@ -38,6 +38,7 @@ import { badRequest, conflict, forbidden, notFound, unprocessable } from "../err
 import { PORTABLE_ZIP_UPLOAD_LIMIT_BYTES } from "../http/body-limits.js";
 import { logger } from "../middleware/logger.js";
 import { validate } from "../middleware/validate.js";
+import { readIdempotencyHeaders, runIdempotentOperation } from "../services/idempotent-operations.js";
 import {
   assembleImportTransferZip,
   importTransferPartName,
@@ -1204,17 +1205,71 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       throw forbidden("Instance admin required");
     }
     const ownerPrincipalId = req.actor.userId ?? "local-board";
-    const company = await svc.create({
-      ...req.body,
-      defaultResponsibleUserId: req.body.defaultResponsibleUserId ?? ownerPrincipalId,
-    });
-    await access.ensureMembership(company.id, "user", ownerPrincipalId, "owner", "active");
-    await access.ensureRoleDefaultGrants(
-      company.id,
-      ownerPrincipalId,
-      "owner",
-      req.actor.userId ?? null,
-    );
+    // Isol8: the company, its owner membership, grants and budget are created
+    // together; with an Idempotency-Key they commit with the key's record, and
+    // a retry replays the company instead of creating a second one.
+    const createCompany = async (createDb: Db) => {
+      const created = await companyService(createDb).create({
+        ...req.body,
+        defaultResponsibleUserId: req.body.defaultResponsibleUserId ?? ownerPrincipalId,
+      });
+      const createAccess = accessService(createDb);
+      await createAccess.ensureMembership(created.id, "user", ownerPrincipalId, "owner", "active");
+      await createAccess.ensureRoleDefaultGrants(
+        created.id,
+        ownerPrincipalId,
+        "owner",
+        req.actor.userId ?? null,
+      );
+      if (created.budgetMonthlyCents > 0) {
+        await budgetService(createDb).upsertPolicy(
+          created.id,
+          {
+            scopeType: "company",
+            scopeId: created.id,
+            amount: created.budgetMonthlyCents,
+            windowKind: "calendar_month_utc",
+          },
+          req.actor.userId ?? "board",
+        );
+      }
+      return created;
+    };
+    const idempotency = readIdempotencyHeaders(req);
+    if (idempotency) {
+      const { result, replayed } = await runIdempotentOperation(
+        db,
+        {
+          operation: "company.create",
+          key: idempotency.key,
+          companyId: null,
+          // Keys are per creating principal: another admin's key never replays
+          // someone else's company.
+          scope: `user:${ownerPrincipalId}`,
+        },
+        { replayOnly: idempotency.replayOnly },
+        {
+          replay: async (record, tx) => (record.companyId ? companyService(tx).getById(record.companyId) : null),
+          create: async (tx) => {
+            const created = await createCompany(tx);
+            return { result: created, resourceId: created.id, companyId: created.id };
+          },
+        },
+      );
+      if (replayed) {
+        res.status(200).json(result);
+        return;
+      }
+      await logCompanyCreated(req, result);
+      res.status(201).json(result);
+      return;
+    }
+    const company = await createCompany(db);
+    await logCompanyCreated(req, company);
+    res.status(201).json(company);
+  });
+
+  async function logCompanyCreated(req: Request, company: { id: string; name: string }) {
     await logActivity(db, {
       companyId: company.id,
       actorType: "user",
@@ -1224,20 +1279,7 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       entityId: company.id,
       details: { name: company.name },
     });
-    if (company.budgetMonthlyCents > 0) {
-      await budgets.upsertPolicy(
-        company.id,
-        {
-          scopeType: "company",
-          scopeId: company.id,
-          amount: company.budgetMonthlyCents,
-          windowKind: "calendar_month_utc",
-        },
-        req.actor.userId ?? "board",
-      );
-    }
-    res.status(201).json(company);
-  });
+  }
 
   router.patch("/:companyId", async (req, res) => {
     const companyId = req.params.companyId as string;
