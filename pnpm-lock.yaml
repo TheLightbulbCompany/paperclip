@@ -736,11 +736,11 @@ importers:
         version: link:../sdk
     devDependencies:
       '@types/node':
-        specifier: ^22.19.21
-        version: 22.20.1
+        specifier: ^24.0.0
+        version: 24.13.3
       typescript:
-        specifier: ^5.7.3
-        version: 5.9.3
+        specifier: ^7.0.2
+        version: 7.0.2
 
   packages/plugins/plugin-llm-wiki:
     devDependencies:
