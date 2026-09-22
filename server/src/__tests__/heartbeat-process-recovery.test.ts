@@ -9935,6 +9935,10 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
         status: "failed",
         errorCode: "openclaw_gateway_wait_error",
         error: "gateway agent.wait ended without a terminal run state",
+        // Upstream now holds any failed run whose provider work may have
+        // started for operator reconciliation (legacy-execution-recovery), so
+        // the backoff path is only reachable for failures before provider work.
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
         contextSnapshot: {
           issueId,
           taskId: issueId,
