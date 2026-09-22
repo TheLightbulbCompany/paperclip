@@ -541,11 +541,9 @@ describe("transientRetryPlan", () => {
     expect(transientRetryPlan(false, TRANSIENT_MAX_RETRIES, noJitter)).toBeNull();
   });
 
-  it("keeps the legacy 2-retry linear budget once the agent request was dispatched", () => {
-    expect(POST_DISPATCH_MAX_RETRIES).toBe(2);
-    expect(transientRetryPlan(true, 0)).toEqual({ backoffMs: 2_000 });
-    expect(transientRetryPlan(true, 1)).toEqual({ backoffMs: 4_000 });
-    expect(transientRetryPlan(true, 2)).toBeNull();
+  it("never retries once the agent request was dispatched (upstream remote-work boundary)", () => {
+    expect(POST_DISPATCH_MAX_RETRIES).toBe(0);
+    expect(transientRetryPlan(true, 0)).toBeNull();
   });
 });
 
@@ -676,7 +674,7 @@ describe("buildTerminalFailureResult (heartbeat contract, adapter half)", () => 
     expect(result.retryNotBefore).toBeUndefined();
   });
 
-  it("treats a sent-but-unacknowledged agent request as possibly accepted: legacy retry cap, no transient_upstream", () => {
+  it("treats a sent-but-unacknowledged agent request as possibly accepted: no retry, no transient_upstream", () => {
     // The agent request frame reached the socket but the ack never came back
     // (connection dropped / request timeout). The container may have received
     // it and started the run, so no re-dispatch contract may attach.
@@ -690,9 +688,8 @@ describe("buildTerminalFailureResult (heartbeat contract, adapter half)", () => 
     expect(result.retryNotBefore).toBeUndefined();
     expect(result.timedOut).toBe(true);
     expect(result.errorCode).toBe("openclaw_gateway_timeout");
-    // In-process retries stay at the legacy cap on this path.
-    expect(transientRetryPlan(true, 0)).toEqual({ backoffMs: 2_000 });
-    expect(transientRetryPlan(true, POST_DISPATCH_MAX_RETRIES)).toBeNull();
+    // No in-process retry past the remote-work boundary.
+    expect(transientRetryPlan(true, 0)).toBeNull();
   });
 
   it("keeps the pairing-required guidance and terminal semantics unchanged", () => {

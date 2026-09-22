@@ -189,7 +189,8 @@ describe("openclaw_gateway execute dispatch boundary", () => {
     await vi.advanceTimersByTimeAsync(0);
     expect(authorityChangeSettled).toBe(false);
 
-    await vi.advanceTimersByTimeAsync(2_000);
+    // Isol8 fork: the first transient retry backs off 2s with up to 20% jitter.
+    await vi.advanceTimersByTimeAsync(2_400);
     const result = await resultPromise;
     await authorityChange;
 

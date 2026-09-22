@@ -130,10 +130,10 @@ export const TRANSIENT_MAX_RETRIES = 4;
 // Once the agent request has been WRITTEN to the socket, the container may
 // have received it and started the run even if the ack never came back — a
 // re-send is no longer known to be idempotent, and another dispatch can
-// duplicate the run's side effects. Post-dispatch failures keep the
-// pre-self-healing budget: 2 retries, linear 2s/4s backoff, no recovery
-// contract on exhaustion.
-export const POST_DISPATCH_MAX_RETRIES = 2;
+// duplicate the run's side effects. Upstream (2026.9) stopped retrying past
+// that remote-work boundary altogether; the fork follows: no post-dispatch
+// retry and no recovery contract on exhaustion.
+export const POST_DISPATCH_MAX_RETRIES = 0;
 const TRANSIENT_BACKOFF_CAP_MS = 30_000;
 const TRANSIENT_BACKOFF_JITTER_RATIO = 0.2;
 
