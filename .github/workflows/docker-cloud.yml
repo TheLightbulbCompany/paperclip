@@ -15,6 +15,9 @@ concurrency:
 
 jobs:
   build-and-push-cloud:
+    # Isol8 fork: the cloud variant is upstream's hosted product; nothing in
+    # Lightbulb consumes it, and its raw refs are not lowercase-safe here.
+    if: github.repository == 'paperclipai/paperclip'
     # Only canonical master builds can consume the release Fleet. The runner
     # group must also allow this workflow only at refs/heads/master.
     # Keep an operator switch for a full-run retry on GitHub-hosted runners.
