@@ -271,6 +271,29 @@ describeEmbeddedPostgres("idempotent create routes", () => {
       expect(scrubbed?.completionPayload).toEqual({});
     });
 
+    it("never rotates on replay-only: an expired or revoked record answers like a miss", async () => {
+      const { agentId } = await seedCompany();
+      const app = agentApp();
+      const path = `/api/agents/${agentId}/keys`;
+      const first = await request(app).post(path).set("Idempotency-Key", "mcp:replay-only").send({ name: "mcp" }).expect(201);
+
+      // Within the window, replay-only replays the same token.
+      const replay = await request(app).post(path).set("Idempotency-Key", "mcp:replay-only").set("Idempotency-Replay-Only", "true").send({ name: "mcp" }).expect(200);
+      expect(replay.body.token).toBe(first.body.token);
+
+      await db.update(idempotentOperations).set({ createdAt: new Date(Date.now() - 25 * 60 * 60 * 1000) });
+      const expired = await request(app).post(path).set("Idempotency-Key", "mcp:replay-only").set("Idempotency-Replay-Only", "true").send({ name: "mcp" }).expect(409);
+      expect(expired.body.code).toBe("agent_key_create_idempotency_replay_miss");
+      expect((await liveKeys(agentId)).map((key) => key.id)).toEqual([first.body.id]);
+
+      await request(app).delete(`${path}/${first.body.id}`).expect(200);
+      const revoked = await request(app).post(path).set("Idempotency-Key", "mcp:replay-only").set("Idempotency-Replay-Only", "true").send({ name: "mcp" }).expect(409);
+      expect(revoked.body.code).toBe("agent_key_create_idempotency_replay_miss");
+      expect(await liveKeys(agentId)).toHaveLength(0);
+      const [record] = await db.select().from(idempotentOperations).where(eq(idempotentOperations.idempotencyKey, "mcp:replay-only"));
+      expect(record?.resourceId).toBe(first.body.id);
+    });
+
     it("rotates a replayed key that was revoked", async () => {
       const { agentId } = await seedCompany();
       const app = agentApp();

@@ -5767,6 +5767,13 @@ export function agentRoutes(
               createdAt: existing.createdAt,
             };
           }
+          // Replay-only is a read-style mode: it never revokes or mints. A
+          // record that can no longer replay its token answers like a miss.
+          if (idempotency.replayOnly) {
+            throw conflict("No existing agent_key.create operation matches this idempotency key", {
+              code: "agent_key_create_idempotency_replay_miss",
+            });
+          }
           if (existing && !existing.revokedAt) await keySvc.revokeKey(agent.id, existing.id);
           const rotated = await mintKey(tx);
           await rebindIdempotentOperation(tx, record.id, {
