@@ -2537,6 +2537,13 @@ export function routineService(
         }
 
         const nextSnapshot = await buildRoutineRevisionSnapshot(txDb, candidate);
+        // Isol8: the row differs from the candidate (checked above) but the
+        // candidate equals the latest revision — the row drifted from its own
+        // revision through a direct write (built-in bundle reconcile writes
+        // origin fields directly; tests drift titles). Repair the row without
+        // minting a duplicate revision. Upstream reached the repair only by
+        // accident: its key-order-sensitive compare never matched jsonb.
+        let revisionUnchanged = false;
         if (locked.latestRevisionId) {
           const latestRevision = await txDb
             .select({ snapshot: routineRevisions.snapshot })
@@ -2549,17 +2556,9 @@ export function routineService(
               ),
             )
             .then((rows) => rows[0] ?? null);
-          if (latestRevision && snapshotsMatch(nextSnapshot, latestRevision.snapshot as RoutineRevisionSnapshotV1)) {
-            if (patch.env !== undefined) {
-              await secretsSvc.syncEnvBindingsForTarget(
-                locked.companyId,
-                { targetType: "routine", targetId: locked.id },
-                candidate.env,
-                { db: tx },
-              );
-            }
-            return locked;
-          }
+          revisionUnchanged = Boolean(
+            latestRevision && snapshotsMatch(nextSnapshot, latestRevision.snapshot as RoutineRevisionSnapshotV1),
+          );
         }
 
         const [updated] = await txDb
@@ -2594,9 +2593,9 @@ export function routineService(
           .where(eq(routines.id, id))
           .returning();
         if (!updated) return null;
-        const { routine } = await appendRoutineRevision(txDb, updated, actor, {
-          changeSummary: "Updated routine",
-        });
+        const routine = revisionUnchanged
+          ? updated
+          : (await appendRoutineRevision(txDb, updated, actor, { changeSummary: "Updated routine" })).routine;
         if (patch.env !== undefined) {
           await secretsSvc.syncEnvBindingsForTarget(
             routine.companyId,
