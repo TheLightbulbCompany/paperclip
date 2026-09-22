@@ -402,7 +402,7 @@ export function actorMiddleware(db: Db, opts: ActorMiddlewareOptions): RequestHa
         ));
       if (identityRun?.status === "cancelled" && identityRun.contextSnapshot?.conversationMode === true
         && !["GET", "HEAD", "OPTIONS"].includes(req.method)) {
-        _res.status(403).json({ error: "This conversation turn was cancelled", code: "conversation_turn_cancelled" });
+        res.status(403).json({ error: "This conversation turn was cancelled", code: "conversation_turn_cancelled" });
         return;
       }
       if (identityRun?.activeIdentityContextId && identityRun.status === "running") {
