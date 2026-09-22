@@ -8,6 +8,24 @@ import {
   agentApiKeys,
   agentConfigRevisions,
   agentRuntimeState,
+  agentSessionGoalActions,
+  aiConnectionDefaults,
+  aiProviderDefaults,
+  chatActions,
+  chatConversations,
+  chatDeliveries,
+  chatEndpoints,
+  chatMessageLinks,
+  chatPublications,
+  chatTeamsFileTransfers,
+  completionContracts,
+  managedAgentProfiles,
+  nativeRunFinalizations,
+  nativeRunResults,
+  providerTraceRecords,
+  statusDecisionEffects,
+  statusDecisions,
+  workAssessments,
   agentTaskSessions,
   agentWakeupRequests,
   budgetIncidents,
@@ -107,6 +125,27 @@ type CompanyScopedTable = PgTable & { companyId: PgColumn };
 // replays this sequence against the live FK graph, so a new table that breaks
 // coverage or ordering fails CI instead of 500ing DELETE /api/companies/:id.
 export const COMPANY_DELETE_SEQUENCE: readonly CompanyScopedTable[] = [
+  // Native-run evidence (before heartbeat_runs and issues): finalizations ->
+  // status decisions -> work assessments -> run results -> completion contracts.
+  nativeRunFinalizations,
+  statusDecisionEffects,
+  statusDecisions,
+  workAssessments,
+  nativeRunResults,
+  completionContracts,
+  agentSessionGoalActions,
+  providerTraceRecords,
+  // Chat channels (before issue_comments / issues / agents).
+  chatMessageLinks,
+  chatPublications,
+  chatTeamsFileTransfers,
+  chatActions,
+  chatDeliveries,
+  chatConversations,
+  chatEndpoints,
+  // AI defaults reference connection grants, which go with agents.
+  aiConnectionDefaults,
+  aiProviderDefaults,
   // Decisions + queues (children first, then decisions, then bundles). The whole
   // family lands ahead of heartbeat_runs / agent_api_keys / issues / agents:
   // every table here holds a NO ACTION reference to at least one of those.
@@ -143,7 +182,9 @@ export const COMPANY_DELETE_SEQUENCE: readonly CompanyScopedTable[] = [
   // Skill studio (test runs RESTRICT skill versions, agents, and issues).
   companySkillTestRuns,
   companySkills,
-  // Secrets (proposals reference companies with NO ACTION).
+  // Secrets (proposals reference companies with NO ACTION; managed agent
+  // profiles RESTRICT their api-key secret).
+  managedAgentProfiles,
   companySecretProposals,
   companySecretBindings,
   secretAccessEvents,
