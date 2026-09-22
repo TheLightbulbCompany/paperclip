@@ -63,10 +63,16 @@ import {
   HistorySection,
 } from "../components/routine-sections/operate-sections";
 import type {
+  IssueExecutionPolicy,
   RoutineDetail as RoutineDetailType,
   RoutineEnvConfig,
   RoutineVariable,
 } from "@paperclipai/shared";
+import { principalFromSelectionValue, stageParticipantValues } from "../lib/issue-execution-policy";
+
+function routineReviewerAgentId(policy: IssueExecutionPolicy | null | undefined): string {
+  return principalFromSelectionValue(stageParticipantValues(policy, "review")[0] ?? "")?.agentId ?? "";
+}
 
 const LAST_SECTION_STORAGE_KEY = "paperclip.routineLastSection";
 
@@ -143,9 +149,13 @@ function getLocalTimezone(): string {
   }
 }
 
+// Isol8: this page has no reviewer control, so it never sends executionPolicy
+// (an absent key leaves the routine's review policy untouched) and strips the
+// draft-only reviewerAgentId the shared draft type carries.
 function buildRoutineMutationPayload(input: RoutineEditDraft) {
+  const { reviewerAgentId: _reviewerAgentId, ...rest } = input;
   return {
-    ...input,
+    ...rest,
     description: input.description.trim() || null,
     projectId: input.projectId || null,
     assigneeAgentId: input.assigneeAgentId || null,
@@ -174,6 +184,7 @@ export function RoutineDetail() {
     description: "",
     projectId: "",
     assigneeAgentId: "",
+    reviewerAgentId: "",
     priority: "medium",
     concurrencyPolicy: "coalesce_if_active",
     catchUpPolicy: "skip_missed",
@@ -268,6 +279,7 @@ export function RoutineDetail() {
             description: routine.description ?? "",
             projectId: routine.projectId ?? "",
             assigneeAgentId: routine.assigneeAgentId ?? "",
+            reviewerAgentId: routineReviewerAgentId(routine.executionPolicy),
             priority: routine.priority,
             concurrencyPolicy: routine.concurrencyPolicy,
             catchUpPolicy: routine.catchUpPolicy,
@@ -660,6 +672,7 @@ export function RoutineDetail() {
         description: response.routine.description ?? "",
         projectId: response.routine.projectId ?? "",
         assigneeAgentId: response.routine.assigneeAgentId ?? "",
+        reviewerAgentId: routineReviewerAgentId(response.routine.executionPolicy),
         priority: response.routine.priority,
         concurrencyPolicy: response.routine.concurrencyPolicy,
         catchUpPolicy: response.routine.catchUpPolicy,
@@ -878,6 +891,26 @@ export function RoutineDetail() {
               aria-labelledby="routine-section-title"
               className={isEditableSection ? "mx-auto w-full max-w-3xl" : "w-full"}
             >
+              {routine.status === "paused" && routine.autoPausedAt ? (
+                <div className="mb-6 flex w-full items-start gap-3 rounded-md border border-amber-500/40 bg-amber-500/10 px-4 py-3 text-sm">
+                  <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-amber-400" />
+                  <div className="flex-1">
+                    <p className="font-medium text-amber-200">Automatically paused after repeated failures</p>
+                    <p className="text-muted-foreground">
+                      This routine failed {routine.consecutiveFailureCount} runs in a row and was paused to
+                      stop a pile-up. Fix the underlying issue, then resume.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    disabled={automationToggleDisabled}
+                    onClick={() => updateRoutineStatus.mutate("active")}
+                    className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-50"
+                  >
+                    Resume
+                  </button>
+                </div>
+              ) : null}
               <h2 id="routine-section-title" className="mb-4 text-lg font-semibold">
                 {SECTION_TITLES[section]}
               </h2>

@@ -96,14 +96,15 @@ const activityGateScopeOptions = [
 ];
 
 const triggerKinds = ["schedule", "webhook"];
-const signingModes = ["bearer", "hmac_sha256", "github_hmac", "none"];
+const signingModes = ["bearer", "hmac_sha256", "github_hmac", "hmac_sha1", "none"];
 const signingModeDescriptions: Record<string, string> = {
   bearer: "Expect a shared bearer token in the Authorization header.",
   hmac_sha256: "Expect an HMAC SHA-256 signature over the request using the shared secret.",
   github_hmac: "Accept GitHub-style X-Hub-Signature-256 header (HMAC over raw body, no timestamp).",
+  hmac_sha1: "Accept an HMAC-SHA1 hex signature over the raw body (Vercel-style; optional sha1= prefix).",
   none: "No authentication — the webhook URL itself acts as a shared secret.",
 };
-const SIGNING_MODES_WITHOUT_REPLAY_WINDOW = new Set(["github_hmac", "none"]);
+const SIGNING_MODES_WITHOUT_REPLAY_WINDOW = new Set(["github_hmac", "hmac_sha1", "none"]);
 
 export function OverviewSection({
   defaultDescriptionAnnotationsOpen = false,
