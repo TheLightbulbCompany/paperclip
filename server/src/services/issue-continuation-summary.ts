@@ -94,7 +94,7 @@ function extractPathCandidates(...texts: Array<string | null | undefined>) {
 
 function inferMode(issue: IssueSummaryInput, run: RunSummaryInput) {
   if (issue.status === "done" || issue.status === "in_review") return "review";
-  if (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled") return "implementation";
+  if (run.status === "failed" || run.status === "timed_out" || run.status === "cancelled" || run.status === "interrupted") return "implementation";
   if (issue.status === "backlog" || issue.status === "todo") return "plan";
   return "implementation";
 }
@@ -250,6 +250,7 @@ export async function refreshIssueContinuationSummary(input: {
     db
       .select({
         id: issues.id,
+        conversationAgentId: issues.conversationAgentId,
         identifier: issues.identifier,
         title: issues.title,
         description: issues.description,
@@ -262,7 +263,7 @@ export async function refreshIssueContinuationSummary(input: {
     getIssueContinuationSummaryDocument(db, issueId),
   ]);
 
-  if (!issue) return null;
+  if (!issue || issue.conversationAgentId) return null;
   const body = buildContinuationSummaryMarkdown({
     issue,
     run,

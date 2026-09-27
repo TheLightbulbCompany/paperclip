@@ -1,12 +1,12 @@
+import { normalizeLegacyRunnerProvider } from "@paperclipai/adapter-utils";
 import { memo, useState, useEffect, useRef, useCallback, useMemo, type ChangeEvent, type CSSProperties, type DragEvent, type RefObject } from "react";
 import { useQuery, useMutation, useQueryClient } from "@tanstack/react-query";
-import type { IssueWorkMode } from "@paperclipai/shared";
-import { pickTextColorForSolidBg } from "@/lib/color-contrast";
+import type { AgentEnvConfig, EnvBinding, IssueWorkMode } from "@paperclipai/shared";
 import { useDialog } from "../context/DialogContext";
 import { useCompany } from "../context/CompanyContext";
-import { useAdapterCapabilities } from "../adapters/use-adapter-capabilities";
 import { executionWorkspacesApi } from "../api/execution-workspaces";
 import { issuesApi } from "../api/issues";
+import { MissingUserSecretsBanner } from "../pages/secrets/MissingUserSecretsBanner";
 import { instanceSettingsApi } from "../api/instanceSettings";
 import { projectsApi } from "../api/projects";
 import { agentsApi } from "../api/agents";
@@ -16,9 +16,16 @@ import { assetsApi } from "../api/assets";
 import { buildCompanyUserInlineOptions, buildMarkdownMentionOptions, isAgentTaskTarget } from "../lib/company-members";
 import { queryKeys } from "../lib/queryKeys";
 import { orderReusableExecutionWorkspaces } from "../lib/reusable-execution-workspaces";
+import {
+  defaultExecutionWorkspaceModeForProject,
+  defaultProjectWorkspaceIdForProject,
+  issueExecutionWorkspaceModeForExistingWorkspace,
+} from "../lib/project-workspace-defaults";
 import { useProjectOrder } from "../hooks/useProjectOrder";
+import { useStreamlinedUiEnabled } from "../hooks/useStreamlinedUiEnabled";
 import { getRecentAssigneeIds, sortAgentsByRecency, trackRecentAssignee } from "../lib/recent-assignees";
 import { getRecentProjectIds, trackRecentProject } from "../lib/recent-projects";
+import { recordRecentTask } from "../lib/recent-tasks";
 import { buildExecutionPolicy } from "../lib/issue-execution-policy";
 import { isIssueWorkMode, nextWorkMode, workModeMetaFor, workModeMetaList } from "../lib/work-mode-meta";
 import { useToastActions } from "../context/ToastContext";
@@ -55,6 +62,7 @@ import {
   Paperclip,
   FileText,
   Flag,
+  PauseCircle,
   Loader2,
   ListTree,
   X,
@@ -66,17 +74,70 @@ import {
 import { Textarea } from "@/components/ui/textarea";
 import { cn } from "../lib/utils";
 import { extractProviderIdWithFallback } from "../lib/model-utils";
-import { issueStatusText, issueStatusTextClassic, issueStatusTextDefault, priorityColor, priorityColorDefault } from "../lib/status-colors";
-import { useConferenceRoomChatEnabled } from "../hooks/useConferenceRoomChatEnabled";
+import { issueStatusText, issueStatusTextDefault, priorityColor, priorityColorDefault } from "../lib/status-colors";
+import { SHOW_TASK_PRIORITY_UI } from "../lib/ui-flags";
 import { MarkdownEditor, type MarkdownEditorRef, type MentionOption } from "./MarkdownEditor";
 import { AgentIcon } from "./AgentIconPicker";
+import { InlineBanner } from "./InlineBanner";
 import { InlineEntitySelector, type InlineEntityOption } from "./InlineEntitySelector";
 import { getTrustPreset } from "../lib/trust-policy-ui";
+import { ReusableExecutionWorkspaceSelect } from "./ReusableExecutionWorkspaceSelect";
+import { codexReasoningEffortOptions } from "../lib/codex-reasoning-effort";
 
 const DRAFT_KEY = "paperclip:issue-draft";
 const DEBOUNCE_MS = 800;
-const MOBILE_DIALOG_HEIGHT = "calc(100dvh - max(1rem, env(safe-area-inset-top)) - max(1rem, env(safe-area-inset-bottom)))";
 
+type VisualViewportLayout = {
+  height: number;
+  offsetTop: number;
+  constrained: boolean;
+};
+
+type NewIssueDialogViewportStyle = CSSProperties & {
+  "--new-issue-visual-viewport-height"?: string;
+  "--new-issue-visual-viewport-offset-top"?: string;
+  "--new-issue-dialog-top"?: string;
+  "--new-issue-dialog-height"?: string;
+};
+
+function readVisualViewportLayout(): VisualViewportLayout | null {
+  if (typeof window === "undefined" || !window.visualViewport) return null;
+  const { height, offsetTop } = window.visualViewport;
+  return {
+    height,
+    offsetTop,
+    constrained: height < window.innerHeight,
+  };
+}
+
+function useVisualViewportLayout(enabled: boolean) {
+  const [layout, setLayout] = useState<VisualViewportLayout | null>(() =>
+    enabled ? readVisualViewportLayout() : null,
+  );
+
+  useEffect(() => {
+    if (!enabled) {
+      setLayout(null);
+      return;
+    }
+
+    const viewport = window.visualViewport;
+    if (!viewport) return;
+
+    const updateLayout = () => setLayout(readVisualViewportLayout());
+    updateLayout();
+    viewport.addEventListener("resize", updateLayout);
+    viewport.addEventListener("scroll", updateLayout);
+    window.addEventListener("resize", updateLayout);
+    return () => {
+      viewport.removeEventListener("resize", updateLayout);
+      viewport.removeEventListener("scroll", updateLayout);
+      window.removeEventListener("resize", updateLayout);
+    };
+  }, [enabled]);
+
+  return layout;
+}
 
 interface IssueDraft {
   title: string;
@@ -109,6 +170,7 @@ type StagedIssueFile = {
   title?: string | null;
 };
 
+import { Badge } from "@/components/ui/badge";
 import {
   buildAssigneeAdapterOverrides,
   ISSUE_OVERRIDE_ADAPTER_TYPES,
@@ -123,14 +185,6 @@ const ISSUE_THINKING_EFFORT_OPTIONS = {
     { value: "low", label: "Low" },
     { value: "medium", label: "Medium" },
     { value: "high", label: "High" },
-  ],
-  codex_local: [
-    { value: "", label: "Default" },
-    { value: "minimal", label: "Minimal" },
-    { value: "low", label: "Low" },
-    { value: "medium", label: "Medium" },
-    { value: "high", label: "High" },
-    { value: "xhigh", label: "X-High" },
   ],
   opencode_local: [
     { value: "", label: "Default" },
@@ -214,29 +268,53 @@ function formatFileSize(file: File) {
   return `${(file.size / (1024 * 1024)).toFixed(1)} MB`;
 }
 
-// PAP-75 brand hues ship behind the Conference Room Chat flag (PAP-139); OFF
-// keeps master's palette (`issueStatusTextClassic`).
-function buildStatusOptions(
-  conferenceRoomChat: boolean,
-): ReadonlyArray<{ value: string; label: string; color: string; description?: string }> {
-  const palette = conferenceRoomChat ? issueStatusText : issueStatusTextClassic;
+function buildStatusOptions(): ReadonlyArray<{ value: string; label: string; color: string; description?: string }> {
+  const palette = issueStatusText;
   return [
     {
       value: "backlog",
       label: "Backlog",
       color: palette.backlog ?? issueStatusTextDefault,
-      description: "Parked — assignee will not be woken",
+      description: "Parked - assignee will not be woken",
     },
     {
       value: "todo",
       label: "Todo",
       color: palette.todo ?? issueStatusTextDefault,
-      description: "Executable — assignee will be woken",
+      description: "Executable - assignee will be woken",
     },
     { value: "in_progress", label: "In Progress", color: palette.in_progress ?? issueStatusTextDefault },
     { value: "in_review", label: "In Review", color: palette.in_review ?? issueStatusTextDefault },
     { value: "done", label: "Done", color: palette.done ?? issueStatusTextDefault },
   ];
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+function isRequiredUserSecretBinding(value: unknown): value is Extract<EnvBinding, { type: "user_secret_ref" }> {
+  return isRecord(value)
+    && value.type === "user_secret_ref"
+    && typeof value.key === "string"
+    && value.key.trim().length > 0
+    && value.required !== false
+    && value.allowMissingOverride !== true;
+}
+
+function collectRequiredUserSecretKeysFromEnv(env: AgentEnvConfig | Record<string, unknown> | null | undefined): string[] {
+  if (!isRecord(env)) return [];
+  return Object.values(env).flatMap((binding) =>
+    isRequiredUserSecretBinding(binding) ? [binding.key.trim()] : [],
+  );
+}
+
+function uniqueRequiredUserSecretKeys(inputs: Array<AgentEnvConfig | Record<string, unknown> | null | undefined>): string[] {
+  return [...new Set(inputs.flatMap(collectRequiredUserSecretKeysFromEnv))];
+}
+
+function shouldWarnAboutRunUserSecrets(status: string, assigneeAgentId: string | null | undefined) {
+  return Boolean(assigneeAgentId) && (status === "todo" || status === "in_progress");
 }
 
 const priorities = [
@@ -252,26 +330,6 @@ const EXECUTION_WORKSPACE_MODES = [
   { value: "reuse_existing", label: "Reuse existing workspace" },
 ] as const;
 
-function defaultProjectWorkspaceIdForProject(project: { workspaces?: Array<{ id: string; isPrimary: boolean }>; executionWorkspacePolicy?: { defaultProjectWorkspaceId?: string | null } | null } | null | undefined) {
-  if (!project) return "";
-  return project.executionWorkspacePolicy?.defaultProjectWorkspaceId
-    ?? project.workspaces?.find((workspace) => workspace.isPrimary)?.id
-    ?? project.workspaces?.[0]?.id
-    ?? "";
-}
-
-function defaultExecutionWorkspaceModeForProject(project: { executionWorkspacePolicy?: { enabled?: boolean; defaultMode?: string | null } | null } | null | undefined) {
-  const defaultMode = project?.executionWorkspacePolicy?.enabled ? project.executionWorkspacePolicy.defaultMode : null;
-  if (
-    defaultMode === "isolated_workspace" ||
-    defaultMode === "operator_branch" ||
-    defaultMode === "adapter_default"
-  ) {
-    return defaultMode === "adapter_default" ? "agent_default" : defaultMode;
-  }
-  return "shared_workspace";
-}
-
 function defaultExecutionWorkspaceModeForIssueDefaults(
   defaults: {
     executionWorkspaceId?: unknown;
@@ -285,6 +343,15 @@ function defaultExecutionWorkspaceModeForIssueDefaults(
   return typeof defaults.executionWorkspaceMode === "string" && defaults.executionWorkspaceMode.length > 0
     ? defaults.executionWorkspaceMode
     : defaultExecutionWorkspaceModeForProject(project);
+}
+
+function isWorkModePeriodShortcut(e: Pick<React.KeyboardEvent, "code" | "ctrlKey" | "key" | "metaKey">) {
+  const isPeriod = e.code === "Period" || e.key === ".";
+  return (e.metaKey || e.ctrlKey) && isPeriod;
+}
+
+function isWorkModeEscapeShortcut(e: Pick<KeyboardEvent, "key" | "metaKey">) {
+  return e.metaKey && e.key === "Escape";
 }
 
 const IssueTitleTextarea = memo(function IssueTitleTextarea({
@@ -386,31 +453,22 @@ const IssueDescriptionEditor = memo(function IssueDescriptionEditor({
       placeholder="Add description..."
       bordered={false}
       mentions={mentions}
-      contentClassName={cn("text-sm text-muted-foreground pb-12", expanded ? "min-h-[220px]" : "min-h-[120px]")}
+      contentClassName={cn("text-sm text-muted-foreground pb-12", expanded ? "min-h-(--sz-220px)" : "min-h-(--sz-120px)")}
       imageUploadHandler={imageUploadHandler}
     />
   );
 });
 
-function issueExecutionWorkspaceModeForExistingWorkspace(mode: string | null | undefined) {
-  if (mode === "isolated_workspace" || mode === "operator_branch" || mode === "shared_workspace") {
-    return mode;
-  }
-  if (mode === "adapter_managed" || mode === "cloud_sandbox") {
-    return "agent_default";
-  }
-  return "shared_workspace";
-}
-
 export function NewIssueDialog() {
   const { newIssueOpen, newIssueDefaults, closeNewIssue } = useDialog();
+  const visualViewportLayout = useVisualViewportLayout(newIssueOpen);
+  const dialogBodyRef = useRef<HTMLDivElement>(null);
   const { companies, selectedCompanyId, selectedCompany } = useCompany();
-  // Conference Room Chat flag (PAP-139): selects work-mode labels + status hues.
-  const { enabled: conferenceRoomChatEnabled } = useConferenceRoomChatEnabled();
-  const workModeOptions = useMemo(() => workModeMetaList(conferenceRoomChatEnabled), [conferenceRoomChatEnabled]);
-  const statuses = useMemo(() => buildStatusOptions(conferenceRoomChatEnabled), [conferenceRoomChatEnabled]);
+  const workModeOptions = useMemo(() => workModeMetaList(), []);
+  const statuses = useMemo(() => buildStatusOptions(), []);
   const queryClient = useQueryClient();
   const { pushToast } = useToastActions();
+  const { enabled: streamlinedUiEnabled } = useStreamlinedUiEnabled();
   const [title, setTitle] = useState("");
   const [description, setDescription] = useState("");
   const titleRef = useRef("");
@@ -477,7 +535,11 @@ export function NewIssueDialog() {
     queryFn: () => projectsApi.list(effectiveCompanyId!),
     enabled: !!effectiveCompanyId && newIssueOpen,
   });
-  const { data: reusableExecutionWorkspaces } = useQuery({
+  const {
+    data: reusableExecutionWorkspaces,
+    isLoading: reusableExecutionWorkspacesLoading,
+    isError: reusableExecutionWorkspacesError,
+  } = useQuery({
     queryKey: queryKeys.executionWorkspaces.summaryList(effectiveCompanyId!, {
       projectId,
       projectWorkspaceId: projectWorkspaceId || undefined,
@@ -508,7 +570,7 @@ export function NewIssueDialog() {
   });
   const currentUserId = session?.user?.id ?? session?.session?.userId ?? null;
   const activeProjects = useMemo(
-    () => (projects ?? []).filter((p) => !p.archivedAt),
+    () => projects ?? [],
     [projects],
   );
   const { orderedProjects } = useProjectOrder({
@@ -521,28 +583,18 @@ export function NewIssueDialog() {
   const selectedAssigneeAgentId = selectedAssignee.assigneeAgentId;
   const selectedAssigneeUserId = selectedAssignee.assigneeUserId;
 
-  const assigneeAdapterType = (agents ?? []).find((agent) => agent.id === selectedAssigneeAgentId)?.adapterType ?? null;
+  const selectedAssigneeAgent = useMemo(
+    () => (agents ?? []).find((agent) => agent.id === selectedAssigneeAgentId) ?? null,
+    [agents, selectedAssigneeAgentId],
+  );
+  const assigneeAdapterType = selectedAssigneeAgent?.adapterType ?? null;
+  const assigneePrimaryModel = isRecord(selectedAssigneeAgent?.adapterConfig)
+    && typeof selectedAssigneeAgent.adapterConfig.model === "string"
+    ? selectedAssigneeAgent.adapterConfig.model
+    : "";
+  const effectiveAssigneeModel = assigneeModelOverride || assigneePrimaryModel;
   const supportsAssigneeOverrides = Boolean(
     assigneeAdapterType && ISSUE_OVERRIDE_ADAPTER_TYPES.has(assigneeAdapterType),
-  );
-  const getAdapterCapabilities = useAdapterCapabilities();
-  const assigneeAdapterCapabilities = assigneeAdapterType
-    ? getAdapterCapabilities(assigneeAdapterType)
-    : null;
-  const assigneeSupportsCheapLane = Boolean(
-    supportsAssigneeOverrides && assigneeAdapterCapabilities?.supportsModelProfiles,
-  );
-
-  const { data: assigneeCheapProfiles } = useQuery({
-    queryKey: effectiveCompanyId && assigneeAdapterType
-      ? queryKeys.agents.adapterModelProfiles(effectiveCompanyId, assigneeAdapterType)
-      : ["agents", "none", "adapter-model-profiles", assigneeAdapterType ?? "none"],
-    queryFn: () => agentsApi.adapterModelProfiles(effectiveCompanyId!, assigneeAdapterType!),
-    enabled: Boolean(effectiveCompanyId) && newIssueOpen && assigneeSupportsCheapLane,
-  });
-  const assigneeCheapProfile = useMemo(
-    () => (assigneeCheapProfiles ?? []).find((profile) => profile.key === "cheap") ?? null,
-    [assigneeCheapProfiles],
   );
   const mentionOptions = useMemo<MentionOption[]>(() => {
     return buildMarkdownMentionOptions({
@@ -552,12 +604,13 @@ export function NewIssueDialog() {
     });
   }, [agents, companyMembers?.users, orderedProjects]);
 
+  const catalogProvider = assigneeAdapterType === "paperclip_runner" ? String(normalizeLegacyRunnerProvider(selectedAssigneeAgent?.adapterConfig ?? {}).provider ?? "codex") : undefined;
   const { data: assigneeAdapterModels } = useQuery({
     queryKey:
       effectiveCompanyId && assigneeAdapterType
-        ? queryKeys.agents.adapterModels(effectiveCompanyId, assigneeAdapterType)
+        ? queryKeys.agents.adapterModels(effectiveCompanyId, assigneeAdapterType, null, catalogProvider)
         : ["agents", "none", "adapter-models", assigneeAdapterType ?? "none"],
-    queryFn: () => agentsApi.adapterModels(effectiveCompanyId!, assigneeAdapterType!),
+    queryFn: () => agentsApi.adapterModels(effectiveCompanyId!, assigneeAdapterType!, { provider: catalogProvider }),
     enabled: Boolean(effectiveCompanyId) && newIssueOpen && supportsAssigneeOverrides,
   });
 
@@ -591,6 +644,7 @@ export function NewIssueDialog() {
       return { issue, companyId, failures };
     },
     onSuccess: ({ issue, companyId, failures }) => {
+      if (streamlinedUiEnabled) recordRecentTask(issue, currentUserId);
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.list(companyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.listMineByMe(companyId) });
       queryClient.invalidateQueries({ queryKey: queryKeys.issues.listTouchedByMe(companyId) });
@@ -617,7 +671,7 @@ export function NewIssueDialog() {
 
   const uploadDescriptionImage = useMutation({
     mutationFn: async (file: File) => {
-      if (!effectiveCompanyId) throw new Error("No company selected");
+      if (!effectiveCompanyId) throw new Error("No organization selected");
       return assetsApi.uploadImage(effectiveCompanyId, file, "issues/drafts");
     },
   });
@@ -882,13 +936,9 @@ export function NewIssueDialog() {
       setAssigneeChrome(false);
       return;
     }
-    if (!assigneeSupportsCheapLane && assigneeModelLane === "cheap") {
-      setAssigneeModelLane("primary");
-    }
-
     const validThinkingValues =
       assigneeAdapterType === "codex_local"
-        ? ISSUE_THINKING_EFFORT_OPTIONS.codex_local
+        ? codexReasoningEffortOptions(effectiveAssigneeModel)
         : assigneeAdapterType === "opencode_local"
           ? ISSUE_THINKING_EFFORT_OPTIONS.opencode_local
           : ISSUE_THINKING_EFFORT_OPTIONS.claude_local;
@@ -898,9 +948,8 @@ export function NewIssueDialog() {
   }, [
     supportsAssigneeOverrides,
     assigneeAdapterType,
+    effectiveAssigneeModel,
     assigneeThinkingEffort,
-    assigneeSupportsCheapLane,
-    assigneeModelLane,
   ]);
 
   // Cleanup timer on unmount
@@ -974,14 +1023,9 @@ export function NewIssueDialog() {
     const currentTitle = titleRef.current.trim();
     const currentDescription = descriptionRef.current.trim();
     if (!effectiveCompanyId || !currentTitle || createIssue.isPending) return;
-    const effectiveLane = assigneeSupportsCheapLane
-      ? assigneeModelLane
-      : assigneeModelLane === "cheap"
-        ? "primary"
-        : assigneeModelLane;
     const assigneeAdapterOverrides = buildAssigneeAdapterOverrides({
       adapterType: assigneeAdapterType,
-      lane: effectiveLane,
+      lane: assigneeModelLane,
       modelOverride: assigneeModelOverride,
       thinkingEffortOverride: assigneeThinkingEffort,
       chrome: assigneeChrome,
@@ -991,7 +1035,7 @@ export function NewIssueDialog() {
       experimentalSettings?.enableIsolatedWorkspaces === true
         ? selectedProject?.executionWorkspacePolicy ?? null
         : null;
-    const selectedReusableExecutionWorkspace = deduplicatedReusableWorkspaces.find(
+    const selectedReusableExecutionWorkspace = selectableReusableWorkspaces.find(
       (workspace) => workspace.id === selectedExecutionWorkspaceId,
     );
     const requestedExecutionWorkspaceMode =
@@ -1026,16 +1070,16 @@ export function NewIssueDialog() {
         : {}),
       ...(executionWorkspaceSettings ? { executionWorkspaceSettings } : {}),
       ...(executionPolicy ? { executionPolicy } : {}),
-      ...(taskWatchdogsEnabled && watchdogAgentId
+      ...(watchdogAgentId
         ? { watchdog: { agentId: watchdogAgentId, instructions: watchdogInstructions.trim() || null } }
         : {}),
     });
   }
 
   function handleKeyDown(e: React.KeyboardEvent) {
-    if ((e.metaKey || e.ctrlKey) && e.code === "Period") {
+    if (isWorkModePeriodShortcut(e)) {
       e.preventDefault();
-      setWorkMode((current) => nextWorkMode(current, conferenceRoomChatEnabled));
+      setWorkMode((current) => nextWorkMode(current));
       return;
     }
     if (e.key === "Enter" && (e.metaKey || e.ctrlKey)) {
@@ -1115,16 +1159,23 @@ export function NewIssueDialog() {
     : null;
   const currentAssigneeLowTrust = getTrustPreset(currentAssignee?.permissions) === "low_trust_review";
   const currentProject = orderedProjects.find((project) => project.id === projectId);
+  const neededUserSecretKeys = useMemo(
+    () => {
+      if (!shouldWarnAboutRunUserSecrets(status, selectedAssigneeAgentId)) return [];
+      return uniqueRequiredUserSecretKeys([
+        isRecord(currentAssignee?.adapterConfig) ? currentAssignee.adapterConfig.env as Record<string, unknown> : null,
+        currentProject?.env ?? null,
+      ]);
+    },
+    [currentAssignee?.adapterConfig, currentProject?.env, selectedAssigneeAgentId, status],
+  );
   const currentProjectExecutionWorkspacePolicy =
     experimentalSettings?.enableIsolatedWorkspaces === true
       ? currentProject?.executionWorkspacePolicy ?? null
       : null;
   const currentProjectSupportsExecutionWorkspace = Boolean(currentProjectExecutionWorkspacePolicy?.enabled);
-  const taskWatchdogsEnabled = experimentalSettings?.enableTaskWatchdogs === true;
-  const deduplicatedReusableWorkspaces = useMemo(() => {
-    return orderReusableExecutionWorkspaces(reusableExecutionWorkspaces ?? []);
-  }, [reusableExecutionWorkspaces]);
-  const selectedReusableExecutionWorkspace = deduplicatedReusableWorkspaces.find(
+  const selectableReusableWorkspaces = reusableExecutionWorkspaces ?? [];
+  const selectedReusableExecutionWorkspace = selectableReusableWorkspaces.find(
     (workspace) => workspace.id === selectedExecutionWorkspaceId,
   );
   const isUsingParentExecutionWorkspace = isSubIssueMode && parentExecutionWorkspaceId
@@ -1144,7 +1195,7 @@ export function NewIssueDialog() {
         : "Agent options";
   const thinkingEffortOptions =
     assigneeAdapterType === "codex_local"
-      ? ISSUE_THINKING_EFFORT_OPTIONS.codex_local
+      ? codexReasoningEffortOptions(effectiveAssigneeModel)
       : assigneeAdapterType === "opencode_local"
         ? ISSUE_THINKING_EFFORT_OPTIONS.opencode_local
       : ISSUE_THINKING_EFFORT_OPTIONS.claude_local;
@@ -1243,8 +1294,46 @@ export function NewIssueDialog() {
     },
     [assigneeAdapterModels],
   );
-  const currentWorkMode = workModeMetaFor(workMode, conferenceRoomChatEnabled);
+  const currentWorkMode = workModeMetaFor(workMode);
   const CurrentWorkModeIcon = currentWorkMode.icon;
+  const dialogViewportStyle = useMemo<NewIssueDialogViewportStyle>(() => {
+    const dialogGeometry = {
+      "--new-issue-dialog-top":
+        "calc(var(--new-issue-visual-viewport-offset-top) + var(--new-issue-dialog-top-gap))",
+      "--new-issue-dialog-height":
+        "calc(var(--new-issue-visual-viewport-height) - var(--new-issue-dialog-top-gap) - var(--new-issue-dialog-bottom-gap))",
+    };
+    if (!visualViewportLayout) return dialogGeometry;
+    return {
+      ...dialogGeometry,
+      "--new-issue-visual-viewport-height": `${visualViewportLayout.height}px`,
+      "--new-issue-visual-viewport-offset-top": `${visualViewportLayout.offsetTop}px`,
+      ...(visualViewportLayout.constrained
+        ? {
+            top: "var(--new-issue-dialog-top)",
+            height: "var(--new-issue-dialog-height)",
+            translate: "var(--pct-neg-50)",
+          }
+        : {}),
+    };
+  }, [visualViewportLayout]);
+
+  useEffect(() => {
+    if (!visualViewportLayout?.constrained) return;
+    const focusedElement = document.activeElement;
+    if (
+      !(focusedElement instanceof HTMLElement)
+      || !dialogBodyRef.current?.contains(focusedElement)
+      || typeof focusedElement.scrollIntoView !== "function"
+    ) {
+      return;
+    }
+
+    const frame = window.requestAnimationFrame(() => {
+      focusedElement.scrollIntoView({ block: "nearest" });
+    });
+    return () => window.cancelAnimationFrame(frame);
+  }, [visualViewportLayout]);
 
   return (
     <Dialog
@@ -1256,15 +1345,24 @@ export function NewIssueDialog() {
       <DialogContent
         showCloseButton={false}
         aria-describedby={undefined}
-        style={{ "--new-issue-dialog-height": MOBILE_DIALOG_HEIGHT } as CSSProperties}
+        style={dialogViewportStyle}
         className={cn(
-          "flex h-[var(--new-issue-dialog-height)] max-h-[var(--new-issue-dialog-height)] flex-col gap-0 overflow-hidden p-0 sm:h-auto",
+          "flex h-(--new-issue-dialog-height) max-h-(--new-issue-dialog-height) flex-col gap-0 overflow-hidden p-0 sm:h-auto",
           expanded
-            ? "sm:max-w-2xl sm:h-[var(--new-issue-dialog-height)]"
+            ? "sm:max-w-2xl sm:h-(--new-issue-dialog-height)"
             : "sm:max-w-lg"
         )}
         onKeyDown={handleKeyDown}
         onEscapeKeyDown={(event) => {
+          if (event.defaultPrevented) return;
+          // iOS Safari maps command-period to Escape for hardware keyboards.
+          // Treat modifier-Escape as the same mode-cycle shortcut so the
+          // dialog does not dismiss before the shortcut can run.
+          if (isWorkModeEscapeShortcut(event)) {
+            event.preventDefault();
+            setWorkMode((current) => nextWorkMode(current));
+            return;
+          }
           if (createIssue.isPending) {
             event.preventDefault();
           }
@@ -1292,21 +1390,11 @@ export function NewIssueDialog() {
             <Popover open={companyOpen} onOpenChange={setCompanyOpen}>
               <PopoverTrigger asChild>
                 <button
-                  className={cn(
-                    "px-1.5 py-0.5 rounded text-xs font-semibold cursor-pointer hover:opacity-80 transition-opacity",
-                    !dialogCompany?.brandColor && "bg-muted",
-                  )}
+                  data-slot="new-issue-compact-control"
+                  className="rounded bg-muted p-1.5 text-xs font-semibold cursor-pointer hover:opacity-80 transition-opacity sm:px-1.5 sm:py-0.5"
                   disabled={isSubIssueMode}
-                  style={
-                    dialogCompany?.brandColor
-                      ? {
-                          backgroundColor: dialogCompany.brandColor,
-                          color: pickTextColorForSolidBg(dialogCompany.brandColor),
-                        }
-                      : undefined
-                  }
                 >
-                  {(dialogCompany?.name ?? "").slice(0, 3).toUpperCase()}
+                  {dialogCompany?.issuePrefix ?? ""}
                 </button>
               </PopoverTrigger>
               <PopoverContent className="w-48 p-1" align="start">
@@ -1322,21 +1410,8 @@ export function NewIssueDialog() {
                       setCompanyOpen(false);
                     }}
                   >
-                    <span
-                      className={cn(
-                        "px-1 py-0.5 rounded text-[10px] font-semibold leading-none",
-                        !c.brandColor && "bg-muted",
-                      )}
-                      style={
-                        c.brandColor
-                          ? {
-                              backgroundColor: c.brandColor,
-                              color: pickTextColorForSolidBg(c.brandColor),
-                            }
-                          : undefined
-                      }
-                    >
-                      {c.name.slice(0, 3).toUpperCase()}
+                    <span className="px-1 py-0.5 rounded bg-muted text-(length:--text-nano) font-semibold leading-none">
+                      {c.issuePrefix}
                     </span>
                     <span className="truncate">{c.name}</span>
                   </button>
@@ -1368,7 +1443,7 @@ export function NewIssueDialog() {
           </div>
         </div>
 
-        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
+        <div ref={dialogBodyRef} className="min-h-0 flex-1 overflow-y-auto overscroll-contain">
           {/* Title */}
           <div className="px-4 pt-4 pb-2">
             <IssueTitleTextarea
@@ -1383,6 +1458,17 @@ export function NewIssueDialog() {
             />
           </div>
 
+          {effectiveCompanyId ? (
+            <div className="px-4 pb-2">
+              {neededUserSecretKeys.length > 0 ? (
+                <MissingUserSecretsBanner
+                  companyId={effectiveCompanyId}
+                  definitionKeys={neededUserSecretKeys}
+                />
+              ) : null}
+            </div>
+          ) : null}
+
           <div className="px-4 pb-2">
             <div className="overflow-x-auto overscroll-x-contain">
               <div className="inline-flex items-center gap-2 text-sm text-muted-foreground flex-wrap sm:flex-nowrap sm:min-w-max">
@@ -1393,6 +1479,8 @@ export function NewIssueDialog() {
                 options={assigneeOptions}
                 recentOptionIds={recentAssigneeOptionIds}
                 placeholder="Assignee"
+                className="h-8 px-2.5 py-0 sm:h-auto sm:px-2 sm:py-1"
+                triggerDataSlot="new-issue-compact-control"
                 disablePortal
                 noneLabel="No assignee"
                 searchPlaceholder="Search assignees..."
@@ -1452,6 +1540,8 @@ export function NewIssueDialog() {
                 options={projectOptions}
                 recentOptionIds={recentProjectIds}
                 placeholder="Project"
+                className="h-8 px-2.5 py-0 sm:h-auto sm:px-2 sm:py-1"
+                triggerDataSlot="new-issue-compact-control"
                 disablePortal
                 noneLabel="No project"
                 searchPlaceholder="Search projects..."
@@ -1465,7 +1555,7 @@ export function NewIssueDialog() {
                     <>
                       <span
                         className="h-3.5 w-3.5 shrink-0 rounded-sm"
-                        style={{ backgroundColor: currentProject.color ?? "#6366f1" }}
+                        style={{ backgroundColor: currentProject.color ?? "var(--project-seed)" }}
                       />
                       <span className="truncate">{option.label}</span>
                     </>
@@ -1480,7 +1570,7 @@ export function NewIssueDialog() {
                     <>
                       <span
                         className="h-3.5 w-3.5 shrink-0 rounded-sm"
-                        style={{ backgroundColor: project?.color ?? "#6366f1" }}
+                        style={{ backgroundColor: project?.color ?? "var(--project-seed)" }}
                       />
                       <span className="truncate">{option.label}</span>
                     </>
@@ -1494,7 +1584,7 @@ export function NewIssueDialog() {
                   <button
                     type="button"
                     className="inline-flex items-center justify-center rounded-md p-1 text-muted-foreground hover:bg-accent/50 transition-colors"
-                    title={taskWatchdogsEnabled ? "Add reviewer, approver, or watchdog" : "Add reviewer or approver"}
+                    title="Add reviewer, approver, or watchdog"
                   >
                     <MoreHorizontal className="h-4 w-4" />
                   </button>
@@ -1528,29 +1618,27 @@ export function NewIssueDialog() {
                     <ShieldCheck className="h-3 w-3" />
                     Approver
                   </button>
-                  {taskWatchdogsEnabled && (
-                    <button
-                      className={cn(
-                        "flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50",
-                        showWatchdogRow && "bg-accent",
-                      )}
-                      onClick={() => {
-                        if (showWatchdogRow) {
-                          setShowWatchdogRow(false);
-                          setWatchdogAgentId("");
-                          setWatchdogInstructions("");
-                          setWatchdogEditorOpen(false);
-                        } else {
-                          setShowWatchdogRow(true);
-                          setWatchdogEditorOpen(true);
-                        }
-                        setParticipantMenuOpen(false);
-                      }}
-                    >
-                      <ScanEye className="h-3 w-3" />
-                      Watchdog
-                    </button>
-                  )}
+                  <button
+                    className={cn(
+                      "flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50",
+                      showWatchdogRow && "bg-accent",
+                    )}
+                    onClick={() => {
+                      if (showWatchdogRow) {
+                        setShowWatchdogRow(false);
+                        setWatchdogAgentId("");
+                        setWatchdogInstructions("");
+                        setWatchdogEditorOpen(false);
+                      } else {
+                        setShowWatchdogRow(true);
+                        setWatchdogEditorOpen(true);
+                      }
+                      setParticipantMenuOpen(false);
+                    }}
+                  >
+                    <ScanEye className="h-3 w-3" />
+                    Watchdog
+                  </button>
                 </PopoverContent>
               </Popover>
               </div>
@@ -1647,7 +1735,7 @@ export function NewIssueDialog() {
             )}
 
             {/* Watchdog row */}
-            {taskWatchdogsEnabled && showWatchdogRow && (
+            {showWatchdogRow && (
               <div className="flex items-center gap-2 text-sm text-muted-foreground mt-1">
                 <span className="w-6 shrink-0 flex items-center justify-center"><ScanEye className="h-3.5 w-3.5" /></span>
                 <Popover open={watchdogEditorOpen} onOpenChange={setWatchdogEditorOpen}>
@@ -1758,7 +1846,7 @@ export function NewIssueDialog() {
             <div className="px-4 py-3 space-y-2">
             <div className="space-y-1.5">
               <div className="text-xs font-medium">Execution workspace</div>
-              <div className="text-[11px] text-muted-foreground">
+              <div className="text-(length:--text-micro) text-muted-foreground">
                 Control whether this task runs in the shared workspace, a new isolated workspace, or an existing one.
               </div>
               <select
@@ -1778,26 +1866,27 @@ export function NewIssueDialog() {
                 ))}
               </select>
               {executionWorkspaceMode === "reuse_existing" && (
-                <select
-                  className="w-full rounded border border-border bg-transparent px-2 py-1.5 text-xs outline-none"
+                <ReusableExecutionWorkspaceSelect
                   value={selectedExecutionWorkspaceId}
-                  onChange={(e) => setSelectedExecutionWorkspaceId(e.target.value)}
-                >
-                  <option value="">Choose an existing workspace</option>
-                  {deduplicatedReusableWorkspaces.map((workspace) => (
-                    <option key={workspace.id} value={workspace.id}>
-                      {workspace.name} · {workspace.status} · {workspace.branchName ?? workspace.cwd ?? workspace.id.slice(0, 8)}
-                    </option>
-                  ))}
-                </select>
+                  workspaces={selectableReusableWorkspaces}
+                  onValueChange={(workspaceId) => setSelectedExecutionWorkspaceId(workspaceId)}
+                  loading={reusableExecutionWorkspacesLoading}
+                  error={reusableExecutionWorkspacesError}
+                  disablePortal
+                />
               )}
+              {/*
+                The label used to fall back to the workspace working directory,
+                a path on the execution host. It now falls back to a neutral
+                phrase, so the dialog never renders a host path.
+              */}
               {executionWorkspaceMode === "reuse_existing" && selectedReusableExecutionWorkspace && (
-                <div className="text-[11px] text-muted-foreground">
-                  Reusing {selectedReusableExecutionWorkspace.name} from {selectedReusableExecutionWorkspace.branchName ?? selectedReusableExecutionWorkspace.cwd ?? "existing execution workspace"}.
+                <div className="text-(length:--text-micro) text-muted-foreground">
+                  Reusing {selectedReusableExecutionWorkspace.name} from {selectedReusableExecutionWorkspace.branchName ?? "existing execution workspace"}.
                 </div>
               )}
               {showParentWorkspaceWarning ? (
-                <div className="rounded-md border border-amber-300/60 bg-amber-50 px-2 py-1.5 text-[11px] text-amber-900 dark:border-amber-800/70 dark:bg-amber-950/30 dark:text-amber-100">
+                <div className="rounded-md border border-amber-300/60 bg-amber-50 px-2 py-1.5 text-(length:--text-micro) text-amber-900 dark:border-amber-800/70 dark:bg-amber-950/30 dark:text-amber-100">
                   Warning: this sub-task will no longer use the parent task workspace{parentExecutionWorkspaceLabel ? ` (${parentExecutionWorkspaceLabel})` : ""}.
                 </div>
               ) : null}
@@ -1823,7 +1912,7 @@ export function NewIssueDialog() {
                     role="radiogroup"
                     aria-label="Model lane"
                   >
-                    {(["primary", ...(assigneeSupportsCheapLane ? (["cheap"] as const) : ([] as const)), "custom"] as const).map((lane) => (
+                    {(["primary", "custom"] as const).map((lane) => (
                       <button
                         key={lane}
                         type="button"
@@ -1835,29 +1924,15 @@ export function NewIssueDialog() {
                         )}
                         onClick={() => setAssigneeModelLane(lane)}
                       >
-                        {lane === "primary"
-                          ? "Primary"
-                          : lane === "cheap"
-                            ? "Cheap"
-                            : "Custom"}
+                        {lane === "primary" ? "Primary" : "Custom"}
                       </button>
                     ))}
                   </div>
-                  {assigneeModelLane === "cheap" && (
-                    <p className="text-[11px] text-muted-foreground">
-                      Sends <code>modelProfile: "cheap"</code>{" "}
-                      {assigneeCheapProfile?.adapterConfig && typeof (assigneeCheapProfile.adapterConfig as Record<string, unknown>).model === "string"
-                        ? <>· adapter default <code>{String((assigneeCheapProfile.adapterConfig as Record<string, unknown>).model)}</code></>
-                        : assigneeCheapProfile
-                          ? <>· uses the agent's configured cheap profile</>
-                          : <>· falls back to the primary model if no cheap profile is configured</>}
-                    </p>
-                  )}
                   {assigneeModelLane === "primary" && (
-                    <p className="text-[11px] text-muted-foreground">Runs on the agent's primary model.</p>
+                    <p className="text-(length:--text-micro) text-muted-foreground">Runs on the agent's primary model.</p>
                   )}
                   {assigneeModelLane === "custom" && (
-                    <p className="text-[11px] text-muted-foreground">Override the model and effort for this task only.</p>
+                    <p className="text-(length:--text-micro) text-muted-foreground">Override the model and effort for this task only.</p>
                   )}
                 </div>
                 {assigneeModelLane === "custom" && (
@@ -1941,12 +2016,12 @@ export function NewIssueDialog() {
                       <div key={file.id} className="flex items-start justify-between gap-3 rounded-md border border-border/70 px-3 py-2">
                         <div className="min-w-0">
                           <div className="flex items-center gap-2">
-                            <span className="rounded-full border border-border px-2 py-0.5 font-mono text-[10px] uppercase tracking-[0.16em] text-muted-foreground">
+                            <Badge variant="outline" className="border-border font-mono text-(length:--text-nano) uppercase tracking-(--tracking-eyebrow) text-muted-foreground">
                               {file.documentKey}
-                            </span>
+                            </Badge>
                             <span className="truncate text-sm">{file.file.name}</span>
                           </div>
-                          <div className="mt-1 flex items-center gap-2 text-[11px] text-muted-foreground">
+                          <div className="mt-1 flex items-center gap-2 text-(length:--text-micro) text-muted-foreground">
                             <FileText className="h-3.5 w-3.5" />
                             <span>{file.title || file.file.name}</span>
                             <span>•</span>
@@ -1980,7 +2055,7 @@ export function NewIssueDialog() {
                             <Paperclip className="h-3.5 w-3.5 shrink-0 text-muted-foreground" />
                             <span className="truncate text-sm">{file.file.name}</span>
                           </div>
-                          <div className="mt-1 text-[11px] text-muted-foreground">
+                          <div className="mt-1 text-(length:--text-micro) text-muted-foreground">
                             {file.file.type || "application/octet-stream"} • {formatFileSize(file.file)}
                           </div>
                         </div>
@@ -2009,7 +2084,10 @@ export function NewIssueDialog() {
           {/* Status chip */}
           <Popover open={statusOpen} onOpenChange={setStatusOpen}>
             <PopoverTrigger asChild>
-              <button className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors">
+              <button
+                data-slot="new-issue-compact-control"
+                className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 py-0 text-xs hover:bg-accent/50 transition-colors sm:h-auto sm:px-2 sm:py-1"
+              >
                 <CircleDot className={cn("h-3 w-3", currentStatus.color)} />
                 {currentStatus.label}
               </button>
@@ -2028,7 +2106,7 @@ export function NewIssueDialog() {
                   <span className="flex flex-col text-left leading-tight">
                     <span>{s.label}</span>
                     {s.description ? (
-                      <span className="text-[10px] text-muted-foreground">{s.description}</span>
+                      <span className="text-(length:--text-nano) text-muted-foreground">{s.description}</span>
                     ) : null}
                   </span>
                 </button>
@@ -2036,7 +2114,8 @@ export function NewIssueDialog() {
             </PopoverContent>
           </Popover>
 
-          {/* Priority chip */}
+          {/* Priority chip — PAP-411: hidden behind SHOW_TASK_PRIORITY_UI. */}
+          {SHOW_TASK_PRIORITY_UI && (
           <Popover open={priorityOpen} onOpenChange={setPriorityOpen}>
             <PopoverTrigger asChild>
               <button
@@ -2073,6 +2152,7 @@ export function NewIssueDialog() {
               ))}
             </PopoverContent>
           </Popover>
+          )}
 
           {/* Labels chip — disabled, not wired up yet */}
           {/* <button className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors text-muted-foreground">
@@ -2089,7 +2169,8 @@ export function NewIssueDialog() {
             multiple
           />
           <button
-            className="inline-flex items-center gap-1.5 rounded-md border border-border px-2 py-1 text-xs hover:bg-accent/50 transition-colors text-muted-foreground"
+            data-slot="new-issue-compact-control"
+            className="inline-flex h-8 items-center gap-1.5 rounded-md border border-border px-2.5 py-0 text-xs hover:bg-accent/50 transition-colors text-muted-foreground sm:h-auto sm:px-2 sm:py-1"
             onClick={() => stageFileInputRef.current?.click()}
             disabled={createIssue.isPending}
           >
@@ -2103,14 +2184,15 @@ export function NewIssueDialog() {
               <button
                 type="button"
                 data-issue-work-mode-chip={workMode}
+                data-slot="new-issue-compact-control"
                 aria-keyshortcuts="Meta+Period Control+Period"
                 className={cn(
-                  "inline-flex items-center gap-1.5 rounded-md border px-2 py-1 text-xs transition-colors",
+                  "inline-flex h-8 items-center gap-1.5 rounded-md border px-2.5 py-0 text-xs transition-colors sm:h-auto sm:px-2 sm:py-1",
                   currentWorkMode.classes.chip,
                 )}
               >
                 <CurrentWorkModeIcon className="h-3 w-3" />
-                {currentWorkMode.shortLabel}
+                {currentWorkMode.label}
               </button>
             </PopoverTrigger>
             <PopoverContent className="w-36 p-1" align="start">
@@ -2145,14 +2227,17 @@ export function NewIssueDialog() {
               <button
                 type="button"
                 data-testid="new-issue-more-menu-trigger"
-                className="inline-flex items-center justify-center rounded-md border border-border p-1 text-xs text-muted-foreground transition-colors hover:bg-accent/50"
+                data-slot="new-issue-compact-control"
+                className="inline-flex size-8 items-center justify-center rounded-md border border-border p-0 text-xs text-muted-foreground transition-colors hover:bg-accent/50 sm:size-auto sm:p-1"
               >
                 <MoreHorizontal className="h-3 w-3" />
               </button>
             </PopoverTrigger>
             <PopoverContent className="w-44 p-1" align="start" data-testid="new-issue-more-menu">
+              {/* PAP-411: mobile priority section hidden behind SHOW_TASK_PRIORITY_UI. */}
+              {SHOW_TASK_PRIORITY_UI && (
               <div className="sm:hidden">
-                <div className="px-2 py-1 text-[10px] font-medium uppercase text-muted-foreground">
+                <div className="px-2 py-1 text-(length:--text-nano) font-medium uppercase text-muted-foreground">
                   Priority
                 </div>
                 {priorities.map((p) => (
@@ -2175,6 +2260,7 @@ export function NewIssueDialog() {
                 ))}
                 <div className="my-1 border-t border-border" />
               </div>
+              )}
               <button className="flex items-center gap-2 w-full px-2 py-1.5 text-xs rounded hover:bg-accent/50 text-muted-foreground">
                 <Calendar className="h-3 w-3" />
                 Start date
@@ -2194,8 +2280,17 @@ export function NewIssueDialog() {
           >
             <Flag className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-300" />
             <span className="leading-snug">
-              Assigning implies executable intent — leave status as <span className="font-medium">Backlog</span> only to deliberately park this. The assignee will not be woken until status moves to <span className="font-medium">Todo</span> or <span className="font-medium">In Progress</span>.
+              Assigning implies executable intent - leave status as <span className="font-medium">Backlog</span> only to deliberately park this. The assignee will not be woken until status moves to <span className="font-medium">Todo</span> or <span className="font-medium">In Progress</span>.
             </span>
+          </div>
+        ) : null}
+
+        {selectedAssigneeAgent?.status === "paused" ? (
+          <div data-testid="new-issue-paused-assignee-note" className="mx-4 mb-2">
+            <InlineBanner tone="warning" icon={PauseCircle} compact>
+              <span className="font-medium">{selectedAssigneeAgent.name}</span> is paused and will not start work on this task until it is resumed
+              {selectedAssigneeAgent.pauseReason === "import" ? " — it arrived paused from an organization import" : ""}. You can resume it from the task page after creating the task.
+            </InlineBanner>
           </div>
         ) : null}
 
@@ -2206,7 +2301,7 @@ export function NewIssueDialog() {
           >
             <ShieldAlert className="mt-0.5 h-3.5 w-3.5 shrink-0 text-amber-600 dark:text-amber-300" />
             <span className="leading-snug">
-              Low-trust review agent. It can only act inside its assigned review boundary; issue, project, or run policy defines the concrete scope.
+              Low-trust review agent. It can only act inside its assigned review boundary; task, project, or run policy defines the concrete scope.
             </span>
           </div>
         ) : null}
@@ -2223,19 +2318,14 @@ export function NewIssueDialog() {
             Discard Draft
           </Button>
           <div className="flex items-center gap-3">
-            <div className="min-h-5 text-right">
-              {createIssue.isPending ? (
-                <span className="inline-flex items-center gap-1.5 text-xs font-medium text-muted-foreground">
-                  <Loader2 className="h-3 w-3 animate-spin" />
-                  Creating issue...
-                </span>
-              ) : createIssue.isError ? (
+            {createIssue.isError ? (
+              <div className="min-h-5 text-right">
                 <span className="text-xs text-destructive">{createIssueErrorMessage}</span>
-              ) : null}
-            </div>
+              </div>
+            ) : null}
             <Button
               size="sm"
-              className="min-w-[8.5rem] disabled:opacity-100"
+              className="min-w-(--sz-8_5rem) disabled:opacity-100"
               disabled={!titleHasText || createIssue.isPending}
               onClick={handleSubmit}
               aria-busy={createIssue.isPending}

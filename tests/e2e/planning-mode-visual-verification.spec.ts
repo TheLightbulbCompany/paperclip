@@ -1,80 +1,121 @@
 import { expect, test } from "@playwright/test";
+import { mockOnboardingLocalAiConnection } from "./helpers/onboarding-ai-connection";
+import {
+  expectLandsOnFirstTaskWithoutDashboardBounce,
+  instrumentNavLog,
+} from "./helpers/onboarding-landing";
 
-const SKIP_LLM = process.env.PAPERCLIP_E2E_SKIP_LLM !== "false";
-
+/** The name the CEO role fills in — see AGENT_ROLE_LABELS. */
 const AGENT_NAME = "CEO";
-const TASK_TITLE = "PAP-3413 planning mode evidence";
+const TASK_TITLE = "Paperclip onboarding";
+
+/**
+ * The first task opens with the chief of staff's opening card sitting where
+ * the composer is. Cancel hands the plain composer back (the card stays
+ * pending), and the composer is where the mode toggle lives.
+ *
+ * The card arrives with the interactions fetch, after the composer's first
+ * paint, so a bare `count()` right after navigation sees no card and skips
+ * the click; the card then lands on top of the composer and hides the mode
+ * toggle. Wait for the card (or, if it is already dismissed, the pending
+ * strip it leaves behind) before deciding, and only return once the plain
+ * composer is back.
+ */
+async function dismissOpeningCard(page: import("@playwright/test").Page) {
+  const takeover = page.getByTestId("task-chat-composer-takeover");
+  const pendingStrip = page.getByTestId("task-chat-pending-input-indicator");
+  await expect(takeover.or(pendingStrip).first()).toBeVisible({ timeout: 30_000 });
+  const cancel = takeover.getByRole("button", { name: "Cancel", exact: true });
+  if (await cancel.count()) await cancel.first().click();
+  await expect(page.getByTestId("task-chat-composer-mode")).toBeVisible({ timeout: 30_000 });
+}
 
 test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   const timestamp = Date.now();
   const companyName = `PAP-3413-${timestamp}`;
   const screenshotDir = "test-results/planning-mode";
 
-  // This spec captures the CLASSIC (flag-off) wizard + composer; pin the
-  // experimental flag off in case an earlier spec on this shared instance
-  // turned it on (the NUX specs do).
-  const flagRes = await page.request.patch("/api/instance/settings/experimental", {
-    data: { enableConferenceRoomChat: false },
+  await instrumentNavLog(page);
+  await mockOnboardingLocalAiConnection(page);
+
+  await page.route("**/test-environment", (route) =>
+    route.fulfill({
+      contentType: "application/json",
+      body: JSON.stringify({ status: "pass", checks: [] }),
+    }),
+  );
+
+  await page.route("**/agent-hires", async (route) => {
+    const req = route.request();
+    const body = JSON.parse(req.postData() || "{}");
+    const auth = req.headers().authorization;
+    const real = await fetch(new URL(req.url()).toString(), {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        ...(auth ? { Authorization: auth } : {}),
+      },
+      body: JSON.stringify({
+        name: body.name,
+        role: body.role,
+        adapterType: "http",
+        adapterConfig: { url: "http://127.0.0.1:1/dead" },
+        runtimeConfig: { heartbeat: { enabled: false } },
+      }),
+    });
+    await route.fulfill({
+      status: real.status,
+      contentType: "application/json",
+      body: await real.text(),
+    });
   });
-  expect(flagRes.ok()).toBe(true);
 
   await page.goto("/onboarding");
-  await expect(page.locator("h3", { hasText: "Name your company" })).toBeVisible({ timeout: 5_000 });
+  const startBtn = page.getByRole("button", { name: /Start Onboarding|New Organization|Add Agent/ });
+  if (await startBtn.count()) await startBtn.first().click();
 
-  await page.locator('input[placeholder="Acme Corp"]').fill(companyName);
-  await page.getByRole("button", { name: "Next" }).click();
+  const createCard = page.getByRole("button", { name: /Build a new organization/ });
+  if (await createCard.count()) await createCard.first().click();
 
-  await expect(page.locator("h3", { hasText: "Create your first agent" })).toBeVisible({ timeout: 30_000 });
-  await expect(page.locator('input[placeholder="CEO"]')).toHaveValue(AGENT_NAME);
-  await page.getByRole("button", { name: "Next" }).click();
+  await expect(page.getByRole("heading", { name: "What is the name of your organization?" })).toBeVisible({ timeout: 15_000 });
 
-  await expect(page.locator("h3", { hasText: "Give it something to do" })).toBeVisible({ timeout: 30_000 });
-  const baseUrl = page.url().split("/").slice(0, 3).join("/");
+  await page.locator('input[placeholder="e.g. Northwind Labs"]').fill(companyName);
+  await page.getByRole("button", { name: /^Continue/ }).click();
 
-  if (SKIP_LLM) {
-    const companiesAfterAgentRes = await page.request.get(`${baseUrl}/api/companies`);
-    expect(companiesAfterAgentRes.ok()).toBe(true);
-    const companiesAfterAgent = await companiesAfterAgentRes.json();
-    const companyAfterAgent = companiesAfterAgent.find((c: { name: string }) => c.name === companyName);
-    expect(companyAfterAgent).toBeTruthy();
+  // Naming the company creates it and goes straight to the agent step.
 
-    const agentsAfterCreateRes = await page.request.get(`${baseUrl}/api/companies/${companyAfterAgent.id}/agents`);
-    expect(agentsAfterCreateRes.ok()).toBe(true);
-    const agentsAfterCreate = await agentsAfterCreateRes.json();
-    const ceoAgentAfterCreate = agentsAfterCreate.find((a: { name: string }) => a.name === AGENT_NAME);
-    expect(ceoAgentAfterCreate).toBeTruthy();
+  // The agent step asks for a name and nothing else; the name is what gates
+  // "Next", and the hire is filed under the neutral `general` role.
+  await page.waitForSelector("#onboarding-agent-name", { timeout: 30_000 });
+  await page.locator("#onboarding-agent-name").fill(AGENT_NAME);
 
-    const disableWakeRes = await page.request.patch(
-      `${baseUrl}/api/agents/${ceoAgentAfterCreate.id}?companyId=${encodeURIComponent(companyAfterAgent.id)}`,
-      {
-        data: {
-          runtimeConfig: {
-            heartbeat: {
-              enabled: false,
-              intervalSec: 300,
-              wakeOnDemand: false,
-              cooldownSec: 10,
-              maxConcurrentRuns: 5,
-            },
-          },
-        },
-      },
-    );
-    expect(disableWakeRes.ok()).toBe(true);
-  }
+  await page.getByRole("button", { name: /^Next$/ }).click();
 
-  const taskTitleInput = page.locator('input[placeholder="e.g. Research competitor pricing"]');
-  await taskTitleInput.clear();
-  await taskTitleInput.fill(TASK_TITLE);
-  await page.getByRole("button", { name: "Next" }).click();
+  // The connect step arrives with no source selected — the tile row is a
+  // question, not a confirmation — so its CTA stays disabled until one is
+  // pressed. It reads "Connect", not "Next": the button starts the sign-in
+  // where there is one to start. The test simulates successful local account
+  // connection, then exercises the real first-task creation flow.
+  //
+  // Waited on for enabled rather than visible: it is already on screen, and
+  // clicking a disabled button raises nothing and does nothing.
+  const source = page.getByRole("radio").first();
+  await source.waitFor({ timeout: 30_000 });
+  await source.click();
+  const connectNext = page.getByRole("button", { name: /^Connect$/ });
+  await expect(connectNext).toBeEnabled({ timeout: 30_000 });
+  await connectNext.click();
 
-  await expect(page.locator("h3", { hasText: "Ready to launch" })).toBeVisible({ timeout: 30_000 });
-  await page.getByRole("button", { name: "Create & Open Task" }).click();
-  await expect(page).toHaveURL(/\/issues\//, { timeout: 30_000 });
+  // The review step names the agent rather than the step.
+  await expect(
+    page.getByRole("heading", { name: "Let's get started..." }),
+  ).toBeVisible({ timeout: 30_000 });
+  await page.getByRole("button", { name: /Get started/ }).click();
+  // The wizard now drops the user straight onto the first task's detail page,
+  // and must not bounce through the dashboard (PAP-404).
+  await expectLandsOnFirstTaskWithoutDashboardBounce(page);
 
-  const openedIssueUrl = page.url();
-  const openedIssueIdentifier = openedIssueUrl.split("/").filter(Boolean).pop();
-  const baseOrigin = new URL(openedIssueUrl).origin;
+  const baseOrigin = new URL(page.url()).origin;
   const companyRes = await page.request.get(`${baseOrigin}/api/companies`);
   expect(companyRes.ok()).toBe(true);
   const companies = await companyRes.json();
@@ -85,7 +126,7 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   const issues = await issueRes.json();
   const planningSeedIssue = issues.find(
     (candidate: { id: string; identifier?: string; title: string }) =>
-      candidate.identifier === openedIssueIdentifier || candidate.id === openedIssueIdentifier || candidate.title === TASK_TITLE,
+      candidate.title === TASK_TITLE,
   );
   expect(planningSeedIssue).toBeTruthy();
 
@@ -113,12 +154,11 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   await setMode("planning");
 
   await page.goto(issuePath);
-  await expect(page.getByText("Planning").first()).toBeVisible();
-  await expect(page.getByTestId("issue-chat-composer")).toHaveAttribute("data-pending-work-mode", "planning");
-  const desktopPlanningToggle = page.getByTestId("issue-chat-composer-work-mode-toggle");
+  await dismissOpeningCard(page);
+  await expect(page.getByText("Plan mode").first()).toBeVisible();
+  const desktopPlanningToggle = page.getByTestId("task-chat-composer-mode");
   await expect(desktopPlanningToggle).toBeVisible();
   await expect(desktopPlanningToggle).toHaveAttribute("data-pending-work-mode", "planning");
-  await expect(desktopPlanningToggle).toHaveAttribute("aria-pressed", "true");
 
   await page.screenshot({
     path: `${screenshotDir}/desktop-planning-detail-${timestamp}.png`,
@@ -127,18 +167,17 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
 
   await page.goto(`/${companyPrefix}/issues`);
   await expect(page.locator(issueLinkSelector)).toBeVisible();
-  await expect(page.locator(issueLinkSelector)).not.toContainText("Planning");
+  await expect(page.locator(issueLinkSelector)).not.toContainText("Plan mode");
   await page.screenshot({
     path: `${screenshotDir}/desktop-planning-row-${timestamp}.png`,
     fullPage: true,
   });
 
   await page.goto(issuePath);
-  await page.getByTestId("issue-chat-composer-work-mode-toggle").click();
-  await page.getByTestId("issue-chat-composer-work-mode-menu-standard").click();
-  await expect(page.getByTestId("issue-chat-composer")).toHaveAttribute("data-pending-work-mode", "standard");
-  await expect(page.getByTestId("issue-chat-composer-work-mode-toggle")).toHaveAttribute("data-pending-work-mode", "standard");
-  await expect(page.getByTestId("issue-chat-composer-work-mode-toggle")).toHaveAttribute("aria-pressed", "false");
+  await dismissOpeningCard(page);
+  await page.getByTestId("task-chat-composer-mode").click();
+  await page.getByRole("menuitem", { name: /Auto mode/ }).click();
+  await expect(page.getByTestId("task-chat-composer-mode")).toHaveAttribute("data-pending-work-mode", "standard");
   await page.screenshot({
     path: `${screenshotDir}/desktop-standard-toggle-${timestamp}.png`,
     fullPage: true,
@@ -147,11 +186,11 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
   await setMode("planning");
   await page.setViewportSize({ width: 390, height: 844 });
   await page.goto(issuePath);
-  await expect(page.getByText("Planning").first()).toBeVisible();
-  const mobilePlanningToggle = page.getByTestId("issue-chat-composer-work-mode-toggle");
+  await dismissOpeningCard(page);
+  await expect(page.getByText("Plan mode").first()).toBeVisible();
+  const mobilePlanningToggle = page.getByTestId("task-chat-composer-mode");
   await expect(mobilePlanningToggle).toBeVisible();
   await expect(mobilePlanningToggle).toHaveAttribute("data-pending-work-mode", "planning");
-  await expect(mobilePlanningToggle).toHaveAttribute("aria-pressed", "true");
   await page.screenshot({
     path: `${screenshotDir}/mobile-planning-detail-${timestamp}.png`,
     fullPage: true,
@@ -159,7 +198,7 @@ test("captures planning mode UI for desktop and mobile", async ({ page }) => {
 
   await page.goto(`/${companyPrefix}/issues`);
   await expect(page.locator(issueLinkSelector)).toBeVisible();
-  await expect(page.locator(issueLinkSelector)).not.toContainText("Planning");
+  await expect(page.locator(issueLinkSelector)).not.toContainText("Plan mode");
   await page.screenshot({
     path: `${screenshotDir}/mobile-planning-row-${timestamp}.png`,
     fullPage: true,

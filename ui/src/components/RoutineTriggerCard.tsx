@@ -16,8 +16,8 @@ import { ScheduleEditor } from "./ScheduleEditor";
 import { buildRoutineTriggerPatch } from "../lib/routine-trigger-patch";
 import { describeCron } from "../lib/cron-readable";
 
-const signingModes = ["bearer", "hmac_sha256", "github_hmac", "none"];
-const SIGNING_MODES_WITHOUT_REPLAY_WINDOW = new Set(["github_hmac", "none"]);
+const signingModes = ["bearer", "hmac_sha256", "github_hmac", "hmac_sha1", "none"];
+const SIGNING_MODES_WITHOUT_REPLAY_WINDOW = new Set(["github_hmac", "hmac_sha1", "none"]);
 
 function getLocalTimezone(): string {
   try {

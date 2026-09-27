@@ -34,7 +34,7 @@ export interface ResolvedWorkspaceResource {
   denialReason?: string | null;
   capabilities: {
     preview: boolean;
-    download: false;
+    download: boolean;
     listChildren: boolean;
   };
 }
@@ -61,10 +61,10 @@ export interface WorkspaceFileListFileItem {
   contentType?: string | null;
   byteSize?: number | null;
   modifiedAt?: string | null;
-  previewKind: Exclude<WorkspaceFilePreviewKind, "unsupported">;
+  previewKind: WorkspaceFilePreviewKind;
   capabilities: {
-    preview: true;
-    download: false;
+    preview: boolean;
+    download: true;
     listChildren: false;
   };
 }
@@ -116,4 +116,34 @@ export interface WorkspaceFileListResponse {
   items: WorkspaceFileListItem[];
   scannedCount: number;
   truncated: boolean;
+}
+
+export interface WorkspaceFileAvailabilityQuery {
+  path: string;
+  workspace?: WorkspaceFileSelector;
+  projectId?: string;
+  workspaceId?: string;
+}
+
+export interface NormalizedWorkspaceFileAvailabilityQuery {
+  path: string;
+  workspace: WorkspaceFileSelector;
+  projectId: string | null;
+  workspaceId: string | null;
+}
+
+export interface WorkspaceFileAvailabilityRequest {
+  queries: WorkspaceFileAvailabilityQuery[];
+}
+
+export interface WorkspaceFileAvailabilityResult {
+  query: NormalizedWorkspaceFileAvailabilityQuery;
+  openable: boolean;
+  unavailableReason?: string | null;
+  resource: ResolvedWorkspaceResource | null;
+}
+
+export interface WorkspaceFileAvailabilityResponse {
+  kind: "workspace_file_availability";
+  results: WorkspaceFileAvailabilityResult[];
 }

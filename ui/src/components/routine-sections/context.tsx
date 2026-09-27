@@ -42,10 +42,10 @@ export const EDITABLE_SECTIONS: RoutineSectionKey[] = [
 
 /** Which dirty-field keys belong to which section (for scoped save state). */
 export const SECTION_FIELD_KEYS: Record<string, string[]> = {
-  overview: ["title", "description", "projectId", "assigneeAgentId", "priority"],
+  overview: ["title", "description", "projectId", "assigneeAgentId", "reviewerAgentId", "priority"],
   variables: ["variables"],
   secrets: ["env"],
-  delivery: ["concurrencyPolicy", "catchUpPolicy"],
+  delivery: ["concurrencyPolicy", "catchUpPolicy", "activityGatePolicy", "activityGateScope"],
 };
 
 export type RoutineEditDraft = {
@@ -53,9 +53,13 @@ export type RoutineEditDraft = {
   description: string;
   projectId: string;
   assigneeAgentId: string;
+  /** Agent that reviews each generated run issue; "" means no review stage. */
+  reviewerAgentId: string;
   priority: string;
   concurrencyPolicy: string;
   catchUpPolicy: string;
+  activityGatePolicy: string;
+  activityGateScope: string;
   variables: RoutineVariable[];
   env: RoutineEnvConfig | null;
 };

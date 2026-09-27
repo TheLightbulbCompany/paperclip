@@ -4,7 +4,6 @@ import {
   Braces,
   Clock3,
   Edit3,
-  KeyRound,
   Play,
   Plus,
   X,
@@ -27,12 +26,13 @@ import { nextCronFires, previewFirePolicies } from "../../lib/cron-fires";
 import { timeAgo } from "../../lib/timeAgo";
 import { EmptyState } from "../EmptyState";
 import { InlineEntitySelector } from "../InlineEntitySelector";
+import { DocumentAnnotationsCountChip, IssueDocumentAnnotations } from "../IssueDocumentAnnotations";
 import { AgentIcon } from "../AgentIconPicker";
 import { MarkdownEditor } from "../MarkdownEditor";
 import { ScheduleEditor, getScheduleCronValidation } from "../ScheduleEditor";
 import { RoutineVariablesEditor, RoutineVariablesHint } from "../RoutineVariablesEditor";
 import { RoutineTriggerCard } from "../RoutineTriggerCard";
-import { EnvVarEditor } from "../EnvVarEditor";
+import { EnvironmentVariablesEditor } from "../environment-variables-editor";
 import { createDefaultNewTrigger, useRoutineDetail } from "./context";
 import type { EnvBinding, RoutineDetail as RoutineDetailType } from "@paperclipai/shared";
 
@@ -63,21 +63,53 @@ const catchUpPolicyOptions = [
   {
     value: "enqueue_missed_with_cap",
     title: "Enqueue missed with cap",
-    description: "Catch up missed schedule windows in capped batches after recovery.",
+    description: "Catch up missed schedule windows after recovery; sub-hourly schedules are combined into one catch-up run, slower schedules replay each missed window up to a cap.",
+  },
+];
+
+const activityGatePolicyOptions = [
+  {
+    value: "always",
+    title: "Run on every scheduled tick",
+    description: "Fire on the schedule no matter what — the default behavior.",
+  },
+  {
+    value: "require_external_activity",
+    title: "Skip when there's been no activity since the last run",
+    description:
+      "On a scheduled tick, only run if something happened since the last run that finished. Lets a watcher-style routine stay asleep while the system is settled instead of burning tokens.",
+  },
+];
+
+const activityGateScopeOptions = [
+  {
+    value: "company",
+    title: "Organization-wide",
+    description: "Any activity across the organization counts as a reason to run.",
+  },
+  {
+    value: "project",
+    title: "This project",
+    description: "Only activity in the routine's project counts as a reason to run.",
   },
 ];
 
 const triggerKinds = ["schedule", "webhook"];
-const signingModes = ["bearer", "hmac_sha256", "github_hmac", "none"];
+const signingModes = ["bearer", "hmac_sha256", "github_hmac", "hmac_sha1", "none"];
 const signingModeDescriptions: Record<string, string> = {
   bearer: "Expect a shared bearer token in the Authorization header.",
   hmac_sha256: "Expect an HMAC SHA-256 signature over the request using the shared secret.",
   github_hmac: "Accept GitHub-style X-Hub-Signature-256 header (HMAC over raw body, no timestamp).",
+  hmac_sha1: "Accept an HMAC-SHA1 hex signature over the raw body (Vercel-style; optional sha1= prefix).",
   none: "No authentication — the webhook URL itself acts as a shared secret.",
 };
-const SIGNING_MODES_WITHOUT_REPLAY_WINDOW = new Set(["github_hmac", "none"]);
+const SIGNING_MODES_WITHOUT_REPLAY_WINDOW = new Set(["github_hmac", "hmac_sha1", "none"]);
 
-export function OverviewSection() {
+export function OverviewSection({
+  defaultDescriptionAnnotationsOpen = false,
+}: {
+  defaultDescriptionAnnotationsOpen?: boolean;
+} = {}) {
   const ctx = useRoutineDetail();
   const {
     routine,
@@ -98,8 +130,11 @@ export function OverviewSection() {
     routineRuns,
     activity,
     saveRoutine,
+    saveConflict,
+    isSectionDirty,
     navigateToSection,
   } = ctx;
+  const [descriptionAnnotationsOpen, setDescriptionAnnotationsOpen] = useState(defaultDescriptionAnnotationsOpen);
 
   const activeTriggers = routine.triggers.length;
   const nextFire = useMemo(() => {
@@ -109,7 +144,6 @@ export function OverviewSection() {
       .sort((a, b) => a.getTime() - b.getTime())[0];
     return upcoming ? upcoming.toLocaleString() : null;
   }, [routine.triggers]);
-  const boundSecrets = editDraft.env ? Object.keys(editDraft.env).length : 0;
   const lastRun = (routineRuns ?? [])[0] ?? null;
   const recentActivity = (activity ?? []).slice(0, 5);
 
@@ -124,10 +158,10 @@ export function OverviewSection() {
             value={editDraft.assigneeAgentId}
             options={assigneeOptions}
             recentOptionIds={recentAssigneeIds}
-            placeholder="Assignee"
-            noneLabel="No assignee"
-            searchPlaceholder="Search assignees..."
-            emptyMessage="No assignees found."
+            placeholder="Responsible"
+            noneLabel="No responsible"
+            searchPlaceholder="Search responsible..."
+            emptyMessage="No responsible found."
             onChange={(assigneeAgentId) =>
               setEditDraft((current) => ({ ...current, assigneeAgentId }))
             }
@@ -149,7 +183,7 @@ export function OverviewSection() {
                   <span className="truncate">{option.label}</span>
                 )
               ) : (
-                <span className="text-muted-foreground">Assignee</span>
+                <span className="text-muted-foreground">Responsible</span>
               )
             }
             renderOption={(option) => {
@@ -182,7 +216,7 @@ export function OverviewSection() {
                 <>
                   <span
                     className="h-3.5 w-3.5 shrink-0 rounded-sm"
-                    style={{ backgroundColor: currentProject.color ?? "#64748b" }}
+                    style={{ backgroundColor: currentProject.color ?? "var(--project-none)" }}
                   />
                   <span className="truncate">{option.label}</span>
                 </>
@@ -197,13 +231,54 @@ export function OverviewSection() {
                 <>
                   <span
                     className="h-3.5 w-3.5 shrink-0 rounded-sm"
-                    style={{ backgroundColor: project?.color ?? "#64748b" }}
+                    style={{ backgroundColor: project?.color ?? "var(--project-none)" }}
                   />
                   <span className="truncate">{option.label}</span>
                 </>
               );
             }}
           />
+          <span>reviewed by</span>
+          {(routine.executionPolicy?.stages.find((stage) => stage.type === "review")?.participants.length ?? 0) > 1 ? (
+            // This single-select can only express one reviewer, so saving it
+            // over an API-set multi-participant stage would silently delete the
+            // other reviewers. Render the fact read-only instead.
+            <span className="rounded bg-muted/50 px-2 py-1 text-muted-foreground">
+              Multiple reviewers (managed via API)
+            </span>
+          ) : (
+          <InlineEntitySelector
+            value={editDraft.reviewerAgentId}
+            options={assigneeOptions}
+            recentOptionIds={recentAssigneeIds}
+            placeholder="Reviewer"
+            noneLabel="No reviewer"
+            searchPlaceholder="Search reviewers..."
+            emptyMessage="No reviewers found."
+            onChange={(reviewerAgentId) => setEditDraft((current) => ({ ...current, reviewerAgentId }))}
+            renderTriggerValue={(option) => {
+              const reviewer = option ? agentById.get(option.id) : null;
+              return option ? (
+                <>
+                  {reviewer ? <AgentIcon icon={reviewer.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                  <span className="truncate">{option.label}</span>
+                </>
+              ) : (
+                <span className="text-muted-foreground">Reviewer</span>
+              );
+            }}
+            renderOption={(option) => {
+              if (!option.id) return <span className="truncate">{option.label}</span>;
+              const reviewer = agentById.get(option.id);
+              return (
+                <>
+                  {reviewer ? <AgentIcon icon={reviewer.icon} className="h-3.5 w-3.5 shrink-0 text-muted-foreground" /> : null}
+                  <span className="truncate">{option.label}</span>
+                </>
+              );
+            }}
+          />
+          )}
         </div>
       </div>
 
@@ -215,20 +290,63 @@ export function OverviewSection() {
       ) : null}
 
       {/* Instructions */}
-      <MarkdownEditor
-        ref={descriptionEditorRef}
-        value={editDraft.description}
-        onChange={(description) => setEditDraft((current) => ({ ...current, description }))}
-        placeholder="Add instructions..."
-        bordered={false}
-        contentClassName="min-h-[120px] text-[15px] leading-7"
-        mentions={mentionOptions}
-        onSubmit={() => {
-          if (!saveRoutine.isPending && editDraft.title.trim()) {
-            saveRoutine.mutate();
-          }
-        }}
-      />
+      <div className="space-y-2">
+        <div className="flex items-center justify-end">
+          {routine.descriptionDocument ? (
+            <DocumentAnnotationsCountChip
+              issueId={routine.id}
+              docKey="description"
+              target={{ kind: "routine", routineId: routine.id, documentKey: "description" }}
+              panelOpen={descriptionAnnotationsOpen}
+              onToggle={() => setDescriptionAnnotationsOpen((open) => !open)}
+            />
+          ) : null}
+        </div>
+        {routine.descriptionDocument ? (
+          <IssueDocumentAnnotations
+            issueId={routine.id}
+            doc={routine.descriptionDocument}
+            target={{ kind: "routine", routineId: routine.id, documentKey: "description" }}
+            bodyMarkdown={editDraft.description}
+            draftDirty={isSectionDirty("overview") || saveRoutine.isPending}
+            draftConflicted={saveConflict}
+            historicalPreview={false}
+            locationHash={typeof window === "undefined" ? "" : window.location.hash}
+            panelOpen={descriptionAnnotationsOpen}
+            onPanelOpenChange={setDescriptionAnnotationsOpen}
+          >
+            <MarkdownEditor
+              ref={descriptionEditorRef}
+              value={editDraft.description}
+              onChange={(description) => setEditDraft((current) => ({ ...current, description }))}
+              placeholder="Add instructions..."
+              bordered={false}
+              contentClassName="min-h-(--sz-120px) text-sm leading-7"
+              mentions={mentionOptions}
+              onSubmit={() => {
+                if (!saveRoutine.isPending && editDraft.title.trim()) {
+                  saveRoutine.mutate();
+                }
+              }}
+            />
+          </IssueDocumentAnnotations>
+        ) : (
+          <MarkdownEditor
+            ref={descriptionEditorRef}
+            value={editDraft.description}
+            onChange={(description) => setEditDraft((current) => ({ ...current, description }))}
+            placeholder="Add instructions..."
+            bordered={false}
+            contentClassName="min-h-(--sz-120px) text-sm leading-7"
+            mentions={mentionOptions}
+            onSubmit={() => {
+              if (!saveRoutine.isPending && editDraft.title.trim()) {
+                saveRoutine.mutate();
+              }
+            }}
+          />
+        )}
+      </div>
 
       {/* Variables peek */}
       <div className="space-y-3">
@@ -242,7 +360,7 @@ export function OverviewSection() {
       </div>
 
       {/* Summary cards */}
-      <div className="grid gap-3 sm:grid-cols-3">
+      <div className="grid gap-3 sm:grid-cols-2">
         <SummaryCard
           icon={Clock3}
           label="Triggers"
@@ -250,14 +368,6 @@ export function OverviewSection() {
           hint={nextFire ? `Next fire ${nextFire}` : "No schedule"}
           to={() => navigateToSection("triggers")}
           ariaLabel={`${activeTriggers} triggers. Open triggers.`}
-        />
-        <SummaryCard
-          icon={KeyRound}
-          label="Secrets"
-          value={boundSecrets === 0 ? "None" : `${boundSecrets} bound`}
-          hint="Manage bound secrets"
-          to={() => navigateToSection("secrets")}
-          ariaLabel={`${boundSecrets} secrets bound. Open secrets.`}
         />
         <SummaryCard
           icon={Play}
@@ -598,7 +708,7 @@ export function SecretsSection() {
         </div>
       ) : null}
 
-      <EnvVarEditor
+      <EnvironmentVariablesEditor
         value={(editDraft.env ?? {}) as Record<string, EnvBinding>}
         secrets={availableSecrets}
         recentlyUsedSecrets={recentlyUsedSecrets}
@@ -613,10 +723,17 @@ export function DeliverySection() {
   const ctx = useRoutineDetail();
   const { editDraft, setEditDraft, routine } = ctx;
 
+  // The activity gate only affects schedule ticks (webhook/manual/API fires are
+  // themselves activity and always run), so the control is only meaningful for
+  // routines that have a schedule trigger. Disable — rather than hide — it
+  // elsewhere so the capability stays discoverable.
+  const hasScheduleTrigger = routine.triggers.some((trigger) => trigger.kind === "schedule");
+  const gateEnabled = editDraft.activityGatePolicy === "require_external_activity";
+
   return (
     <div className="space-y-6">
       <div className="space-y-3">
-        <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
+        <p className="text-xs font-medium uppercase tracking-(--tracking-caps) text-muted-foreground">
           Concurrency
         </p>
         <RadioCardGroup
@@ -629,7 +746,7 @@ export function DeliverySection() {
         />
       </div>
       <div className="space-y-3">
-        <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
+        <p className="text-xs font-medium uppercase tracking-(--tracking-caps) text-muted-foreground">
           Catch-up
         </p>
         <RadioCardGroup
@@ -640,6 +757,38 @@ export function DeliverySection() {
           }
           options={catchUpPolicyOptions}
         />
+      </div>
+      <div className="space-y-3">
+        <p className="text-xs font-medium uppercase tracking-(--tracking-caps) text-muted-foreground">
+          Advanced run policy
+        </p>
+        <RadioCardGroup
+          ariaLabel="Advanced run policy"
+          value={editDraft.activityGatePolicy}
+          onValueChange={(activityGatePolicy) =>
+            setEditDraft((current) => ({ ...current, activityGatePolicy }))
+          }
+          options={activityGatePolicyOptions}
+          disabled={!hasScheduleTrigger}
+        />
+        {!hasScheduleTrigger ? (
+          <p className="text-xs text-muted-foreground">
+            Add a schedule trigger to gate runs on activity. Webhook, manual, and API fires always
+            run.
+          </p>
+        ) : gateEnabled ? (
+          <div className="space-y-2 rounded-lg border border-border p-3">
+            <Label className="text-xs font-medium">Activity scope</Label>
+            <RadioCardGroup
+              ariaLabel="Activity gate scope"
+              value={editDraft.activityGateScope}
+              onValueChange={(activityGateScope) =>
+                setEditDraft((current) => ({ ...current, activityGateScope }))
+              }
+              options={activityGateScopeOptions}
+            />
+          </div>
+        ) : null}
       </div>
       <NextFiresPreview
         triggers={routine.triggers}
@@ -688,7 +837,7 @@ function NextFiresPreview({
 
   return (
     <div className="space-y-3">
-      <p className="text-xs font-medium uppercase tracking-[0.18em] text-muted-foreground">
+      <p className="text-xs font-medium uppercase tracking-(--tracking-caps) text-muted-foreground">
         Next 5 fires
       </p>
       {preview ? (
@@ -708,7 +857,7 @@ function NextFiresPreview({
               </div>
             ))}
           </div>
-          <p className="text-[11px] text-muted-foreground/60">
+          <p className="text-(length:--text-micro) text-muted-foreground/60">
             Preview assumes the previous run is still in flight when the next fires. Times shown in{" "}
             {preview.timeZone}.
           </p>

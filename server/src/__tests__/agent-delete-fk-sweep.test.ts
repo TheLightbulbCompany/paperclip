@@ -1,0 +1,314 @@
+import { randomUUID } from "node:crypto";
+import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
+import { eq } from "drizzle-orm";
+import {
+  agents,
+  approvals,
+  assets,
+  budgetIncidents,
+  budgetPolicies,
+  companies,
+  companySkills,
+  companySkillTestRuns,
+  companySkillVersions,
+  costEvents,
+  createDb,
+  decisionBundles,
+  decisions,
+  financeEvents,
+  goals,
+  heartbeatRuns,
+  issues,
+  issueThreadInteractions,
+  issueWatchdogs,
+  projects,
+} from "@paperclipai/db";
+import {
+  getEmbeddedPostgresTestSupport,
+  startEmbeddedPostgresTestDatabase,
+} from "./helpers/embedded-postgres.js";
+import { agentService } from "../services/agents.ts";
+import { budgetService } from "../services/budgets.ts";
+
+const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
+const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
+
+if (!embeddedPostgresSupport.supported) {
+  console.warn(
+    `Skipping embedded Postgres agent delete FK tests on this host: ${embeddedPostgresSupport.reason ?? "unsupported environment"}`,
+  );
+}
+
+describeEmbeddedPostgres("agent delete FK sweep", () => {
+  let db!: ReturnType<typeof createDb>;
+  let tempDb: Awaited<ReturnType<typeof startEmbeddedPostgresTestDatabase>> | null = null;
+
+  beforeAll(async () => {
+    tempDb = await startEmbeddedPostgresTestDatabase("paperclip-agent-delete-fk-");
+    db = createDb(tempDb.connectionString);
+  }, 20_000);
+
+  afterEach(async () => {
+    await db.delete(budgetIncidents);
+    await db.delete(budgetPolicies);
+    await db.delete(companySkillTestRuns);
+    await db.delete(companySkillVersions);
+    await db.delete(companySkills);
+    await db.delete(decisions);
+    await db.delete(decisionBundles);
+    await db.delete(issueWatchdogs);
+    await db.delete(issueThreadInteractions);
+    await db.delete(costEvents);
+    await db.delete(financeEvents);
+    await db.delete(assets);
+    await db.delete(approvals);
+    await db.delete(heartbeatRuns);
+    await db.delete(issues);
+    await db.delete(goals);
+    await db.delete(projects);
+    await db.delete(agents);
+    await db.delete(companies);
+  });
+
+  afterAll(async () => {
+    await tempDb?.cleanup();
+  });
+
+  it("deletes an agent whose work is referenced by assets, decisions, and finance rows, preserving the evidence", async () => {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const runId = randomUUID();
+    const assetId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Lens",
+      role: "general",
+      status: "idle",
+      adapterType: "openclaw_gateway",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "run issue",
+      status: "done",
+      createdByAgentId: agentId,
+      assigneeAgentId: agentId,
+    });
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      invocationSource: "on_demand",
+      status: "completed",
+    });
+    // The FK that broke prod deletion: an asset created by the agent.
+    await db.insert(assets).values({
+      id: assetId,
+      companyId,
+      provider: "s3",
+      objectKey: "companies/test/asset.txt",
+      contentType: "text/plain",
+      byteSize: 5,
+      sha256: "a".repeat(64),
+      createdByAgentId: agentId,
+    });
+    await db.insert(approvals).values({
+      companyId,
+      type: "generic",
+      payload: {},
+      requestedByAgentId: agentId,
+    });
+    await db.insert(financeEvents).values({
+      companyId,
+      agentId,
+      eventKind: "inference",
+      biller: "aws",
+      amountCents: 5,
+      occurredAt: new Date(),
+    });
+    await db.insert(costEvents).values({
+      companyId,
+      agentId,
+      provider: "anthropic",
+      model: "claude",
+      costCents: 5,
+      occurredAt: new Date(),
+    });
+    await db.insert(goals).values({ companyId, title: "goal", ownerAgentId: agentId });
+    await db.insert(projects).values({ companyId, name: "proj", leadAgentId: agentId });
+    await db.insert(issueThreadInteractions).values({
+      companyId,
+      issueId,
+      kind: "ask_user_questions",
+      status: "pending",
+      payload: {},
+      createdByAgentId: agentId,
+    });
+    await db.insert(issueWatchdogs).values({
+      companyId,
+      issueId,
+      watchdogAgentId: agentId,
+    });
+    const bundleId = randomUUID();
+    await db.insert(decisionBundles).values({
+      id: bundleId,
+      companyId,
+      title: "b",
+      summary: "s",
+      originAgentId: agentId,
+      originIssueId: issueId,
+      originRunId: runId,
+    });
+    await db.insert(decisions).values({
+      companyId,
+      bundleId,
+      title: "d",
+      summary: "s",
+      body: "body",
+      options: [],
+      expiresAt: new Date(Date.now() + 86_400_000),
+      signedSpec: "spec",
+      targetSnapshots: {},
+      originAgentId: agentId,
+      originIssueId: issueId,
+      originRunId: runId,
+      status: "pending",
+    });
+
+    // Skill Studio test run — the ON DELETE RESTRICT reference.
+    const skillId = randomUUID();
+    const skillVersionId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: "k",
+      slug: "s",
+      name: "skill",
+      markdown: "# skill",
+    });
+    await db.insert(companySkillVersions).values({
+      id: skillVersionId,
+      companyId,
+      companySkillId: skillId,
+      revisionNumber: 1,
+    });
+    await db.insert(companySkillTestRuns).values({
+      companyId,
+      skillId,
+      inputSnapshot: "{}",
+      skillVersionId,
+      agentId,
+      issueId,
+    });
+
+    const removed = await agentService(db).remove(agentId);
+    expect(removed).not.toBeNull();
+
+    // Agent gone.
+    expect(await db.select().from(agents).where(eq(agents.id, agentId))).toHaveLength(0);
+    // Evidence preserved with attribution nulled.
+    const asset = await db.select().from(assets).where(eq(assets.id, assetId));
+    expect(asset).toHaveLength(1);
+    expect(asset[0]!.createdByAgentId).toBeNull();
+    expect((await db.select().from(approvals))[0]!.requestedByAgentId).toBeNull();
+    expect((await db.select().from(financeEvents))[0]!.agentId).toBeNull();
+    expect((await db.select().from(goals))[0]!.ownerAgentId).toBeNull();
+    expect((await db.select().from(projects))[0]!.leadAgentId).toBeNull();
+    // Operational rows owned by the agent are gone.
+    expect(await db.select().from(costEvents)).toHaveLength(0);
+    expect(await db.select().from(decisions)).toHaveLength(0);
+    expect(await db.select().from(decisionBundles)).toHaveLength(0);
+    expect(await db.select().from(issueWatchdogs)).toHaveLength(0);
+    expect(await db.select().from(companySkillTestRuns)).toHaveLength(0);
+    // The skill and its version survive the agent.
+    expect(await db.select().from(companySkills)).toHaveLength(1);
+    expect(await db.select().from(companySkillVersions)).toHaveLength(1);
+  });
+
+  it("clears the deleted agent's budget policy so the company dashboard keeps loading", async () => {
+    // budget_policies.scope_id is polymorphic text with NO FK to agents.id, so
+    // the delete succeeds without touching it and the row is orphaned. That
+    // orphan then made budgets.overview() throw notFound("Agent not found"),
+    // which 404'd /dashboard AND /sidebar-badges for the whole company —
+    // permanently, since nothing ever cleans the row up.
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issuePrefix = `B${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "Budgeted",
+      role: "general",
+      status: "idle",
+      adapterType: "openclaw_gateway",
+      adapterConfig: {},
+      runtimeConfig: {},
+      permissions: {},
+    });
+    // Exactly what agent-create writes when budgetMonthlyCents > 0.
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: agentId,
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 5_000,
+    });
+
+    expect(await agentService(db).remove(agentId)).not.toBeNull();
+
+    const leftover = await db
+      .select({ id: budgetPolicies.id })
+      .from(budgetPolicies)
+      .where(eq(budgetPolicies.scopeId, agentId));
+    expect(leftover).toEqual([]);
+
+    await expect(budgetService(db).overview(companyId)).resolves.toMatchObject({ companyId });
+  });
+
+  it("skips a budget policy already orphaned by an earlier delete", async () => {
+    // The rows in prod today predate the sweep above, so overview() has to
+    // tolerate them on its own or those owners stay broken forever.
+    const companyId = randomUUID();
+    const issuePrefix = `O${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(budgetPolicies).values({
+      companyId,
+      scopeType: "agent",
+      scopeId: randomUUID(), // agent row is already gone
+      metric: "billed_cents",
+      windowKind: "calendar_month_utc",
+      amount: 5_000,
+    });
+
+    const overview = await budgetService(db).overview(companyId);
+    expect(overview.policies).toEqual([]);
+    expect(overview.pausedAgentCount).toBe(0);
+  });
+});

@@ -1,11 +1,6 @@
 import type { IssueAttachment } from "@paperclipai/shared";
-import { isVideoContentType } from "./issue-output";
-
-const GENERIC_ATTACHMENT_CONTENT_TYPES = new Set([
-  "application/octet-stream",
-  "binary/octet-stream",
-  "application/x-binary",
-]);
+import { isMarkdownAttachmentContent } from "@paperclipai/shared";
+import { isVideoLikeOutput } from "./issue-output";
 
 type AttachmentPathLike = {
   contentPath: string;
@@ -30,41 +25,18 @@ export function attachmentDownloadPath(attachment: AttachmentPathLike) {
 }
 
 export function isImageAttachment(attachment: Pick<IssueAttachment, "contentType">) {
-  return normalizedContentType(attachment).startsWith("image/");
+  const type = normalizedContentType(attachment);
+  return type.startsWith("image/") && !/^image\/hei[cf](?:-sequence)?$/.test(type);
 }
 
 export function isVideoAttachment(
   attachment: Pick<IssueAttachment, "contentType" | "originalFilename">,
 ) {
-  const contentType = normalizedContentType(attachment);
-  if (isVideoContentType(contentType)) return true;
-  if (!GENERIC_ATTACHMENT_CONTENT_TYPES.has(contentType)) return false;
-
-  const filename = (attachment.originalFilename ?? "").toLowerCase();
-  return (
-    filename.endsWith(".mp4") ||
-    filename.endsWith(".m4v") ||
-    filename.endsWith(".webm") ||
-    filename.endsWith(".mov") ||
-    filename.endsWith(".qt") ||
-    filename.endsWith(".quicktime")
-  );
+  return isVideoLikeOutput(attachment.contentType, attachment.originalFilename);
 }
 
 export function isMarkdownAttachment(
   attachment: Pick<IssueAttachment, "contentType" | "originalFilename">,
 ) {
-  const contentType = normalizedContentType(attachment);
-  if (
-    contentType === "text/markdown" ||
-    contentType === "text/x-markdown" ||
-    contentType === "application/markdown" ||
-    contentType === "application/x-markdown"
-  ) {
-    return true;
-  }
-
-  const filename = (attachment.originalFilename ?? "").toLowerCase();
-  if (!filename.endsWith(".md") && !filename.endsWith(".markdown")) return false;
-  return contentType === "text/plain" || GENERIC_ATTACHMENT_CONTENT_TYPES.has(contentType);
+  return isMarkdownAttachmentContent(attachment);
 }
