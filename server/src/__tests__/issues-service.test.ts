@@ -36,6 +36,7 @@ import {
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
 import { instanceSettingsService } from "../services/instance-settings.ts";
+import { observeCrossIssueInfluence } from "../services/cross-issue-influence-limit.ts";
 import {
   clampIssueListLimit,
   deriveIssueCommentRunLogAttribution,
@@ -613,6 +614,79 @@ describeEmbeddedPostgres("issueService.list participantAgentId", () => {
       assigneeAgentId: null,
       status: "todo",
     });
+  });
+
+  it("records the checked-out issue on a timer run so its same-issue writes pass the cross-issue limiter", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, { id: agentId, name: "TimerCoder" }));
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId,
+      companyId,
+      agentId,
+      status: "running",
+      responsibleUserId: "board-user",
+      contextSnapshot: { source: "scheduler", reason: "interval_elapsed", wakeReason: "heartbeat_timer" },
+    });
+    const claimed = await svc.create(companyId, {
+      title: "Picked up by a timer run",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: agentId,
+    });
+    const other = await svc.create(companyId, {
+      title: "Someone else's",
+      description: null,
+      status: "todo",
+      priority: "medium",
+      assigneeAgentId: null,
+    });
+    const observe = (targetIssueId: string, kind: "comment" | "update") =>
+      observeCrossIssueInfluence(db, { companyId, runId, agentId, targetIssueId, kind });
+
+    // Before the fix: an unscoped timer run fails closed on its first write.
+    await expect(observe(claimed.id, "comment")).rejects.toMatchObject({ status: 403 });
+
+    await svc.checkout(claimed.id, agentId, ["todo"], runId);
+
+    // Same-issue comment + PATCH are not cross-issue: no charge, no 403.
+    await expect(observe(claimed.id, "comment")).resolves.toBeNull();
+    await expect(observe(claimed.id, "update")).resolves.toBeNull();
+    // Any other issue is cross-issue and charged against the run's cap.
+    await expect(observe(other.id, "update")).resolves.toMatchObject({ count: 1 });
+
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(run?.contextSnapshot).toMatchObject({ source: "scheduler", issueId: claimed.id });
+  });
+
+  it("never replaces a run's existing source issue on checkout", async () => {
+    const companyId = await seedAssignableAgentCompany();
+    const agentId = randomUUID();
+    await db.insert(agents).values(agentRow(companyId, { id: agentId, name: "ScopedCoder" }));
+    const source = await svc.create(companyId, {
+      title: "Source", description: null, status: "backlog", priority: "medium", assigneeAgentId: null,
+    });
+    const runId = randomUUID();
+    await db.insert(heartbeatRuns).values({
+      id: runId, companyId, agentId, status: "running", responsibleUserId: "board-user",
+      contextSnapshot: { issueId: source.id },
+    });
+    const next = await svc.create(companyId, {
+      title: "Next", description: null, status: "todo", priority: "medium", assigneeAgentId: agentId,
+    });
+
+    await svc.checkout(next.id, agentId, ["todo"], runId);
+
+    const [run] = await db
+      .select({ contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.id, runId));
+    expect(run?.contextSnapshot).toEqual({ issueId: source.id });
   });
 
   it("expires a pending connection and its OAuth state when reassigned to a user without a status change", async () => {
