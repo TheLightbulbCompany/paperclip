@@ -990,6 +990,44 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     }
   });
 
+  // Report an operator stop. Acknowledge it only when Hermes reports a
+  // cancelled/stopped terminal status; a rejected /stop or a run that is still
+  // active must not read as a verified cancellation.
+  const cancelledResult = (finalStatus: Record<string, unknown> | null) => {
+    const status = extractStatus(finalStatus);
+    const confirmed = status !== null && CANCELLED_STATUSES.has(status);
+    return {
+      exitCode: 1,
+      signal: "SIGTERM",
+      timedOut: false,
+      errorCode: "hermes_gateway_cancelled",
+      errorMessage: confirmed
+        ? "Hermes gateway run was cancelled."
+        : "Hermes gateway run was cancelled, but Hermes did not confirm that the remote run stopped.",
+      provider: "hermes_gateway",
+      resultJson: {
+        run_id: runId,
+        status: status ?? "unconfirmed",
+        last_event: state.lastEventName,
+        final_status: redactForLog(finalStatus, [], 0, redactText),
+        ...(confirmed
+          ? {
+              executionCancellation: {
+                state: "acknowledged",
+                acknowledgedAt: new Date().toISOString(),
+                proof: "hermes_gateway_terminal_cancelled",
+              },
+            }
+          : {}),
+      },
+      sessionParams: {
+        hermesRunId: runId,
+        strategy,
+      },
+      sessionDisplayId: sessionKey ? redactText(sessionKey) : null,
+    };
+  };
+
   try {
     const outcome = await Promise.race([state.terminalPromise, timeoutPromise, stopGracePromise]);
     if (timeoutTimer) clearTimeout(timeoutTimer);
@@ -999,6 +1037,8 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     if (outcome === "timeout") {
       await requestStop();
       const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+      // The operator may have cancelled just before the timeout won the race.
+      if (ctx.signal?.aborted) return cancelledResult(finalStatus);
       return {
         exitCode: 1,
         signal: null,
@@ -1022,31 +1062,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
 
     if (outcome === "cancelled_timeout") {
       const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: 1_000 });
-      const statusStr = extractStatus(finalStatus) ?? "stopped";
-      return {
-        exitCode: 1,
-        signal: "SIGTERM",
-        timedOut: false,
-        errorCode: "hermes_gateway_cancelled",
-        errorMessage: "Hermes gateway run was cancelled.",
-        provider: "hermes_gateway",
-        resultJson: {
-          run_id: runId,
-          status: statusStr,
-          last_event: state.lastEventName,
-          final_status: redactForLog(finalStatus, [], 0, redactText),
-          executionCancellation: {
-            state: "acknowledged",
-            acknowledgedAt: new Date().toISOString(),
-            proof: "hermes_gateway_terminal_cancelled",
-          },
-        },
-        sessionParams: {
-          hermesRunId: runId,
-          strategy,
-        },
-        sessionDisplayId: sessionKey ? redactText(sessionKey) : null,
-      };
+      return cancelledResult(finalStatus);
     }
 
     return mapFinalResultForTest({
