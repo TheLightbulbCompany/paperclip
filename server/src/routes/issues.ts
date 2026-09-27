@@ -3882,10 +3882,26 @@ export function issueRoutes(
   async function assertCrossIssueInfluenceWithinRunCap(
     req: Request,
     res: Response,
-    issue: { id: string; identifier?: string | null; companyId: string },
+    issue: {
+      id: string;
+      identifier?: string | null;
+      companyId: string;
+      assigneeAgentId?: string | null;
+    },
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
+    // isol8: with NO run at all (a Lightbulb room turn on the agent key) there
+    // is no source issue to contain and no run budget to charge, so the agent's
+    // write to the issue it is ASSIGNED is not cross-issue influence. Without
+    // this it could not comment on or update its own issue from a room. Every
+    // other no-run write still fails closed; runs keep the upstream cap as-is.
+    if (
+      !req.actor.runId &&
+      req.actor.agentId &&
+      issue.assigneeAgentId === req.actor.agentId
+    )
+      return true;
     if (!req.actor.agentId || !req.actor.runId)
       throw crossIssueInfluenceRunContextError();
 
@@ -5362,6 +5378,12 @@ export function issueRoutes(
       return true;
     }
     if (issue.status !== "in_progress") {
+      return true;
+    }
+    // isol8: no heartbeat run (a Lightbulb room turn on the agent key). The
+    // run lock protects a LIVE run's checkout; once no live run holds the
+    // issue the assignee may edit it. A live lock still needs that run's id.
+    if (!req.actor.runId?.trim() && !(await svc.hasLiveRunLock(issue.id))) {
       return true;
     }
     const runId = requireAgentRunId(req, res);

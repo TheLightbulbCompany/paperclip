@@ -16,6 +16,7 @@ const recoveryActionId = "77777777-7777-4777-8777-777777777777";
 const mockIssueService = vi.hoisted(() => ({
   addComment: vi.fn(),
   assertCheckoutOwner: vi.fn(),
+  hasLiveRunLock: vi.fn(),
   create: vi.fn(),
   createChild: vi.fn(),
   decomposeAcceptedPlan: vi.fn(),
@@ -641,6 +642,8 @@ describe("agent issue mutation checkout ownership", () => {
     });
     mockIssueService.list.mockResolvedValue([makeIssue()]);
     mockIssueService.assertCheckoutOwner.mockResolvedValue({ adoptedFromRunId: null });
+    mockIssueService.hasLiveRunLock.mockReset();
+    mockIssueService.hasLiveRunLock.mockResolvedValue(true);
     mockIssueService.create.mockImplementation(async (_companyId: string, input: Record<string, unknown>) => ({
       ...makeIssue({
         id: "88888888-8888-4888-8888-888888888888",
@@ -1090,6 +1093,63 @@ describe("agent issue mutation checkout ownership", () => {
     expect(res.status, JSON.stringify(res.body)).toBe(401);
     expect(res.body.error).toBe("Agent run id required");
     expect(mockStorageService.putFile).not.toHaveBeenCalled();
+  });
+
+  describe("assignee writes without a heartbeat run (isol8 room turns)", () => {
+    const roomTurnOwner = () => ({ type: "agent", agentId: ownerAgentId, companyId, source: "agent_key" });
+
+    it("lets the assignee comment on and update its own idle in-progress issue", async () => {
+      mockIssueService.hasLiveRunLock.mockResolvedValue(false);
+      const app = await createApp(roomTurnOwner());
+
+      await request(app).post(`/api/issues/${issueId}/comments`).send({ body: "From a room." }).expect(201);
+      const res = await request(app).patch(`/api/issues/${issueId}`).send({ title: "Updated from a room" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockIssueService.update).toHaveBeenCalled();
+      expect(mockIssueService.assertCheckoutOwner).not.toHaveBeenCalled();
+      expect(mockObserveCrossIssueInfluence).not.toHaveBeenCalled();
+    });
+
+    it("lets the assignee update its own backlog issue", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "backlog" }));
+      const res = await request(await createApp(roomTurnOwner()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Scoped from a room" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(200);
+      expect(mockObserveCrossIssueInfluence).not.toHaveBeenCalled();
+    });
+
+    it("keeps a live run's checkout lock: the assignee still needs that run id", async () => {
+      mockIssueService.hasLiveRunLock.mockResolvedValue(true);
+      const res = await request(await createApp(roomTurnOwner()))
+        .patch(`/api/issues/${issueId}`)
+        .send({ title: "Collides with the live run" });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(401);
+      expect(res.body.error).toBe("Agent run id required");
+      expect(mockIssueService.update).not.toHaveBeenCalled();
+    });
+
+    it("still refuses a non-assignee without a run", async () => {
+      mockIssueService.getById.mockResolvedValue(makeIssue({ status: "todo" }));
+      const { HttpError: CurrentHttpError } =
+        await vi.importActual<typeof import("../errors.js")>("../errors.js");
+      vi.doMock("../services/cross-issue-influence-limit.js", () => ({
+        observeCrossIssueInfluence: mockObserveCrossIssueInfluence,
+        crossIssueInfluenceLimitError: vi.fn(),
+        crossIssueInfluenceRunContextError: () =>
+          new CurrentHttpError(403, "run context required", { code: "cross_issue_influence_run_context_required" }),
+      }));
+      const res = await request(await createApp(peerActor({ runId: undefined })))
+        .post(`/api/issues/${issueId}/comments`)
+        .send({ body: "Not my issue." });
+
+      expect(res.status, JSON.stringify(res.body)).toBe(403);
+      expect(res.body.details?.code ?? res.body.code).toBe("cross_issue_influence_run_context_required");
+      expect(mockIssueService.addComment).not.toHaveBeenCalled();
+    });
   });
 
   it("allows the checked-out owner with the matching run id to patch and update documents", async () => {
