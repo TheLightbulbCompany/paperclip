@@ -1,6 +1,6 @@
 import { and, asc, eq, isNull } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { goals } from "@paperclipai/db";
+import { costEvents, financeEvents, goals, issues, projects } from "@paperclipai/db";
 
 type GoalReader = Pick<Db, "select">;
 
@@ -70,11 +70,23 @@ export function goalService(db: Db) {
         .returning()
         .then((rows) => rows[0] ?? null),
 
+    // isol8: these FKs into goals.id have no delete policy, so a linked task,
+    // project, sub-goal or cost/finance row made the delete fail with SQLSTATE
+    // 23503. Detach them in the same transaction; sub-goals move up one level.
     remove: (id: string) =>
-      db
-        .delete(goals)
-        .where(eq(goals.id, id))
-        .returning()
-        .then((rows) => rows[0] ?? null),
+      db.transaction(async (tx) => {
+        const goal = await tx.select().from(goals).where(eq(goals.id, id)).then((rows) => rows[0] ?? null);
+        if (!goal) return null;
+        await tx.update(goals).set({ parentId: goal.parentId }).where(eq(goals.parentId, id));
+        await tx.update(issues).set({ goalId: null }).where(eq(issues.goalId, id));
+        await tx.update(projects).set({ goalId: null }).where(eq(projects.goalId, id));
+        await tx.update(costEvents).set({ goalId: null }).where(eq(costEvents.goalId, id));
+        await tx.update(financeEvents).set({ goalId: null }).where(eq(financeEvents.goalId, id));
+        return tx
+          .delete(goals)
+          .where(eq(goals.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+      }),
   };
 }
