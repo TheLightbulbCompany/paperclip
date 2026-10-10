@@ -5,6 +5,8 @@ import {
   projectGoals,
   goals,
   issues,
+  costEvents,
+  financeEvents,
   budgetPolicies,
   pluginManagedResources,
   plugins,
@@ -945,16 +947,41 @@ export function projectService(db: Db) {
       return cleared;
     },
 
+    // isol8: these FKs into projects.id have no delete policy, so a linked task
+    // (or a cost/finance row) made the delete fail with SQLSTATE 23503.
+    // Detach them in the same transaction; the rows outlive the project. The
+    // row lock blocks new references until we commit, and every sweep is scoped
+    // to the project's own company.
     remove: (id: string) =>
-      db
-        .delete(projects)
-        .where(eq(projects.id, id))
-        .returning()
-        .then((rows) => {
-          const row = rows[0] ?? null;
-          if (!row) return null;
-          return { ...row, urlKey: deriveProjectUrlKey(row.name, row.id) };
-        }),
+      db.transaction(async (tx) => {
+        const project = await tx
+          .select({ companyId: projects.companyId })
+          .from(projects)
+          .where(eq(projects.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!project) return null;
+        const { companyId } = project;
+        await tx
+          .update(issues)
+          .set({ projectId: null })
+          .where(and(eq(issues.companyId, companyId), eq(issues.projectId, id)));
+        await tx
+          .update(costEvents)
+          .set({ projectId: null })
+          .where(and(eq(costEvents.companyId, companyId), eq(costEvents.projectId, id)));
+        await tx
+          .update(financeEvents)
+          .set({ projectId: null })
+          .where(and(eq(financeEvents.companyId, companyId), eq(financeEvents.projectId, id)));
+        const row = await tx
+          .delete(projects)
+          .where(eq(projects.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!row) return null;
+        return { ...row, urlKey: deriveProjectUrlKey(row.name, row.id) };
+      }),
 
     listWorkspaces: async (projectId: string): Promise<ProjectWorkspace[]> => {
       const rows = await db
