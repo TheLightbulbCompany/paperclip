@@ -9,6 +9,7 @@ import {
   financeEvents,
   goals,
   issues,
+  projectGoals,
   projects,
 } from "@paperclipai/db";
 import {
@@ -37,6 +38,7 @@ describeEmbeddedPostgres("goal/project remove FK sweep", () => {
     await db.delete(financeEvents);
     await db.delete(costEvents);
     await db.delete(issues);
+    await db.delete(projectGoals);
     await db.delete(projects);
     await db.delete(goals);
     await db.delete(agents);
@@ -81,6 +83,7 @@ describeEmbeddedPostgres("goal/project remove FK sweep", () => {
       { id: subGoalId, companyId, parentId: goalId, title: "Child", level: "task", status: "active" },
     ]);
     await db.insert(projects).values({ id: projectId, companyId, goalId, name: "Doomed project" });
+    await db.insert(projectGoals).values({ projectId, goalId, companyId });
     await db.insert(issues).values({
       id: issueId,
       companyId,
@@ -112,7 +115,7 @@ describeEmbeddedPostgres("goal/project remove FK sweep", () => {
       amountCents: 5,
       occurredAt: new Date(),
     });
-    return { rootGoalId, goalId, subGoalId, projectId, issueId, costEventId, financeEventId };
+    return { companyId, rootGoalId, goalId, subGoalId, projectId, issueId, costEventId, financeEventId };
   }
 
   it("deletes a project with linked tasks and cost rows, keeping those rows", async () => {
@@ -134,16 +137,63 @@ describeEmbeddedPostgres("goal/project remove FK sweep", () => {
     const removed = await goalService(db).remove(s.goalId);
     expect(removed?.id).toBe(s.goalId);
 
+    // Tasks and projects move up to the parent goal, so they still trace to a company goal.
     const [issue] = await db.select().from(issues).where(eq(issues.id, s.issueId));
-    expect(issue?.goalId).toBeNull();
+    expect(issue?.goalId).toBe(s.rootGoalId);
     const [project] = await db.select().from(projects).where(eq(projects.id, s.projectId));
-    expect(project?.goalId).toBeNull();
+    expect(project?.goalId).toBe(s.rootGoalId);
+    const links = await db.select().from(projectGoals).where(eq(projectGoals.projectId, s.projectId));
+    expect(links.map((l) => l.goalId)).toEqual([s.rootGoalId]);
     const [subGoal] = await db.select().from(goals).where(eq(goals.id, s.subGoalId));
     expect(subGoal?.parentId).toBe(s.rootGoalId);
     const [cost] = await db.select().from(costEvents).where(eq(costEvents.id, s.costEventId));
     expect(cost?.goalId).toBeNull();
     const [finance] = await db.select().from(financeEvents).where(eq(financeEvents.id, s.financeEventId));
     expect(finance?.goalId).toBeNull();
+  });
+
+  it("refuses to delete a top-level goal that tasks or projects still point at", async () => {
+    const s = await seed();
+    await goalService(db).remove(s.goalId);
+    await expect(goalService(db).remove(s.rootGoalId)).rejects.toMatchObject({ status: 409 });
+    const [root] = await db.select().from(goals).where(eq(goals.id, s.rootGoalId));
+    expect(root?.id).toBe(s.rootGoalId);
+  });
+
+  it("deletes a top-level goal with only sub-goals and cost rows", async () => {
+    const s = await seed();
+    await db.delete(issues);
+    await projectService(db).remove(s.projectId);
+    await db.update(goals).set({ parentId: null }).where(eq(goals.id, s.goalId));
+    expect((await goalService(db).remove(s.goalId))?.id).toBe(s.goalId);
+    const [subGoal] = await db.select().from(goals).where(eq(goals.id, s.subGoalId));
+    expect(subGoal?.parentId).toBeNull();
+  });
+
+  it("never rewrites another company's rows", async () => {
+    const s = await seed();
+    const otherCompanyId = randomUUID();
+    const strayGoalId = randomUUID();
+    await db.insert(companies).values({
+      id: otherCompanyId,
+      name: "Other",
+      issuePrefix: `O${otherCompanyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`,
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(goals).values({
+      id: strayGoalId,
+      companyId: otherCompanyId,
+      parentId: s.goalId,
+      title: "Stray",
+      level: "team",
+      status: "active",
+    });
+
+    await expect(goalService(db).remove(s.goalId)).rejects.toThrow();
+    const [stray] = await db.select().from(goals).where(eq(goals.id, strayGoalId));
+    expect(stray?.parentId).toBe(s.goalId);
+    const [issue] = await db.select().from(issues).where(eq(issues.id, s.issueId));
+    expect(issue?.goalId).toBe(s.goalId);
   });
 
   it("returns null for a missing goal or project", async () => {
