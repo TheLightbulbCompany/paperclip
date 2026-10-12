@@ -52,6 +52,7 @@ import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { assertBoardOrgAccess, assertInstanceAdmin } from "./authz.js";
 import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
+import { isConversationAdapter } from "../services/conversation-continuation.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -116,6 +117,8 @@ interface AdapterCapabilities {
   supportsLocalAgentJwt: boolean;
   requiresMaterializedRuntimeSkills: boolean;
   supportsAcp: boolean;
+  /** Failed runs continue as a conversation turn (built-in list or the module flag). */
+  supportsConversationContinuation: boolean;
   /**
    * The projected login capability. It is present only when the adapter
    * declares an interactive login capability. It is absent otherwise.
@@ -182,6 +185,7 @@ export function buildAdapterCapabilities(adapter: ServerAdapterModule): AdapterC
     supportsLocalAgentJwt: adapter.supportsLocalAgentJwt ?? false,
     requiresMaterializedRuntimeSkills: adapter.requiresMaterializedRuntimeSkills ?? false,
     supportsAcp: Boolean(adapter.acp),
+    supportsConversationContinuation: isConversationAdapter(adapter.type),
     ...(login
       ? {
           login: {

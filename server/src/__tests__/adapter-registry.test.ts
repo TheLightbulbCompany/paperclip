@@ -16,6 +16,11 @@ import {
   resolveExternalAdapterRegistration,
   setOverridePaused,
 } from "../adapters/registry.js";
+import {
+  CONVERSATION_ADAPTER_TYPES,
+  conversationAdapterTypes,
+  isConversationAdapter,
+} from "../services/conversation-continuation.js";
 
 vi.mock("@paperclipai/paperclip-runner/live", () => ({
   probeAcpxClaudeInstallation: vi.fn(async () => undefined),
@@ -234,6 +239,32 @@ describe("server adapter registry", () => {
     expect(resolved!.supportsInstructionsBundle).toBeUndefined();
     expect(resolved!.instructionsPathKey).toBeUndefined();
     expect(resolved!.requiresMaterializedRuntimeSkills).toBeUndefined();
+  });
+
+  it("treats an external adapter as a conversation adapter only when it opts in", () => {
+    expect(isConversationAdapter("external_test")).toBe(false);
+
+    registerServerAdapter(externalAdapter);
+    expect(isConversationAdapter("external_test")).toBe(false);
+    expect(conversationAdapterTypes()).not.toContain("external_test");
+
+    registerServerAdapter({ ...externalAdapter, supportsConversationContinuation: true });
+    expect(isConversationAdapter("external_test")).toBe(true);
+    expect(conversationAdapterTypes()).toContain("external_test");
+
+    unregisterServerAdapter("external_test");
+    expect(isConversationAdapter("external_test")).toBe(false);
+    expect(conversationAdapterTypes()).not.toContain("external_test");
+  });
+
+  it("keeps the built-in conversation adapters unchanged", () => {
+    registerServerAdapter({ ...externalAdapter, supportsConversationContinuation: true });
+    for (const type of CONVERSATION_ADAPTER_TYPES) {
+      expect(isConversationAdapter(type)).toBe(true);
+    }
+    expect(isConversationAdapter("process")).toBe(false);
+    expect(isConversationAdapter("http")).toBe(false);
+    expect(conversationAdapterTypes().filter((type) => type === "opencode_local")).toHaveLength(1);
   });
 
   it("built-in claude_local adapter declares capability flags", () => {
