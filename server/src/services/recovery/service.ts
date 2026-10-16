@@ -383,9 +383,14 @@ function readRecoveryRunErrorFamily(latestRun: LatestIssueRun) {
 function isProviderQuotaRecovery(latestRun: LatestIssueRun) {
   if (latestRun?.errorCode === "provider_quota") return true;
   if (readRecoveryRunErrorFamily(latestRun) === "provider_quota") return true;
-  if (latestRun?.errorCode !== "adapter_failed") return false;
-  return /(?:usage|rate|quota) limit|you(?:'|’)ve hit your (?:\w+ )?limit|quota (?:exceeded|reset)|try again after/i.test(
-    latestRun.error ?? "",
+  if (
+    latestRun?.errorCode !== "adapter_failed" &&
+    !OPENCLAW_GATEWAY_FAILURE_ERROR_CODES.has(latestRun?.errorCode ?? "")
+  ) {
+    return false;
+  }
+  return /(?:usage|rate|quota) limit|you(?:'|’)ve hit your (?:\w+ )?limit|quota (?:exceeded|reset)|try again after|daily free limit reached/i.test(
+    latestRun?.error ?? "",
   );
 }
 
@@ -525,6 +530,17 @@ const NON_RETRYABLE_CONTINUATION_ERROR_CODES = new Set<string>([
 const CONTINUATION_WAITING_ON_REVIEW_ERROR_CODE =
   "issue_continuation_waiting_on_review";
 const INTERACTION_CONTINUATION_REQUEUE_MAX_ATTEMPTS = 3;
+// Isol8 fork: sentinel for summarizeRecentContinuationRetries — count every
+// unsuccessful terminal continuation run regardless of its error code. The
+// accepted-interaction requeue backoff needs the full failure streak; matching
+// a single code would reset the streak whenever the failure mode alternates.
+const ANY_CONTINUATION_ERROR_CODE = Symbol("any_continuation_error_code");
+// Isol8 fork: backoff schedule for accepted-interaction requeues whose runs
+// keep failing. Never a hard stop — an accepted interaction must eventually
+// execute — but each consecutive failure doubles the wait, bounded at 1 hour,
+// so a sick container costs ~24 retry runs/day instead of one per tick.
+const INTERACTION_CONTINUATION_RETRY_BASE_BACKOFF_MS = 5 * 60 * 1000;
+const INTERACTION_CONTINUATION_RETRY_MAX_BACKOFF_MS = 60 * 60 * 1000;
 
 const CONTINUATION_RECOVERY_TRANSIENT_MAX_ATTEMPTS = 3;
 const CONTINUATION_RECOVERY_DEFAULT_MAX_ATTEMPTS = 1;
@@ -532,7 +548,27 @@ const CONTINUATION_RECOVERY_TRANSIENT_BASE_BACKOFF_MS = 60_000;
 export const PROVIDER_QUOTA_RECOVERY_DEFAULT_BACKOFF_MS = 60 * 60 * 1000;
 
 const PROVIDER_QUOTA_ERROR_RE =
-  /(?:you(?:'|’)ve hit your (?:\w+ )?limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity)/i;
+  /(?:you(?:'|’)ve hit your (?:\w+ )?limit|usage limit(?: reached| exceeded)?|provider quota|quota (?:limit )?exceeded|model (?:is )?at capacity|daily free limit reached)/i;
+
+// A hard per-UTC-day budget cap (e.g. an upstream gate's "daily free limit
+// reached — resets at midnight UTC" denial). The message itself states the
+// reset, so recovery parks precisely at the next UTC midnight instead of the
+// generic quota backoff.
+const DAILY_BUDGET_CAP_ERROR_RE = /daily free limit reached/i;
+
+// The openclaw-gateway adapter classifies daily-cap denials itself (errorCode
+// "provider_quota" + retryNotBefore), but runs recorded by older adapter builds
+// still carry the raw gateway error codes with the denial text only in the
+// message. Let those reach the conservative provider-quota text matching so
+// they park too instead of re-waking into the hard cap.
+const OPENCLAW_GATEWAY_FAILURE_ERROR_CODES = new Set([
+  "openclaw_gateway_agent_error",
+  "openclaw_gateway_wait_error",
+]);
+
+function nextUtcMidnight(now: Date): Date {
+  return new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), now.getUTCDate() + 1));
+}
 const CONFIGURATION_INCOMPLETE_ERROR_RE =
   /(?:model_not_found|model [^\n]{0,120} not found|missing (?:api )?(?:key|credentials?)|credentials? (?:are |is )?missing|no (?:api )?(?:key|credentials?) (?:was |were )?(?:found|configured|provided)|api key (?:is )?(?:not set|unavailable))/i;
 
@@ -630,10 +666,12 @@ export function classifyAdapterFailureForRecovery(
   if (latestRun.errorCode === "adapter_engine_unavailable" || latestRun.errorCode === "provider_tool_definition_invalid" || latestRun.errorCode === "native_provider_model_rejected") {
     return { kind: "configuration_incomplete" };
   }
+  const gatewayFailure = OPENCLAW_GATEWAY_FAILURE_ERROR_CODES.has(latestRun.errorCode ?? "");
   if (
     latestRun.errorCode !== "adapter_failed" &&
     latestRun.errorCode !== "provider_quota" &&
-    latestRun.errorCode !== "configuration_incomplete"
+    latestRun.errorCode !== "configuration_incomplete" &&
+    !gatewayFailure
   ) {
     return null;
   }
@@ -644,8 +682,9 @@ export function classifyAdapterFailureForRecovery(
     JSON.stringify(resultJson),
   ].join("\n");
   if (
-    latestRun.errorCode === "configuration_incomplete" ||
-    CONFIGURATION_INCOMPLETE_ERROR_RE.test(error)
+    !gatewayFailure &&
+    (latestRun.errorCode === "configuration_incomplete" ||
+      CONFIGURATION_INCOMPLETE_ERROR_RE.test(error))
   ) {
     return { kind: "configuration_incomplete" };
   }
@@ -681,6 +720,9 @@ export function classifyAdapterFailureForRecovery(
       retryAt: parsedClockReset,
       parsedResetTime: true,
     };
+  }
+  if (DAILY_BUDGET_CAP_ERROR_RE.test(error)) {
+    return { kind: "provider_quota", retryAt: nextUtcMidnight(now), parsedResetTime: true };
   }
   return {
     kind: "provider_quota",
@@ -1014,7 +1056,7 @@ export function recoveryService(
     companyId: string,
     issueId: string,
     agentId: string,
-    errorCodeToMatch: string | null,
+    errorCodeToMatch: string | null | typeof ANY_CONTINUATION_ERROR_CODE,
     since: Date | null = null,
   ) {
     const rows = await db
@@ -1058,9 +1100,11 @@ export function recoveryService(
         break;
       }
 
-      const rowErrorCode = readNonEmptyString(row.errorCode);
-      if (errorCodeToMatch !== rowErrorCode) {
-        break;
+      if (errorCodeToMatch !== ANY_CONTINUATION_ERROR_CODE) {
+        const rowErrorCode = readNonEmptyString(row.errorCode);
+        if (errorCodeToMatch !== rowErrorCode) {
+          break;
+        }
       }
 
       consecutive += 1;
@@ -2126,6 +2170,11 @@ export function recoveryService(
         identifier: issues.identifier,
         status: issues.status,
         createdByAgentId: issues.createdByAgentId,
+        blockedAssigneeAgentId: sql<string | null>`(
+          select blocked_issue.assignee_agent_id
+          from issues blocked_issue
+          where blocked_issue.id = ${issueRelations.relatedIssueId}
+        )`,
       })
       .from(issueRelations)
       .innerJoin(issues, eq(issueRelations.issueId, issues.id))
@@ -2148,8 +2197,17 @@ export function recoveryService(
 
     let assigned = 0;
     let skipped = 0;
+    let needingBoardOwner = 0;
     const issueIds: string[] = [];
     const seen = new Set<string>();
+    // A blocker created by the very agent it blocks is that agent declaring
+    // "I cannot do this". Handing it back re-runs the agent, which files
+    // another unassigned blocker, which the next tick hands back — forever.
+    const createdByBlockedAssignee = new Set(
+      candidates
+        .filter((row) => row.createdByAgentId && row.createdByAgentId === row.blockedAssigneeAgentId)
+        .map((row) => row.id),
+    );
 
     for (const candidate of candidates) {
       if (seen.has(candidate.id)) continue;
@@ -2158,6 +2216,11 @@ export function recoveryService(
       const creatorAgentId = candidate.createdByAgentId;
       if (!creatorAgentId) {
         skipped += 1;
+        continue;
+      }
+      if (createdByBlockedAssignee.has(candidate.id)) {
+        needingBoardOwner += 1;
+        await ensureOrphanBlockerNeedsBoardOwnerComment(candidate);
         continue;
       }
       const creatorAgent = await getAgent(creatorAgentId);
@@ -2242,7 +2305,57 @@ export function recoveryService(
       }
     }
 
-    return { assigned, skipped, issueIds };
+    return { assigned, skipped, needingBoardOwner, issueIds };
+  }
+
+  async function ensureOrphanBlockerNeedsBoardOwnerComment(candidate: {
+    id: string;
+    companyId: string;
+    identifier: string | null;
+  }) {
+    const source = "recovery.orphan_blocker_needs_board_owner";
+    const [prior] = await db
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.companyId, candidate.companyId),
+          eq(activityLog.entityType, "issue"),
+          eq(activityLog.entityId, candidate.id),
+          sql`${activityLog.details} ->> 'source' = ${source}`,
+        ),
+      )
+      .limit(1);
+    if (prior) return;
+
+    const relations = await issuesSvc.getRelationSummaries(candidate.id);
+    const blockingLinks = formatIssueLinksForComment(relations.blocks);
+    await issuesSvc.addComment(
+      candidate.id,
+      [
+        "## Orphan Blocker Needs a Board Owner",
+        "",
+        `Paperclip found this issue is blocking ${blockingLinks} but has no assignee.`,
+        "",
+        "- It was created by the agent assigned to the work it blocks, so that agent has already said it cannot resolve it. Paperclip will not hand it back.",
+        "- Next action: assign a human owner, or add an approval card on the blocked issue so a board operator can unblock it.",
+      ].join("\n"),
+      {},
+    );
+    await logActivity(db, {
+      companyId: candidate.companyId,
+      actorType: "system",
+      actorId: "system",
+      agentId: null,
+      runId: null,
+      action: "issue.orphan_blocker_needs_board_owner",
+      entityType: "issue",
+      entityId: candidate.id,
+      details: {
+        identifier: candidate.identifier,
+        source,
+      },
+    });
   }
 
   async function getCompanyIssuePrefix(companyId: string) {
@@ -4356,6 +4469,7 @@ export function recoveryService(
       productiveContinuationObserved: 0,
       successfulContinuationObserved: 0,
       orphanBlockersAssigned: 0,
+      orphanBlockersNeedingBoardOwner: 0,
       successfulRunHandoffEscalated: 0,
       successfulRunHandoffRetried: 0,
       reviewParticipantRequeued: 0,
@@ -4880,6 +4994,31 @@ export function recoveryService(
               result.skipped += 1;
             }
             continue;
+          }
+
+          // An accepted interaction is a promise: keep requeueing until a run
+          // completes it. But each requeue re-dispatches a full agent run, so
+          // consecutive failures (gateway wait errors, adapter crashes — any
+          // code) stretch the retry interval exponentially up to a 1-hour
+          // ceiling instead of re-firing on every reconcile tick. The streak
+          // resets on any successful or non-continuation run.
+          const failureStreak = await summarizeRecentContinuationRetries(
+            issue.companyId,
+            issue.id,
+            agentId,
+            ANY_CONTINUATION_ERROR_CODE,
+            acceptedInteractionResolvedAt,
+          );
+          if (failureStreak.consecutive > 0 && failureStreak.latestFinishedAt) {
+            const requiredDelayMs = Math.min(
+              INTERACTION_CONTINUATION_RETRY_BASE_BACKOFF_MS *
+                Math.pow(2, Math.max(0, failureStreak.consecutive - 1)),
+              INTERACTION_CONTINUATION_RETRY_MAX_BACKOFF_MS,
+            );
+            if (Date.now() - failureStreak.latestFinishedAt.getTime() < requiredDelayMs) {
+              result.skipped += 1;
+              continue;
+            }
           }
 
           const queued = await enqueueStrandedIssueRecovery({
@@ -5521,6 +5660,7 @@ export function recoveryService(
 
     const orphanBlockerRecovery = await reconcileUnassignedBlockingIssues();
     result.orphanBlockersAssigned = orphanBlockerRecovery.assigned;
+    result.orphanBlockersNeedingBoardOwner = orphanBlockerRecovery.needingBoardOwner;
     result.skipped += orphanBlockerRecovery.skipped;
     result.issueIds.push(...orphanBlockerRecovery.issueIds);
 

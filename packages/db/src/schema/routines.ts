@@ -18,7 +18,13 @@ import { projects } from "./projects.js";
 import { goals } from "./goals.js";
 import { heartbeatRuns } from "./heartbeat_runs.js";
 import { folders } from "./folders.js";
-import type { RoutineEnvConfig, RoutineRevisionSnapshotV1, RoutineVariable, RoutineWebhookDelivery } from "@paperclipai/shared";
+import type {
+  IssueExecutionPolicy,
+  RoutineEnvConfig,
+  RoutineRevisionSnapshotV1,
+  RoutineVariable,
+  RoutineWebhookDelivery,
+} from "@paperclipai/shared";
 
 export const routines = pgTable(
   "routines",
@@ -36,12 +42,20 @@ export const routines = pgTable(
     status: text("status").notNull().default("active"),
     concurrencyPolicy: text("concurrency_policy").notNull().default("coalesce_if_active"),
     catchUpPolicy: text("catch_up_policy").notNull().default("skip_missed"),
+    autoPauseEnabled: boolean("auto_pause_enabled"),
+    autoPauseThreshold: integer("auto_pause_threshold"),
+    consecutiveFailureCount: integer("consecutive_failure_count").notNull().default(0),
+    autoPausedAt: timestamp("auto_paused_at", { withTimezone: true }),
+    autoPauseReason: text("auto_pause_reason"),
     activityGatePolicy: text("activity_gate_policy").notNull().default("always"),
     activityGateScope: text("activity_gate_scope").notNull().default("company"),
     originKind: text("origin_kind").notNull().default("manual"),
     originId: text("origin_id"),
     variables: jsonb("variables").$type<RoutineVariable[]>().notNull().default([]),
     env: jsonb("env").$type<RoutineEnvConfig>(),
+    // Issue executionPolicy stamped onto every run issue this routine generates.
+    // Null (the pre-existing state) means the run issue is created exactly as before.
+    executionPolicy: jsonb("execution_policy").$type<IssueExecutionPolicy>(),
     latestRevisionId: uuid("latest_revision_id"),
     latestRevisionNumber: integer("latest_revision_number").notNull().default(1),
     createdByAgentId: uuid("created_by_agent_id").references(() => agents.id, { onDelete: "set null" }),

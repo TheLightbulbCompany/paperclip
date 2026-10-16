@@ -10654,6 +10654,154 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
   });
 
+  // An accepted interaction with no successful follow-up run is requeued each
+  // reconcile tick. Consecutive failed continuation runs — with ANY error code,
+  // not just waiting-on-review cancellations — must stretch the requeue
+  // interval (exponential backoff, 1h ceiling) instead of re-firing a full
+  // agent run on every tick. The interaction is still never abandoned.
+  async function seedFailingAcceptedInteractionFixture(failedRunTimes: Date[]) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const interactionId = randomUUID();
+    const resolvedAt = new Date(Math.min(...failedRunTimes.map((at) => at.getTime())) - 5 * 60 * 1000);
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Accepted step whose continuation runs keep dying on the gateway",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      createdByAgentId: agentId,
+      resolvedByUserId: "responsible-user",
+      resolvedAt,
+      updatedAt: resolvedAt,
+      payload: { version: 1, prompt: "Run the registration step?" },
+      result: { outcome: "accepted" },
+    });
+    for (const at of failedRunTimes) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "failed",
+        errorCode: "openclaw_gateway_wait_error",
+        error: "gateway agent.wait ended without a terminal run state",
+        // Upstream now holds any failed run whose provider work may have
+        // started for operator reconciliation (legacy-execution-recovery), so
+        // the backoff path is only reachable for failures before provider work.
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          interactionId,
+          interactionStatus: "accepted",
+          retryReason: "issue_continuation_needed",
+          source: "issue.interaction_continuation_recovery",
+        },
+        startedAt: at,
+        finishedAt: at,
+        createdAt: at,
+        updatedAt: at,
+      });
+    }
+
+    return { companyId, agentId, issueId, interactionId };
+  }
+
+  it("defers the accepted-interaction requeue while the failure backoff window is open", async () => {
+    // Three consecutive failures, the latest two minutes ago: the backoff for a
+    // streak of 3 is 20 minutes, so this tick must not dispatch another run.
+    const now = Date.now();
+    const { agentId, issueId } = await seedFailingAcceptedInteractionFixture([
+      new Date(now - 15 * 60 * 1000),
+      new Date(now - 8 * 60 * 1000),
+      new Date(now - 2 * 60 * 1000),
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+
+    const issue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(3);
+  });
+
+  it("requeues the accepted interaction again once the failure backoff window has elapsed", async () => {
+    // Same streak of 3 (20-minute backoff), but the latest failure is 25
+    // minutes old: the promise resumes — one more continuation run is queued.
+    const now = Date.now();
+    const { agentId, issueId, interactionId } = await seedFailingAcceptedInteractionFixture([
+      new Date(now - 45 * 60 * 1000),
+      new Date(now - 35 * 60 * 1000),
+      new Date(now - 25 * 60 * 1000),
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runs = await db
+      .select({ status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(4);
+    const recoveryRun = runs.find((row) => row.status !== "failed");
+    expect(recoveryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      interactionId,
+      source: "issue.interaction_continuation_recovery",
+    });
+  });
+
   // Scenario 3 (restart durability): a bounded continuation retry scheduled
   // before a server restart survives it. Promotion is DB-driven (scheduled_retry rows +
   // promoteDueScheduledRetries), not an in-memory setTimeout — so a brand-new heartbeat
@@ -11082,6 +11230,167 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     if (runId) {
       await waitForRunToSettle(heartbeat, runId);
     }
+  });
+
+  async function seedOrphanBlockerFixture(input: {
+    blockedAssignees: string[];
+  }) {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values(
+      [
+        { id: creatorAgentId, name: "Forge" },
+        { id: otherAgentId, name: "Other" },
+      ].map((agent) => ({
+        ...agent,
+        companyId,
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      })),
+    );
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Unblock Forge",
+      status: "todo",
+      priority: "high",
+      createdByAgentId: creatorAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    const blockedIssueIds: string[] = [];
+    for (const [index, assignee] of input.blockedAssignees.entries()) {
+      const blockedIssueId = randomUUID();
+      blockedIssueIds.push(blockedIssueId);
+      await db.insert(issues).values({
+        id: blockedIssueId,
+        companyId,
+        title: `Blocked work ${index + 1}`,
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: assignee === "creator" ? creatorAgentId : otherAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: index + 2,
+        identifier: `${issuePrefix}-${index + 2}`,
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+        createdByAgentId: creatorAgentId,
+      });
+    }
+    return { companyId, creatorAgentId, otherAgentId, blockerIssueId, blockedIssueIds, issuePrefix };
+  }
+
+  it("never hands an orphan blocker back to the assignee it blocks", async () => {
+    const { creatorAgentId, blockerIssueId, issuePrefix } = await seedOrphanBlockerFixture({
+      blockedAssignees: ["creator"],
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.orphanBlockersAssigned).toBe(0);
+    expect(first.orphanBlockersNeedingBoardOwner).toBe(1);
+    expect(first.issueIds).not.toContain(blockerIssueId);
+
+    const blocker = await db.select().from(issues).where(eq(issues.id, blockerIssueId)).then((rows) => rows[0]);
+    expect(blocker?.assigneeAgentId).toBeNull();
+
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId));
+    expect(wakeups).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Orphan Blocker Needs a Board Owner");
+    expect(comments[0]?.body).toContain(`[${issuePrefix}-2](/${issuePrefix}/issues/${issuePrefix}-2)`);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, blockerIssueId),
+          sql`${activityLog.details} ->> 'source' = 'recovery.orphan_blocker_needs_board_owner'`,
+        ),
+      );
+    expect(activities).toHaveLength(1);
+
+    // Second tick: still skipped, nothing new posted.
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.orphanBlockersAssigned).toBe(0);
+    expect(second.orphanBlockersNeedingBoardOwner).toBe(1);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId))).toHaveLength(1);
+    expect(
+      await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, blockerIssueId),
+            sql`${activityLog.details} ->> 'source' = 'recovery.orphan_blocker_needs_board_owner'`,
+          ),
+        ),
+    ).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId))).toHaveLength(0);
+  });
+
+  it("still reassigns an orphan blocker whose creator is not the blocked assignee", async () => {
+    const { creatorAgentId, blockerIssueId } = await seedOrphanBlockerFixture({
+      blockedAssignees: ["other"],
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.orphanBlockersAssigned).toBe(1);
+    expect(result.orphanBlockersNeedingBoardOwner).toBe(0);
+
+    const blocker = await db.select().from(issues).where(eq(issues.id, blockerIssueId)).then((rows) => rows[0]);
+    expect(blocker?.assigneeAgentId).toBe(creatorAgentId);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Assigned Orphan Blocker");
+
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId));
+    expect(wakeups).toHaveLength(1);
+    const runId = wakeups[0]?.runId;
+    if (runId) {
+      await waitForRunToSettle(heartbeat, runId);
+    }
+  });
+
+  it("treats a blocker of several issues as needing a board owner when any is assigned to its creator", async () => {
+    const { creatorAgentId, blockerIssueId } = await seedOrphanBlockerFixture({
+      blockedAssignees: ["other", "creator"],
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.orphanBlockersAssigned).toBe(0);
+    expect(result.orphanBlockersNeedingBoardOwner).toBe(1);
+
+    const blocker = await db.select().from(issues).where(eq(issues.id, blockerIssueId)).then((rows) => rows[0]);
+    expect(blocker?.assigneeAgentId).toBeNull();
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Orphan Blocker Needs a Board Owner");
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId))).toHaveLength(0);
   });
 
   it("re-enqueues continuation for stranded in-progress work with no active run", async () => {

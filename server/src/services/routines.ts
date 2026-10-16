@@ -32,6 +32,7 @@ import {
 import type {
   CreateRoutine,
   CreateRoutineTrigger,
+  IssueExecutionPolicy,
   Routine,
   RoutineDetail,
   RoutineDescriptionDocument,
@@ -60,11 +61,12 @@ import {
   syncRoutineVariablesWithTemplate,
 } from "@paperclipai/shared";
 import { trackRoutineRun } from "@paperclipai/shared/telemetry";
-import { conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
+import { badRequest, conflict, forbidden, notFound, unauthorized, unprocessable } from "../errors.js";
 import { logger } from "../middleware/logger.js";
 import { getTelemetryClient } from "../telemetry.js";
 import { getConfiguredSecretProvider } from "../secrets/configured-provider.js";
 import { issueService } from "./issues.js";
+import { normalizeIssueExecutionPolicy } from "./issue-execution-policy.js";
 import { assertAssignableAgent } from "./agent-assignability.js";
 import { visibleIssueCondition } from "./issue-visibility.js";
 import { secretService } from "./secrets.js";
@@ -79,6 +81,7 @@ import {
 } from "./instance-settings.js";
 import { queueIssueAssignmentWakeup, type IssueAssignmentWakeupDeps } from "./issue-assignment-wakeup.js";
 import { logActivity } from "./activity-log.js";
+import { applyRoutineOutcome } from "./routine-circuit-breaker.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { runtimePublicOrigin } from "./cloud-runtime-identity.js";
 
@@ -413,6 +416,53 @@ function assertScheduleCompatibleVariables(variables: RoutineVariable[]) {
   }
 }
 
+// Agent actors (per-agent API keys) may tighten webhook trigger auth but never
+// weaken it: the fire URL is public, so signing_mode "none" or an oversized
+// replay window leaves publicId entropy as the only auth. Human/board actors
+// are unrestricted. A null/undefined signingMode verifies as hmac_sha256 at
+// fire time, so it ranks strongest.
+const WEBHOOK_SIGNING_STRENGTH: Record<string, number> = {
+  none: 0,
+  bearer: 1,
+  hmac_sha256: 2,
+  github_hmac: 2,
+  // Upstream's signed provider modes (app webhook signature, Fireflies HMAC).
+  app_webhook: 2,
+  fireflies_hmac: 2,
+  // SHA-1 is what some providers still sign with (Vercel, Intercom); as an
+  // HMAC it remains collision-irrelevant, so it ranks with the other MACs.
+  hmac_sha1: 2,
+};
+const WEBHOOK_REPLAY_WINDOW_DEFAULT_SEC = 300;
+
+function assertAgentCannotWeakenWebhookAuth(
+  actor: Actor,
+  next: { signingMode?: string | null; replayWindowSec?: number | null },
+  existing?: { signingMode: string | null; replayWindowSec: number | null },
+) {
+  if (!actor.agentId) return;
+  const strength = (mode: string | null | undefined) =>
+    WEBHOOK_SIGNING_STRENGTH[mode ?? "hmac_sha256"] ?? 0;
+  if (next.signingMode !== undefined) {
+    const weakens = existing
+      ? strength(next.signingMode) < strength(existing.signingMode)
+      : next.signingMode === "none";
+    if (weakens) {
+      throw badRequest("Agents cannot weaken webhook trigger signing", {
+        code: "agent_cannot_weaken_trigger_auth",
+        field: "signingMode",
+      });
+    }
+  }
+  const maxReplayWindowSec = Math.max(WEBHOOK_REPLAY_WINDOW_DEFAULT_SEC, existing?.replayWindowSec ?? 0);
+  if (next.replayWindowSec != null && next.replayWindowSec > maxReplayWindowSec) {
+    throw badRequest("Agents cannot extend the webhook replay window beyond the default", {
+      code: "agent_cannot_weaken_trigger_auth",
+      field: "replayWindowSec",
+    });
+  }
+}
+
 function statusRequiresDefaultAgent(status: string) {
   return status === "active";
 }
@@ -572,6 +622,10 @@ function routineRevisionSnapshotRoutine(routine: RoutineRow): RoutineRevisionSna
     variables: routine.variables ?? [],
     env: routine.env ?? null,
     responsibleUserId: routine.responsibleUserId ?? null,
+    // Spread, not `?? null`: a policy-less routine must serialize exactly as it
+    // did before this field existed, or `snapshotsMatch` reports every stored
+    // revision as changed and the next edit mints a spurious revision.
+    ...(routine.executionPolicy ? { executionPolicy: routine.executionPolicy } : {}),
   };
 }
 
@@ -607,8 +661,25 @@ async function buildRoutineRevisionSnapshot(
   };
 }
 
+// Key-order-insensitive: one side of a snapshot compare is often a fresh JS
+// object (normalizer insertion order) and the other a Postgres jsonb round-trip
+// (jsonb sorts keys), so raw JSON.stringify reports every echoed-back policy as
+// changed — minting a revision, and a 409, on every GET→PATCH echo. Arrays keep
+// their order; only object keys are sorted.
+function sortKeysDeep(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(sortKeysDeep);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0))
+        .map(([key, entry]) => [key, sortKeysDeep(entry)]),
+    );
+  }
+  return value;
+}
+
 function canonicalSnapshot(value: RoutineRevisionSnapshotV1) {
-  return JSON.stringify(value);
+  return JSON.stringify(sortKeysDeep(value));
 }
 
 function snapshotsMatch(left: RoutineRevisionSnapshotV1, right: RoutineRevisionSnapshotV1) {
@@ -1030,6 +1101,52 @@ export function routineService(
       .then((rows) => rows[0] ?? null);
     if (!project) throw notFound("Project not found");
     if (project.companyId !== companyId) throw unprocessable("Project must belong to same company");
+  }
+
+  /**
+   * Validate + canonicalize the issue execution policy a routine stamps onto
+   * every run issue it generates.
+   *
+   * Shape validation is `normalizeIssueExecutionPolicy` — the same function the
+   * issue routes use, so a routine policy and a hand-set issue policy are
+   * byte-identical once stored. On top of that, every agent reviewer/approver
+   * is put through `assertAssignableAgent`, which is what rejects an agent from
+   * another company (or a terminated / unapproved one) everywhere else.
+   *
+   * Returns null for a policy-less routine, which is the pre-existing state.
+   */
+  async function normalizeRoutineExecutionPolicy(
+    companyId: string,
+    input: unknown,
+    executor: Db = db,
+  ): Promise<IssueExecutionPolicy | null> {
+    const policy = normalizeIssueExecutionPolicy(input ?? null);
+    if (!policy) return null;
+    if (policy.monitor) {
+      // A monitor can only attach to an in_progress/in_review issue, and every
+      // routine run issue is born "todo" — a stored monitor would make
+      // buildInitialIssueMonitorFields throw on EVERY dispatch, fail-looping
+      // the routine into an auto-pause. Reject up front rather than stripping
+      // silently: the saver should know the monitor will not be honored.
+      throw unprocessable("Routine execution policies cannot schedule a monitor", {
+        field: "executionPolicy.monitor",
+      });
+    }
+    for (const stage of policy.stages) {
+      for (const participant of stage.participants) {
+        if (participant.type !== "agent") {
+          // ponytail: v1 restriction — agent participants only. No membership
+          // check exists on this path, so a typo'd or departed userId would
+          // pass save and park every generated run in_review forever. Lift
+          // when user participants can be validated like agents are.
+          throw unprocessable("Routine execution policies support agent participants only", {
+            field: "executionPolicy.stages.participants",
+          });
+        }
+        await assertAssignableAgent(executor, companyId, participant.agentId, { kind: "work" });
+      }
+    }
+    return policy;
   }
 
   async function assertGoal(companyId: string, goalId: string) {
@@ -1882,6 +1999,25 @@ export function routineService(
 
       let createdIssue: Awaited<ReturnType<typeof issueSvc.create>> | null = null;
       try {
+        // Reviewers are as long-lived as the default agent and go stale the same
+        // way, so revalidate the STORED policy rather than forwarding it blind:
+        // a reviewer terminated since the routine was saved would otherwise be
+        // stamped onto an issue that can never leave review.
+        //
+        // Deliberately fails the run rather than dropping the dead stage and
+        // running unreviewed — silently shipping work the owner gated on review
+        // is the worse, and invisible, failure.
+        //
+        // Deliberately INSIDE this try, not beside the default-agent check
+        // before the transaction. The catch below is what persists the failed
+        // run and increments the circuit breaker, so throwing earlier would
+        // fail silently: no run row, no breaker tick. Worse, on a scheduled
+        // tick `nextRunAt` has already been advanced and an escaping rejection
+        // aborts every remaining due routine in that tick.
+        //
+        // It also sits AFTER the coalesce/skip return below, because those
+        // paths mint no issue and so need no reviewer — a dead reviewer must
+        // not turn a run that would have coalesced into a failure.
         const activeIssue = await findLiveExecutionIssue(input.routine, txDb, dispatchFingerprint, {
           kind: issueOriginKind,
           id: issueOriginId,
@@ -1913,6 +2049,12 @@ export function routineService(
           return updated ?? createdRun;
         }
 
+        const executionPolicy = await normalizeRoutineExecutionPolicy(
+          input.routine.companyId,
+          input.routine.executionPolicy ?? null,
+          txDb,
+        );
+
         try {
           createdIssue = await issueSvc.create(input.routine.companyId, {
             projectId,
@@ -1936,6 +2078,14 @@ export function routineService(
             executionWorkspaceId: input.executionWorkspaceId ?? null,
             executionWorkspacePreference: input.executionWorkspacePreference ?? null,
             executionWorkspaceSettings: input.executionWorkspaceSettings ?? null,
+            // Spread, not `?? null`: a policy-less routine must hand issueSvc.create
+            // exactly the input it got before this field existed.
+            // Cast because the issues.execution_policy column is typed as the
+            // open `Record<string, unknown>` jsonb, not the IssueExecutionPolicy
+            // interface (which has no index signature).
+            ...(executionPolicy
+              ? { executionPolicy: executionPolicy as unknown as Record<string, unknown> }
+              : {}),
           });
         } catch (error) {
           const isOpenExecutionConflict =
@@ -2020,6 +2170,9 @@ export function routineService(
           status: "failed",
           nextRunAt,
         }, txDb);
+        // Dispatch-time failure (issue creation threw): no issue exists to
+        // transition, so count the routine failure directly here.
+        if (failed) await applyRoutineOutcome(txDb, failed.routineId, failed.companyId, "failed");
         return failed ?? createdRun;
       }
     });
@@ -2210,6 +2363,7 @@ export function routineService(
       await assertProject(companyId, input.projectId ?? null);
       await assertRoutineFolder(companyId, input.folderId ?? null);
       await assertAssignableAgent(db, companyId, input.assigneeAgentId ?? null, { kind: "routine" });
+      const executionPolicy = await normalizeRoutineExecutionPolicy(companyId, input.executionPolicy ?? null);
       if (input.goalId) await assertGoal(companyId, input.goalId);
       if (input.parentIssueId) await assertParentIssue(companyId, input.parentIssueId);
       const env = input.env === undefined || input.env === null
@@ -2249,6 +2403,7 @@ export function routineService(
             activityGateScope: input.activityGateScope ?? "company",
             variables,
             env,
+            executionPolicy,
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
@@ -2288,9 +2443,29 @@ export function routineService(
               strictMode: process.env.PAPERCLIP_SECRETS_STRICT_MODE === "true",
               fieldPath: "env",
             });
+      // Same posture as assertAgentCannotWeakenWebhookAuth: the review gate is
+      // the owner's control over the agent's output, so the assignee agent must
+      // not be able to remove (or rewrite) it on its own routine. Board/user
+      // actors are unrestricted; setting AND clearing are both blocked because
+      // a swap to a friendlier reviewer weakens the gate as surely as null.
+      if (actor.agentId && patch.executionPolicy !== undefined) {
+        throw forbidden("Agents cannot modify routine execution policies", {
+          code: "agent_cannot_modify_execution_policy",
+        });
+      }
+      const nextExecutionPolicy = patch.executionPolicy === undefined
+        ? undefined
+        : await normalizeRoutineExecutionPolicy(existing.companyId, patch.executionPolicy);
       const requestedStatus = patch.status ?? existing.status;
       if (patch.status === "active") {
         assertRoutineCanEnable(patch.status, nextAssigneeAgentId);
+        // Re-enabling puts the stored policy back in force, and its reviewers
+        // may have died while the routine was paused — the assignee gets
+        // revalidated below, so the reviewers must be too, or the routine
+        // re-enables straight into a dispatch fail-loop.
+        if (patch.executionPolicy === undefined && existing.executionPolicy) {
+          await normalizeRoutineExecutionPolicy(existing.companyId, existing.executionPolicy);
+        }
       }
       const nextStatus = patch.assigneeAgentId === undefined
         ? requestedStatus
@@ -2365,6 +2540,7 @@ export function routineService(
           activityGateScope: patch.activityGateScope ?? locked.activityGateScope,
           variables: nextVariables,
           env: nextEnv,
+          executionPolicy: nextExecutionPolicy === undefined ? locked.executionPolicy : nextExecutionPolicy,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
@@ -2372,6 +2548,19 @@ export function routineService(
 
         const folderChanged = patch.folderId !== undefined && locked.folderId !== candidate.folderId;
         if (locked.latestRevisionId && routineCurrentFieldsMatch(locked, candidate)) {
+          // Same repair the snapshot-match no-op below performs: an echoed env
+          // must still re-sync secret bindings (drift repair). This guard used
+          // to be unreachable for echoed jsonb because the raw stringify never
+          // matched key order; now that the compare is canonical it is the
+          // common no-op path, so it must not skip the sync.
+          if (patch.env !== undefined) {
+            await secretsSvc.syncEnvBindingsForTarget(
+              locked.companyId,
+              { targetType: "routine", targetId: locked.id },
+              candidate.env,
+              { db: tx },
+            );
+          }
           if (!folderChanged) return locked;
           const [updated] = await txDb
             .update(routines)
@@ -2387,6 +2576,13 @@ export function routineService(
         }
 
         const nextSnapshot = await buildRoutineRevisionSnapshot(txDb, candidate);
+        // Isol8: the row differs from the candidate (checked above) but the
+        // candidate equals the latest revision — the row drifted from its own
+        // revision through a direct write (built-in bundle reconcile writes
+        // origin fields directly; tests drift titles). Repair the row without
+        // minting a duplicate revision. Upstream reached the repair only by
+        // accident: its key-order-sensitive compare never matched jsonb.
+        let revisionUnchanged = false;
         if (locked.latestRevisionId) {
           const latestRevision = await txDb
             .select({ snapshot: routineRevisions.snapshot })
@@ -2399,17 +2595,9 @@ export function routineService(
               ),
             )
             .then((rows) => rows[0] ?? null);
-          if (latestRevision && snapshotsMatch(nextSnapshot, latestRevision.snapshot as RoutineRevisionSnapshotV1)) {
-            if (patch.env !== undefined) {
-              await secretsSvc.syncEnvBindingsForTarget(
-                locked.companyId,
-                { targetType: "routine", targetId: locked.id },
-                candidate.env,
-                { db: tx },
-              );
-            }
-            return locked;
-          }
+          revisionUnchanged = Boolean(
+            latestRevision && snapshotsMatch(nextSnapshot, latestRevision.snapshot as RoutineRevisionSnapshotV1),
+          );
         }
 
         const [updated] = await txDb
@@ -2424,12 +2612,18 @@ export function routineService(
             assigneeAgentId: candidate.assigneeAgentId,
             priority: candidate.priority,
             status: candidate.status,
+            // Resume from a circuit-breaker pause: clear failure state when an
+            // operator re-enables a paused routine so it starts fresh.
+            ...(locked.status === "paused" && candidate.status === "active"
+              ? { consecutiveFailureCount: 0, autoPausedAt: null, autoPauseReason: null }
+              : {}),
             concurrencyPolicy: candidate.concurrencyPolicy,
             catchUpPolicy: candidate.catchUpPolicy,
             activityGatePolicy: candidate.activityGatePolicy,
             activityGateScope: candidate.activityGateScope,
             variables: candidate.variables,
             env: candidate.env,
+            executionPolicy: candidate.executionPolicy,
             responsibleUserId: candidate.responsibleUserId,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
@@ -2438,9 +2632,9 @@ export function routineService(
           .where(eq(routines.id, id))
           .returning();
         if (!updated) return null;
-        const { routine } = await appendRoutineRevision(txDb, updated, actor, {
-          changeSummary: "Updated routine",
-        });
+        const routine = revisionUnchanged
+          ? updated
+          : (await appendRoutineRevision(txDb, updated, actor, { changeSummary: "Updated routine" })).routine;
         if (patch.env !== undefined) {
           await secretsSvc.syncEnvBindingsForTarget(
             routine.companyId,
@@ -2461,6 +2655,10 @@ export function routineService(
     ): Promise<{ trigger: RoutineTrigger; secretMaterial: RoutineTriggerSecretMaterial | null; revision: RoutineRevision }> => {
       const routine = await getRoutineById(routineId);
       if (!routine) throw notFound("Routine not found");
+
+      if (input.kind === "webhook") {
+        assertAgentCannotWeakenWebhookAuth(actor, input);
+      }
 
       let secretMaterial: RoutineTriggerSecretMaterial | null = null;
       let secretId: string | null = null;
@@ -2563,18 +2761,30 @@ export function routineService(
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
         await tx.execute(sql`select id from ${routines} where ${routines.id} = ${existing.routineId} for update`);
+        // Re-read under the routine lock: validating against the pre-lock row
+        // would let two overlapping patches leapfrog the weaken check, and
+        // stale fallbacks would silently revert a concurrent tighten.
+        const fresh = await txDb
+          .select()
+          .from(routineTriggers)
+          .where(eq(routineTriggers.id, id))
+          .then((rows) => rows[0] ?? null);
+        if (!fresh) return null;
+        if (fresh.kind === "webhook") {
+          assertAgentCannotWeakenWebhookAuth(actor, patch, fresh);
+        }
         const [updated] = await txDb
           .update(routineTriggers)
           .set({
-            label: patch.label === undefined ? existing.label : patch.label,
-            enabled: patch.enabled ?? existing.enabled,
+            label: patch.label === undefined ? fresh.label : patch.label,
+            enabled: patch.enabled ?? fresh.enabled,
             ...(patch.setupPending === false ? { setupPending: false } : {}),
             ...(patch.archived !== undefined ? { archived: patch.archived } : {}),
             cronExpression,
             timezone,
             nextRunAt,
-            signingMode: patch.signingMode === undefined ? existing.signingMode : patch.signingMode,
-            replayWindowSec: patch.replayWindowSec === undefined ? existing.replayWindowSec : patch.replayWindowSec,
+            signingMode: patch.signingMode === undefined ? fresh.signingMode : patch.signingMode,
+            replayWindowSec: patch.replayWindowSec === undefined ? fresh.replayWindowSec : patch.replayWindowSec,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: new Date(),
@@ -2630,6 +2840,7 @@ export function routineService(
     rotateTriggerSecret: async (
       id: string,
       actor: Actor,
+      providedSecret?: string,
     ): Promise<{ trigger: RoutineTrigger; secretMaterial: RoutineTriggerSecretMaterial; revision: RoutineRevision }> => {
       const existing = await getTriggerById(id);
       if (!existing) throw notFound("Routine trigger not found");
@@ -2637,7 +2848,17 @@ export function routineService(
         throw unprocessable("Only webhook triggers can rotate secrets");
       }
 
-      const secretValue = crypto.randomBytes(24).toString("hex");
+      // An agent must not be able to CHOOSE a trigger's signing secret: knowing
+      // it would let the agent forge externally-signed fires of a trigger it
+      // otherwise only reaches from inside the company. Supplying a specific
+      // secret (arming a provider-imposed whsec_) is a board-only action; agents
+      // may still rotate to a fresh RANDOM secret. Same posture as the agent
+      // trigger-auth guard (#15).
+      if (providedSecret !== undefined && actor.agentId) {
+        throw unprocessable("Only board actors may set a specific webhook trigger secret");
+      }
+
+      const secretValue = providedSecret ?? crypto.randomBytes(24).toString("hex");
       await secretsSvc.rotate(existing.secretId, { value: secretValue }, actor);
       const { trigger, revision } = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
@@ -2716,6 +2937,17 @@ export function routineService(
       const snapshot = routineRevisionSnapshotSchema.parse(targetRevision.snapshot) as RoutineRevisionSnapshotV1;
       const routineSnapshot = snapshot.routine;
       await assertRestorableAssignee(existingRoutine.companyId, routineSnapshot.assigneeAgentId, actor);
+      // Same reason the assignee is checked above: an old revision can name a
+      // reviewer who has since been terminated or deleted, and restoring it
+      // would report success while installing a policy whose first generated
+      // issue cannot leave review. Re-normalizing here also strips the zod
+      // defaults `routineRevisionSnapshotSchema.parse()` applies
+      // (`maxReviewRounds: null`), which the normalizer omits — storing the
+      // parsed shape verbatim would leave a policy no other write path emits.
+      const restoredExecutionPolicy = await normalizeRoutineExecutionPolicy(
+        existingRoutine.companyId,
+        routineSnapshot.executionPolicy ?? null,
+      );
 
       const result = await db.transaction(async (tx) => {
         const txDb = tx as unknown as Db;
@@ -2772,6 +3004,7 @@ export function routineService(
             activityGateScope: routineSnapshot.activityGateScope,
             variables: routineSnapshot.variables,
             env: routineSnapshot.env,
+            executionPolicy: restoredExecutionPolicy,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,
             updatedAt: now,
@@ -2802,6 +3035,15 @@ export function routineService(
             .from(routineTriggers)
             .where(and(eq(routineTriggers.companyId, locked.companyId), eq(routineTriggers.id, triggerSnapshot.id)))
             .then((rows) => rows[0] ?? null);
+          if (triggerSnapshot.kind === "webhook") {
+            // A restore is a trigger write too: without this, an agent could
+            // resurrect an old weak-signing snapshot around the create/update guard.
+            assertAgentCannotWeakenWebhookAuth(
+              actor,
+              { signingMode: triggerSnapshot.signingMode, replayWindowSec: triggerSnapshot.replayWindowSec },
+              current?.kind === "webhook" ? current : undefined,
+            );
+          }
           const webhookSecret = recreatedWebhookSecrets.get(triggerSnapshot.id);
           const restoredNextRunAt = triggerSnapshot.kind === "schedule" && triggerSnapshot.enabled
             && triggerSnapshot.cronExpression && triggerSnapshot.timezone
@@ -2981,6 +3223,27 @@ export function routineService(
               .update(rawBody)
               .digest("hex");
             const normalizedSignature = providedSignature.replace(/^sha256=/, "");
+            const normalizedBuf = Buffer.from(normalizedSignature);
+            const expectedBuf = Buffer.from(expectedHmac);
+            const valid =
+              normalizedBuf.length === expectedBuf.length &&
+              crypto.timingSafeEqual(normalizedBuf, expectedBuf);
+            if (!valid) throw unauthorized();
+          } else if (trigger.signingMode === "hmac_sha1") {
+            // SHA-1 twin of github_hmac, for providers that sign the raw body
+            // with HMAC-SHA1 (Vercel's x-vercel-signature, Intercom's
+            // X-Hub-Signature). Same header conventions: the generic
+            // X-Paperclip-Signature (operators/proxies normalize into it) or a
+            // hub-style header, with an optional "sha1=" prefix.
+            const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
+            const rawBody = input.rawBody ?? Buffer.from(JSON.stringify(input.payload ?? {}));
+            const providedSignature = (input.signatureHeader ?? input.hubSignatureHeader)?.trim() ?? "";
+            if (!providedSignature) throw unauthorized();
+            const expectedHmac = crypto
+              .createHmac("sha1", secretValue)
+              .update(rawBody)
+              .digest("hex");
+            const normalizedSignature = providedSignature.replace(/^sha1=/, "");
             const normalizedBuf = Buffer.from(normalizedSignature);
             const expectedBuf = Buffer.from(expectedHmac);
             const valid =
@@ -3315,6 +3578,10 @@ export function routineService(
         .where(eq(issues.id, issueId))
         .then((rows) => rows[0] ?? null);
       if (!issue || issue.originKind !== "routine_execution" || !issue.originRunId) return null;
+      // NOTE: the circuit-breaker counter is NOT updated here. It fires from the
+      // issue's terminal-status transition in issuesSvc.update (the universal
+      // hook that also covers recovery-driven blocks). Counting here too would
+      // double-count the normal path. This function only finalizes the run row.
       const run = await db
         .select({
           id: routineRuns.id,

@@ -80,12 +80,25 @@ export function buildExecutionPolicy(input: {
     });
   }
 
-  if (stages.length === 0 && !monitor) return null;
+  // Carried through, never rebuilt: no form that calls this has a control for
+  // these, so rebuilding the policy without them lets an unrelated reviewer or
+  // approver edit silently delete governance that was set through the API,
+  // weakening every issue the policy subsequently gates.
+  const reviewPreset = input.existingPolicy?.reviewPreset;
+  const authorizationPolicy = input.existingPolicy?.authorizationPolicy;
+  const maxReviewRounds = input.existingPolicy?.maxReviewRounds;
+
+  // maxReviewRounds counts as content: collapsing to null here would delete an
+  // API-set round cap when the last stage/monitor is removed.
+  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy && maxReviewRounds == null) return null;
 
   return {
     mode,
     commentRequired: true,
     stages,
     ...(monitor ? { monitor } : {}),
+    ...(reviewPreset ? { reviewPreset } : {}),
+    ...(authorizationPolicy ? { authorizationPolicy } : {}),
+    ...(maxReviewRounds != null ? { maxReviewRounds } : {}),
   };
 }

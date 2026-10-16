@@ -648,7 +648,7 @@ export type RoutineActivityGateScope = (typeof ROUTINE_ACTIVITY_GATE_SCOPES)[num
 export const ROUTINE_TRIGGER_KINDS = ["schedule", "webhook", "api"] as const;
 export type RoutineTriggerKind = (typeof ROUTINE_TRIGGER_KINDS)[number];
 
-export const ROUTINE_TRIGGER_SIGNING_MODES = ["bearer", "app_webhook", "hmac_sha256", "github_hmac", "fireflies_hmac", "none"] as const;
+export const ROUTINE_TRIGGER_SIGNING_MODES = ["bearer", "app_webhook", "hmac_sha256", "github_hmac", "fireflies_hmac", "hmac_sha1", "none"] as const;
 export type RoutineTriggerSigningMode = (typeof ROUTINE_TRIGGER_SIGNING_MODES)[number];
 
 export const ROUTINE_VARIABLE_TYPES = ["text", "textarea", "number", "boolean", "select", "date"] as const;
@@ -1699,6 +1699,13 @@ export const PLUGIN_EVENT_TYPES = [
   "issue.checked_out",
   "issue.released",
   "issue.assignment_wakeup_requested",
+  // A thread interaction pauses its issue until someone answers, so an
+  // integration that notifies humans has to hear about it. Only the CREATE is
+  // exposed: accepted/rejected are the answering human's own action (the same
+  // reasoning that keeps approval.decided off notify-shaped subscriptions), and
+  // the expired activity logs no addresseeAgentId, so a subscriber could not
+  // tell an abandoned human wait from a routine agent-to-agent one.
+  "issue.thread_interaction_created",
   "agent.created",
   "agent.updated",
   "agent.status_changed",
@@ -1709,7 +1716,14 @@ export const PLUGIN_EVENT_TYPES = [
   "agent.run.cancelled",
   "goal.created",
   "goal.updated",
+  // The routine circuit breaker auto-pauses a routine after N consecutive
+  // failed runs, and nothing re-enables it without a human Resume — so an
+  // integration that notifies humans has to hear about it. The activity-log
+  // bridge forwards the breaker's payload (reason / threshold /
+  // consecutiveFailureCount) as-is.
+  "routine.auto_paused",
   "approval.created",
+  "approval.resubmitted",
   "approval.decided",
   "budget.incident.opened",
   "budget.incident.resolved",

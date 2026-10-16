@@ -61,8 +61,11 @@ export const routinesApi = {
   updateTrigger: (id: string, data: Record<string, unknown>) =>
     api.patch<RoutineTrigger>(`/routine-triggers/${id}`, data),
   deleteTrigger: (id: string) => api.delete<void>(`/routine-triggers/${id}`),
-  rotateTriggerSecret: (id: string) =>
-    api.post<RotateRoutineTriggerResponse>(`/routine-triggers/${id}/rotate-secret`, {}),
+  rotateTriggerSecret: (id: string, secret?: string) =>
+    api.post<RotateRoutineTriggerResponse>(
+      `/routine-triggers/${id}/rotate-secret`,
+      secret === undefined ? {} : { secret },
+    ),
   run: (id: string, data?: Record<string, unknown>) =>
     api.post<RoutineRun>(`/routines/${id}/run`, data ?? {}),
   activity: async (
