@@ -729,6 +729,7 @@ async function stopRun(input: {
     const stopped = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
       method: "POST",
       headers: input.headers,
+      signal: AbortSignal.timeout(STOP_GRACE_MS),
     });
     await input.ctx.onLog("stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`);
     return asRecord(stopped);
@@ -750,6 +751,8 @@ async function fetchFinalStatus(input: {
       const status = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
         method: "GET",
         headers: input.headers,
+        // isol8: a gateway that accepts the connection but never answers must not hold settlement.
+        signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
       });
       const record = asRecord(status);
       const normalized = extractStatus(status);
@@ -1051,6 +1054,9 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           status: extractStatus(finalStatus) ?? "timeout",
           last_event: state.lastEventName,
           final_status: redactForLog(finalStatus, [], 0, redactText),
+          // isol8: without a terminal Hermes status the remote turn may still run, so the
+          // server keeps its reconciliation hold instead of continuing the conversation.
+          ...(finalStatus ? {} : { remoteExecutionStopped: false }),
         },
         sessionParams: {
           hermesRunId: runId,

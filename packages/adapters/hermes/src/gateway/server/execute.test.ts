@@ -825,6 +825,32 @@ describe("execute", () => {
       proof: "hermes_gateway_terminal_cancelled",
     });
   });
+  it("keeps a timeout unconfirmed when Hermes never answers the final status", async () => {
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        return new Response(JSON.stringify({ run_id: "run-hung", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith("/stop")) {
+        return new Response(JSON.stringify({ status: "stopping" }), { status: 202 });
+      }
+      // Events and status: accept the request, never answer until aborted.
+      return new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+      });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const result = await execute(makeCtx({
+      apiBaseUrl: "http://127.0.0.1:8642",
+      apiKey: "secret-key",
+      timeoutSec: 0.001,
+      pollIntervalMs: 250,
+    }));
+
+    expect(result.errorCode).toBe("hermes_gateway_timeout");
+    expect(result.resultJson).toMatchObject({ remoteExecutionStopped: false });
+  }, 20_000);
 });
 
 describe("testEnvironment", () => {

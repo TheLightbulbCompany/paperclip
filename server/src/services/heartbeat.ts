@@ -18282,6 +18282,8 @@ export function heartbeatService(
       parseObject(result?.executionCancellation).state === "acknowledged";
     return options?.conversationContinuationEligible !== false && outcome !== "succeeded" &&
       (outcome !== "cancelled" || cancellationAcknowledged) &&
+      // isol8: a remote adapter that could not confirm its provider stopped keeps the hold.
+      result?.remoteExecutionStopped !== false &&
       isConversationAdapter(agent.adapterType)
       ? { ...result, conversationContinuation: CONVERSATION_CONTINUATION_POLICY }
       : result;
