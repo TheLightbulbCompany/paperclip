@@ -10,6 +10,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { issueService } from "../services/issues.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { deliverReconciledExecutions, markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
+import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
@@ -7752,6 +7754,53 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(await db.select().from(agentWakeupRequests).where(and(
       eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
     ))).toEqual([]);
+  });
+
+  it("a board reconciliation delivers a comment parked behind a pre-receipt hermes_gateway hold (ISOA-837 nudge)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "failed",
+      runErrorCode: "hermes_gateway_run_failed", runError: "model_unavailable",
+    });
+    const finishedAt = new Date(Date.now() - 60 * 60_000);
+    // The isol8.1 result: a Hermes terminal status, but no remoteExecutionStopped receipt.
+    await db.update(heartbeatRuns).set({ finishedAt, resultJson: { run_id: "hermes-run", status: "failed" } })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.update(agents).set({ status: "error", adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } })
+      .where(eq(agents.id, agentId));
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: agentId, cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${runId}`, nextAction: "Automatic recovery stopped.",
+      evidence: { runId, automaticRecovery: { runId, policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const heartbeat = heartbeatService(db);
+
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "Please continue" }).returning();
+    const parked = await heartbeat.wakeup(agentId, {
+      source: "automation", reason: "issue_reopened_via_comment", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId, commentId: comment!.id },
+      contextSnapshot: { issueId, commentId: comment!.id, wakeCommentId: comment!.id, wakeReason: "issue_reopened_via_comment" },
+    });
+    expect(parked).toBeNull();
+    const deferred = () => db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    expect((await deferred())[0]?.payload).toMatchObject({ executionWait: { recoveryActionId: hold!.id } });
+
+    // The board's native decision (POST /recovery-actions/resolve with executionReconciliation).
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+    await markExecutionReconciliation(db, issueRecoveryActionReadModel(hold!), {
+      runId, providerStopped: true, actionOutcome: "mixed",
+      outcomeEvidence: "Hermes reported the run failed (expired ChatGPT token); its earlier tool calls stay recorded.",
+    }, "board-user");
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    await deliverReconciledExecutions(db, heartbeat.wakeup);
+
+    await vi.waitFor(async () => {
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.some(run => run.id !== runId && JSON.stringify(run.contextSnapshot).includes(comment!.id))).toBe(true);
+    }, { timeout: 15_000 });
+    await vi.waitFor(async () => expect(await deferred()).toEqual([]), { timeout: 15_000 });
   });
 
   it.each(["dedicated deferred donor", "non-coalescing recipient", "persistent agent conversation"] as const)(
