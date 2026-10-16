@@ -1,4 +1,5 @@
 import { AgentAvatar } from "@/components/AgentAvatar";
+import { singleReviewerPolicyEditable } from "@/lib/issue-execution-policy";
 import { useMemo, useState } from "react";
 import {
   ArrowRight,
@@ -225,12 +226,12 @@ export function OverviewSection({
             }}
           />
           <span>reviewed by</span>
-          {(routine.executionPolicy?.stages.find((stage) => stage.type === "review")?.participants.length ?? 0) > 1 ? (
-            // This single-select can only express one reviewer, so saving it
-            // over an API-set multi-participant stage would silently delete the
-            // other reviewers. Render the fact read-only instead.
+          {!singleReviewerPolicyEditable(routine.executionPolicy) ? (
+            // This single-select can only express one agent reviewer, so saving
+            // it over an API-set multi-stage or multi-participant policy would
+            // silently delete the rest. Render the fact read-only instead.
             <span className="rounded bg-muted/50 px-2 py-1 text-muted-foreground">
-              Multiple reviewers (managed via API)
+              Review policy managed via API
             </span>
           ) : (
           <InlineEntitySelector

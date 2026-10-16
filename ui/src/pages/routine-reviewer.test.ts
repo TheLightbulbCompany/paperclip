@@ -75,6 +75,24 @@ describe("routine edit payload", () => {
     expect(buildEditPayload(editDraft, existing).executionPolicy).toBeNull();
   });
 
+  it("never rebuilds a policy the one-reviewer selector cannot express", () => {
+    const otherAgentId = "33333333-3333-4333-8333-333333333333";
+    const multiStage = policyWith([
+      { id: "s1", type: "review", approvalsNeeded: 1, participants: [{ id: "p1", type: "agent", agentId: reviewerAgentId, userId: null }] },
+      { id: "s2", type: "review", approvalsNeeded: 1, participants: [{ id: "p2", type: "agent", agentId: otherAgentId, userId: null }] },
+    ]);
+    const multiReviewer = policyWith([
+      { id: "s1", type: "review", approvalsNeeded: 1, participants: [
+        { id: "p1", type: "agent", agentId: reviewerAgentId, userId: null },
+        { id: "p2", type: "agent", agentId: otherAgentId, userId: null },
+      ] },
+    ]);
+    for (const existing of [multiStage, multiReviewer]) {
+      expect(buildEditPayload({ ...editDraft, reviewerAgentId: workerAgentId }, existing)).not.toHaveProperty("executionPolicy");
+      expect(buildEditPayload(editDraft, existing)).not.toHaveProperty("executionPolicy");
+    }
+  });
+
   it("keeps an approval stage this form cannot edit", () => {
     const existing = policyWith([
       { id: "stage-2", type: "approval", approvalsNeeded: 1, participants: [{ id: "p2", type: "user", agentId: null, userId: approverUserId }] },

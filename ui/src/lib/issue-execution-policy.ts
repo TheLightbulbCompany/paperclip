@@ -28,6 +28,23 @@ export function stageParticipantValues(policy: IssueExecutionPolicy | null | und
   return stage?.participants.map((participant) => selectionValueFromPrincipal(participant)) ?? [];
 }
 
+/**
+ * True when a one-reviewer selector can express the whole policy: at most one
+ * review stage with at most one agent reviewer, and at most one approval
+ * stage. Anything richer was set through the API and must not be rebuilt
+ * from that selector, which would drop the other stages and participants.
+ */
+export function singleReviewerPolicyEditable(policy: IssueExecutionPolicy | null | undefined): boolean {
+  if (!policy) return true;
+  const reviews = policy.stages.filter((stage) => stage.type === "review");
+  const approvals = policy.stages.filter((stage) => stage.type === "approval");
+  const reviewers = reviews[0]?.participants ?? [];
+  return reviews.length <= 1
+    && approvals.length <= 1
+    && reviewers.length <= 1
+    && reviewers.every((participant) => participant.type === "agent");
+}
+
 function mergeParticipants(
   existing: IssueExecutionStageParticipant[] | undefined,
   values: string[],

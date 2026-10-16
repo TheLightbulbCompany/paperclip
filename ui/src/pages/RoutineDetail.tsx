@@ -76,6 +76,7 @@ import {
   buildExecutionPolicy,
   principalFromSelectionValue,
   selectionValueFromPrincipal,
+  singleReviewerPolicyEditable,
   stageParticipantValues,
 } from "../lib/issue-execution-policy";
 
@@ -128,7 +129,8 @@ export function buildRoutineMutationPayload(input: RoutineEditDraft, existingPol
   // the policy or churn a new revision out of freshly minted stage ids.
   // (buildExecutionPolicy is what guarantees the API-only fields survive a
   // reviewer change; this only keeps unrelated edits off the field at all.)
-  const reviewerChanged = reviewerAgentId !== routineReviewerAgentId(existingPolicy);
+  const reviewerChanged = reviewerAgentId !== routineReviewerAgentId(existingPolicy)
+    && singleReviewerPolicyEditable(existingPolicy);
   return {
     ...rest,
     description: input.description.trim() || null,
