@@ -593,6 +593,8 @@ describe("execute", () => {
     expect(result.exitCode).toBe(1);
     expect(result.errorCode).toBe("hermes_gateway_auth_failed");
     expect(result.errorMessage).toContain("Check adapterConfig.apiKey matches the Hermes API_SERVER_KEY");
+    // A rejected create proves no remote run exists.
+    expect(result.resultJson).toMatchObject({ remoteExecutionStopped: true });
   });
 
   it("includes network causes in connection failure messages", async () => {

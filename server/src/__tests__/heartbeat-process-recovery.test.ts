@@ -7686,7 +7686,7 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
       return {
         exitCode: 1, signal: "SIGTERM", timedOut: false, errorCode: "hermes_gateway_cancelled",
         errorMessage: "Hermes gateway run was cancelled.", provider: "hermes_gateway", model: "test-model",
-        resultJson: { status: "cancelled", executionCancellation: {
+        resultJson: { status: "cancelled", remoteExecutionStopped: true, executionCancellation: {
           state: "acknowledged", acknowledgedAt: new Date().toISOString(), proof: "hermes_gateway_terminal_cancelled",
         } },
       } as never;

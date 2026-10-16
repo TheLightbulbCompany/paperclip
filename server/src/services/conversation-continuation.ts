@@ -34,6 +34,11 @@ export function isConversationAdapter(adapterType: string): boolean {
 // adapter type alone never releases a hold (e.g. after a Paperclip restart).
 const RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES = new Set(["hermes_gateway"]);
 
+/** A receipt-only adapter's run continues only on the adapter's positive stop evidence. */
+export function remoteStopProvenFor(adapterType: string, result: Record<string, unknown> | null | undefined): boolean {
+  return !RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES.has(adapterType) || result?.remoteExecutionStopped === true;
+}
+
 function inferableConversationAdapterTypes(): string[] {
   return conversationAdapterTypes().filter((type) => !RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES.has(type));
 }

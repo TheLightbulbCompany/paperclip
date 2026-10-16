@@ -705,6 +705,8 @@ export function mapFinalResultForTest(input: {
       output: output ?? "",
       usage: usage ?? null,
       cost_usd: costUsd,
+      // isol8: Hermes reported a terminal status, so the remote run has ended.
+      remoteExecutionStopped: true,
       ...(CANCELLED_STATUSES.has(input.terminal.status)
         ? {
             executionCancellation: {
@@ -777,10 +779,14 @@ function errorResult(err: unknown, redactText: TextRedactor = sanitizeSensitiveT
   const errorMessage = code === "hermes_gateway_auth_failed"
     ? `${redactErrorMessage(err, redactText)}. Check adapterConfig.apiKey matches the Hermes API_SERVER_KEY for the running gateway.`
     : redactErrorMessage(err, redactText);
+  // isol8: a 4xx rejection (not a 409 idempotency conflict) means Hermes created no run.
+  // A dropped connection or a 5xx may follow an accepted create, so it proves nothing.
+  const rejected = !!hermesError.status && hermesError.status >= 400 && hermesError.status < 500 && hermesError.status !== 409;
   return {
     exitCode: 1,
     signal: null,
     timedOut: false,
+    ...(rejected ? { resultJson: { remoteExecutionStopped: true } } : {}),
     errorCode: code,
     errorFamily: classified?.family ?? (code === "hermes_gateway_connect_failed" ? "transient_upstream" : null),
     retryNotBefore: hermesError.retryNotBefore ?? null,
@@ -882,6 +888,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       errorCode: "hermes_gateway_cancelled",
       errorMessage: "Hermes gateway run was cancelled before start.",
       resultJson: {
+        remoteExecutionStopped: true,
         executionCancellation: {
           state: "acknowledged",
           acknowledgedAt: new Date().toISOString(),
@@ -1032,6 +1039,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
         status: status ?? "unconfirmed",
         last_event: state.lastEventName,
         final_status: redactForLog(finalStatus, [], 0, redactText),
+        remoteExecutionStopped: finalStatus !== null,
         ...(confirmed
           ? {
               executionCancellation: {
@@ -1075,7 +1083,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
           final_status: redactForLog(finalStatus, [], 0, redactText),
           // isol8: without a terminal Hermes status the remote turn may still run, so the
           // server keeps its reconciliation hold instead of continuing the conversation.
-          ...(finalStatus ? {} : { remoteExecutionStopped: false }),
+          remoteExecutionStopped: finalStatus !== null,
         },
         sessionParams: {
           hermesRunId: runId,
