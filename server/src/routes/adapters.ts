@@ -52,7 +52,7 @@ import { isCloudManagedInstance } from "../services/cloud-instance.js";
 import { getHiddenSettings } from "../services/settings-visibility.js";
 import { assertBoardOrgAccess, assertInstanceAdmin } from "./authz.js";
 import { BUILTIN_ADAPTER_TYPES } from "../adapters/builtin-adapter-types.js";
-import { isConversationAdapter } from "../services/conversation-continuation.js";
+import { isInferableConversationAdapter } from "../services/conversation-continuation.js";
 
 const execFileAsync = promisify(execFile);
 
@@ -185,7 +185,8 @@ export function buildAdapterCapabilities(adapter: ServerAdapterModule): AdapterC
     supportsLocalAgentJwt: adapter.supportsLocalAgentJwt ?? false,
     requiresMaterializedRuntimeSkills: adapter.requiresMaterializedRuntimeSkills ?? false,
     supportsAcp: Boolean(adapter.acp),
-    supportsConversationContinuation: isConversationAdapter(adapter.type),
+    // isol8: receipt-only gateways need run-level stop evidence, so the UI must not assume it.
+    supportsConversationContinuation: isInferableConversationAdapter(adapter.type),
     ...(login
       ? {
           login: {

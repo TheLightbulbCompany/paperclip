@@ -39,6 +39,11 @@ export function remoteStopProvenFor(adapterType: string, result: Record<string, 
   return !RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES.has(adapterType) || result?.remoteExecutionStopped === true;
 }
 
+/** The adapter's type alone lets a stopped run continue (what the UI's Retry may assume). */
+export function isInferableConversationAdapter(adapterType: string): boolean {
+  return inferableConversationAdapterTypes().includes(adapterType);
+}
+
 function inferableConversationAdapterTypes(): string[] {
   return conversationAdapterTypes().filter((type) => !RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES.has(type));
 }

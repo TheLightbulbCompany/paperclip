@@ -1,3 +1,4 @@
+import { buildAdapterCapabilities } from "../routes/adapters.js";
 import { probeAcpxClaudeInstallation } from "@paperclipai/paperclip-runner/live";
 import { describe, expect, it, beforeEach, afterEach, vi } from "vitest";
 import { buildSandboxNpmInstallCommand } from "@paperclipai/adapter-utils";
@@ -271,6 +272,8 @@ describe("server adapter registry", () => {
     expect(findActiveServerAdapter("hermes_gateway")?.supportsConversationContinuation).toBe(true);
     expect(isConversationAdapter("hermes_gateway")).toBe(true);
     expect(isConversationAdapter("openclaw_gateway")).toBe(false);
+    // Its runs need the adapter's stop receipt, so the UI capability stays off.
+    expect(buildAdapterCapabilities(findActiveServerAdapter("hermes_gateway")!).supportsConversationContinuation).toBe(false);
   });
 
   it("built-in claude_local adapter declares capability flags", () => {
