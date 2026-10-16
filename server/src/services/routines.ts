@@ -3019,6 +3019,10 @@ export function routineService(
             assigneeAgentId: routineSnapshot.assigneeAgentId,
             priority: routineSnapshot.priority,
             status: routineSnapshot.status,
+            // Same as update: leaving a breaker pause for active starts fresh.
+            ...(locked.status === "paused" && routineSnapshot.status === "active"
+              ? { consecutiveFailureCount: 0, autoPausedAt: null, autoPauseReason: null }
+              : {}),
             concurrencyPolicy: routineSnapshot.concurrencyPolicy,
             catchUpPolicy: routineSnapshot.catchUpPolicy,
             activityGatePolicy: routineSnapshot.activityGatePolicy,

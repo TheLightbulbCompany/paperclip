@@ -283,6 +283,21 @@ describeEmbeddedPostgres("routine circuit breaker", () => {
     expect(r.autoPauseEnabled).toBe(false);
   });
 
+  it("resets failure state when restoring an active revision onto a breaker-paused routine", async () => {
+    const { routine } = await seedRoutine();
+    await routinesSvc.update(routine.id, { title: "Sweep v2" }, { userId: "u_test" });
+    await routinesSvc.update(routine.id, { title: "Sweep v3" }, { userId: "u_test" });
+    const [, older] = await routinesSvc.listRevisions(routine.id);
+    await db.update(routines).set({
+      status: "paused", consecutiveFailureCount: 3, autoPausedAt: new Date(), autoPauseReason: "consecutive_failures",
+    }).where(eq(routines.id, routine.id));
+    await routinesSvc.restoreRevision(routine.id, older!.id, { userId: "u_test" });
+    const r = await getRoutine(routine.id);
+    expect(r.status).toBe("active");
+    expect(r.consecutiveFailureCount).toBe(0);
+    expect(r.autoPausedAt).toBeNull();
+  });
+
   it("does not fire a paused routine from tickScheduledTriggers", async () => {
     const { companyId, routine } = await seedRoutine({ status: "paused", consecutiveFailureCount: 3, autoPausedAt: new Date() });
     await db.insert(routineTriggers).values({
