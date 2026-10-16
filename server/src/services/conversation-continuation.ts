@@ -9,8 +9,64 @@ export const CONVERSATION_ADAPTER_TYPES = [
   "pi_local", "grok_local", "kimi_local", "hermes_local",
 ] as const;
 
+// External adapter plugins that declare supportsConversationContinuation. The
+// adapter registry keeps this in step with registration, so installing or
+// removing a plugin takes effect without a restart.
+const externalConversationAdapterTypes = new Set<string>();
+
+export function setExternalConversationAdapter(adapterType: string, supported: boolean): void {
+  if (supported) externalConversationAdapterTypes.add(adapterType);
+  else externalConversationAdapterTypes.delete(adapterType);
+}
+
+/** Built-in conversation adapters plus registered external ones that opt in. */
+export function conversationAdapterTypes(): string[] {
+  return [...new Set<string>([...CONVERSATION_ADAPTER_TYPES, ...externalConversationAdapterTypes])];
+}
+
 export function isConversationAdapter(adapterType: string): boolean {
-  return (CONVERSATION_ADAPTER_TYPES as readonly string[]).includes(adapterType);
+  return conversationAdapterTypes().includes(adapterType);
+}
+
+// isol8: remote gateway adapters leave no host PID or environment lease, so
+// nothing here can tell whether their remote run still executes. Their runs
+// continue only when stamped from the adapter's own stop receipt; the
+// adapter type alone never releases a hold (e.g. after a Paperclip restart).
+const RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES = new Set(["hermes_gateway"]);
+
+/** A receipt-only adapter's run continues only on the adapter's positive stop evidence. */
+export function remoteStopProvenFor(adapterType: string, result: Record<string, unknown> | null | undefined): boolean {
+  return !RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES.has(adapterType) ||
+    (result?.remoteExecutionStopped === true && result?.sessionResumable !== false);
+}
+
+/**
+ * isol8: the receipt-only adapter recorded that its remote run ended, so no host process
+ * proof applies. isol8.2+ results carry remoteExecutionStopped; an isol8.1 hermes_gateway
+ * result has the mapped Hermes terminal status instead (hermes_gateway_run_failed is set
+ * only from a failed/error status Hermes reported for that remote run).
+ */
+export function remoteStopRecordedFor(
+  adapterType: string | null,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "status" | "errorCode" | "resultJson">,
+): boolean {
+  if (!adapterType || !RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES.has(adapterType)) return false;
+  const result = run.resultJson;
+  // run/none session keys start a new Hermes session on the next wake: nothing to continue.
+  if (result?.sessionResumable === false) return false;
+  if (result?.remoteExecutionStopped === true) return true;
+  return result?.remoteExecutionStopped === undefined && run.status === "failed" &&
+    run.errorCode === "hermes_gateway_run_failed" && ["failed", "error"].includes(String(result?.status)) &&
+    typeof result?.run_id === "string";
+}
+
+/** The adapter's type alone lets a stopped run continue (what the UI's Retry may assume). */
+export function isInferableConversationAdapter(adapterType: string): boolean {
+  return inferableConversationAdapterTypes().includes(adapterType);
+}
+
+function inferableConversationAdapterTypes(): string[] {
+  return conversationAdapterTypes().filter((type) => !RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES.has(type));
 }
 
 export const CONVERSATION_CONTINUATION_POLICY = "continue_conversation_v1";
@@ -27,14 +83,14 @@ export function claimedAdapterType(run: Pick<typeof heartbeatRuns.$inferSelect, 
 
 function conversationRunPredicate() {
   return or(
-    inArray(sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`, [...CONVERSATION_ADAPTER_TYPES]),
+    inArray(sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`, inferableConversationAdapterTypes()),
     sql`${heartbeatRuns.resultJson}->>'conversationContinuation' = ${CONVERSATION_CONTINUATION_POLICY}`,
     sql`exists (
       select 1 from ${heartbeatRunEvents}
       where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId}
         and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
         and ${heartbeatRunEvents.eventType} = 'adapter.invoke'
-        and ${inArray(sql`${heartbeatRunEvents.payload}->>'adapterType'`, [...CONVERSATION_ADAPTER_TYPES])}
+        and ${inArray(sql`${heartbeatRunEvents.payload}->>'adapterType'`, inferableConversationAdapterTypes())}
     )`,
   );
 }
@@ -55,7 +111,7 @@ export async function runUsedConversationAdapter(db: Db, run: typeof heartbeatRu
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive") return false;
   if (hasConversationContinuationPolicy(run.resultJson)) return true;
   const adapterType = await historicalAdapterType(db, run);
-  return adapterType !== null && isConversationAdapter(adapterType);
+  return adapterType !== null && inferableConversationAdapterTypes().includes(adapterType);
 }
 
 /** Only immutable run evidence can retire a historical conversation hold.

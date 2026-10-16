@@ -2129,6 +2129,34 @@
       "when": 1791300719193,
       "tag": "0305_chubby_vin_gonzales",
       "breakpoints": true
+    },
+    {
+      "idx": 306,
+      "version": "7",
+      "when": 1791300719194,
+      "tag": "0306_routine_circuit_breaker",
+      "breakpoints": true
+    },
+    {
+      "idx": 307,
+      "version": "7",
+      "when": 1791300719195,
+      "tag": "0307_routine_execution_policy",
+      "breakpoints": true
+    },
+    {
+      "idx": 308,
+      "version": "7",
+      "when": 1791300719196,
+      "tag": "0308_lazy_hardball",
+      "breakpoints": true
+    },
+    {
+      "idx": 309,
+      "version": "7",
+      "when": 1791300719197,
+      "tag": "0309_isol8_idempotent_operations",
+      "breakpoints": true
     }
   ]
 }

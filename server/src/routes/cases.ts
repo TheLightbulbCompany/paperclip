@@ -363,11 +363,17 @@ async function autoLinkRunIssue(db: CaseRouteDb, input: {
 
 async function nextCaseIdentity(db: CaseRouteDb, companyId: string) {
   await db.execute(sql`select pg_advisory_xact_lock(hashtext(${`paperclip:cases:${companyId}`}))`);
+  // FOR UPDATE: an empty-board rename recomputes the issue prefix under the
+  // company row lock, so the prefix read that mints an identifier must take
+  // the same lock — otherwise a case can mint from the old prefix while the
+  // rename commits the new one. The advisory lock above only serializes
+  // case creators against each other, not against renames.
   const [company] = await db
     .select({ issuePrefix: companies.issuePrefix })
     .from(companies)
     .where(eq(companies.id, companyId))
-    .limit(1);
+    .limit(1)
+    .for("update");
   if (!company) throw notFound("Company not found");
   const [maxRow] = await db
     .select({ maxNum: sql<number>`coalesce(max(${cases.caseNumber}), 0)` })

@@ -10,6 +10,8 @@ import { createHash, randomUUID } from "node:crypto";
 import { terminalizeLegacyExecution } from "../services/legacy-execution-recovery.js";
 import { issueService } from "../services/issues.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
+import { deliverReconciledExecutions, markExecutionReconciliation } from "../services/execution-recovery-resolution.js";
+import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { adapterExecutionControls, createAdapterExecutionControl } from "../services/adapter-execution-control.js";
 import { spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs/promises";
@@ -86,7 +88,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { runningProcesses } from "../adapters/index.ts";
+import { registerServerAdapter, runningProcesses, unregisterServerAdapter } from "../adapters/index.ts";
 import {
   resolveDefaultAgentWorkspaceDir,
   resolvePaperclipInstanceRoot,
@@ -1912,6 +1914,48 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run.status).toBe("failed");
     expect(run.resultJson?.conversationContinuation).toBeUndefined();
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+  });
+
+  it.each([true, false])("treats a stopped run of an external adapter as a conversation only when it opts in: %s", async optedIn => {
+    const adapterType = "external_conversation_test";
+    registerServerAdapter({
+      type: adapterType,
+      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+      testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date(0).toISOString() }),
+      ...(optedIn ? { supportsConversationContinuation: true } : {}),
+    });
+    try {
+      const { runId, issueId, companyId } = await seedRunFixture({
+        adapterType, agentStatus: "idle", runStatus: "interrupted", runErrorCode: "server_shutdown_interrupted",
+      });
+      // Only the recorded adapter (dispatch profile and adapter.invoke event) identifies the
+      // conversation; no continuation policy is stored on the run.
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType } } }).where(eq(heartbeatRuns.id, runId));
+      const [hold] = await db.insert(issueRecoveryActions).values({
+        companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "active", ownerType: "board",
+        cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+        evidence: { runId, automaticRecovery: { replay: "blocked" } }, nextAction: "Reconcile the stopped run.",
+      }).returning();
+      const blocker = await getExecutionBlocker(db, companyId, issueId);
+      if (optedIn) expect(blocker).toBeNull();
+      else expect(blocker).toMatchObject({ recoveryActionId: hold!.id, cause: "legacy_execution_requires_reconciliation" });
+    } finally {
+      unregisterServerAdapter(adapterType);
+    }
+  });
+
+  it("keeps the hold on an interrupted hermes_gateway run that has no stop receipt", async () => {
+    const { runId, issueId, companyId } = await seedRunFixture({
+      adapterType: "hermes_gateway", agentStatus: "idle", runStatus: "interrupted", runErrorCode: "server_shutdown_interrupted",
+    });
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType: "hermes_gateway" } } }).where(eq(heartbeatRuns.id, runId));
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "active", ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      evidence: { runId, automaticRecovery: { replay: "blocked" } }, nextAction: "Reconcile the stopped run.",
+    }).returning();
+    // The remote Hermes run may still execute after a Paperclip restart: only a stop receipt releases it.
+    expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: hold!.id });
   });
 
   it.each([false, true])("waits for a live terminal predecessor before a new turn (historical hold: %s)", async withHold => {
@@ -7631,6 +7675,212 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
   });
 
+  it("continues a hermes_gateway run stopped with a confirmed provider stop when the user comments", async () => {
+    let context!: { onCancellationReady?: () => Promise<void>; signal?: AbortSignal };
+    mockAdapterExecute.mockImplementationOnce(async (input) => {
+      context = input as typeof context;
+      await context.onCancellationReady?.();
+      await new Promise<void>((resolve) => {
+        if (context.signal?.aborted) resolve();
+        else context.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      // The hermes_gateway adapter returns this only after Hermes reports the run cancelled.
+      return {
+        exitCode: 1, signal: "SIGTERM", timedOut: false, errorCode: "hermes_gateway_cancelled",
+        errorMessage: "Hermes gateway run was cancelled.", provider: "hermes_gateway", model: "test-model",
+        resultJson: { status: "cancelled", remoteExecutionStopped: true, executionCancellation: {
+          state: "acknowledged", acknowledgedAt: new Date().toISOString(), proof: "hermes_gateway_terminal_cancelled",
+        } },
+      } as never;
+    });
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "queued",
+    });
+    await db.update(agents).set({ adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(() => expect(adapterExecutionControls.has(runId)).toBe(true));
+
+    await heartbeat.cancelRun(runId, "Cancelled by a board operator");
+    const stopped = await heartbeat.getRun(runId);
+    expect(stopped?.status).toBe("cancelled");
+    expect(stopped?.resultJson).toMatchObject({
+      conversationContinuation: "continue_conversation_v1",
+      executionCancellation: { state: "acknowledged" },
+    });
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "Carry on" }).returning();
+    const next = await heartbeat.wakeup(agentId, {
+      source: "automation", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId, commentId: comment!.id }, contextSnapshot: { issueId, commentId: comment!.id, wakeReason: "issue_commented" },
+    });
+    expect(next?.id).toBeTruthy();
+    expect(next!.id).not.toBe(runId);
+    expect(next!.contextSnapshot).toMatchObject({ issueId, wakeCommentIds: [comment!.id] });
+    await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
+  });
+
+  it("starts a run for a user comment after a hermes_gateway run failed with a Hermes terminal status (ISOA-837)", async () => {
+    // What the hermes_gateway adapter returns when Hermes reports the run failed (mapFinalResultForTest).
+    mockAdapterExecute.mockImplementationOnce(async () => ({
+      exitCode: 1, signal: null, timedOut: false, errorCode: "hermes_gateway_run_failed",
+      errorMessage: "model_unavailable", provider: "hermes_gateway", model: "test-model",
+      resultJson: { run_id: "hermes-run", status: "failed", remoteExecutionStopped: true },
+    }) as never);
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "queued",
+    });
+    await db.update(agents).set({ adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(async () => expect((await heartbeat.getRun(runId))?.status).toBe("failed"));
+    expect((await heartbeat.getRun(runId))?.resultJson).toMatchObject({ conversationContinuation: "continue_conversation_v1" });
+    // No recovery hold once the run's lease is released: Hermes reported the remote run ended.
+    await vi.waitFor(async () => expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull());
+    await vi.waitFor(async () => expect((await db.select().from(agents).where(eq(agents.id, agentId)))[0]?.status).toBe("error"));
+
+    // An agent in `error` stays invokable: the user's next comment starts a fresh run.
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "Try again" }).returning();
+    const next = await heartbeat.wakeup(agentId, {
+      source: "automation", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId, commentId: comment!.id }, contextSnapshot: { issueId, commentId: comment!.id, wakeReason: "issue_commented" },
+    });
+    expect(next?.id).toBeTruthy();
+    expect(next!.id).not.toBe(runId);
+    expect(next!.contextSnapshot).toMatchObject({ issueId, wakeCommentIds: [comment!.id] });
+    // Paperclip's own failed-run retry carries the comment; nothing is left deferred.
+    expect(next!.status === "scheduled_retry" ? next!.retryOfRunId : runId).toBe(runId);
+    expect(await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ))).toEqual([]);
+  });
+
+  it.each(["isol8.1 Hermes terminal result", "remoteExecutionStopped receipt"] as const)(
+    "a parked comment resumes a task held after a hermes_gateway run with a %s, with no board action (ISOA-837)",
+    async (shape) => {
+      const { companyId, agentId, issueId, runId } = await seedRunFixture({
+        adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "failed",
+        runErrorCode: "hermes_gateway_run_failed", runError: "model_unavailable",
+      });
+      await db.update(heartbeatRuns).set({
+        finishedAt: new Date(Date.now() - 60 * 60_000),
+        resultJson: shape === "isol8.1 Hermes terminal result"
+          ? { run_id: "hermes-run", status: "failed" }
+          : { run_id: "hermes-run", status: "failed", remoteExecutionStopped: true },
+      }).where(eq(heartbeatRuns.id, runId));
+      await db.update(agents).set({ status: "error", adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } })
+        .where(eq(agents.id, agentId));
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+      const [hold] = await db.insert(issueRecoveryActions).values({
+        companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+        ownerType: "board", returnOwnerAgentId: agentId, cause: "legacy_execution_requires_reconciliation",
+        fingerprint: `legacy-execution:${runId}`, nextAction: "Automatic recovery stopped.",
+        evidence: { runId, automaticRecovery: { runId, policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" } },
+      }).returning();
+      const heartbeat = heartbeatService(db);
+      const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "responsible-user", body: "Please continue" }).returning();
+      const deferred = () => db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      // The prod shape: the comment was parked behind the hold (e.g. by isol8.2's admission).
+      await db.insert(agentWakeupRequests).values({
+        companyId, agentId, source: "automation", triggerDetail: "system", reason: "issue_reopened_via_comment",
+        status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "responsible-user",
+        updatedAt: new Date(Date.now() - 60_000),
+        payload: { issueId, commentId: comment!.id, mutation: "comment",
+          executionWait: { reason: "process_identity_missing", message: "The previous run has no verified stop record.", recoveryActionId: hold!.id },
+          _paperclipWakeContext: { issueId, taskId: issueId, commentId: comment!.id, wakeCommentId: comment!.id,
+            wakeCommentIds: [comment!.id], wakeReason: "issue_reopened_via_comment", wakeSource: "automation", wakeTriggerDetail: "system" } },
+      });
+
+      await heartbeat.resumeExecutionWaitComments(); // the periodic sweep; nobody resolves a card
+
+      await vi.waitFor(async () => {
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+        expect(runs.some(run => run.id !== runId && JSON.stringify(run.contextSnapshot).includes(comment!.id))).toBe(true);
+      }, { timeout: 15_000 });
+      expect(await deferred()).toEqual([]);
+      const [retired] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold!.id));
+      expect(retired!.evidence).toMatchObject({ automaticRecovery: { replay: "explicit_user_continuation" } });
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    },
+  );
+
+  it.each([
+    ["without a Hermes stop record (timeout, no receipt)", { status: "unconfirmed", remoteExecutionStopped: false }],
+    ["whose stopped session is not resumable (run/none session key)",
+      { run_id: "hermes-run", status: "failed", remoteExecutionStopped: true, sessionResumable: false }],
+  ] as const)("keeps a hermes_gateway hold %s", async (_label, resultJson) => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "failed",
+      runErrorCode: "hermes_gateway_timeout", runError: "Hermes gateway run timed out",
+    });
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 60 * 60_000),
+      resultJson: { ...resultJson } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agents).set({ adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } }).where(eq(agents.id, agentId));
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: agentId, cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${runId}`, nextAction: "Automatic recovery stopped.",
+      evidence: { runId, automaticRecovery: { replay: "blocked" } },
+    }).returning();
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "responsible-user", body: "Continue" }).returning();
+    const heartbeat = heartbeatService(db);
+    const next = await heartbeat.wakeup(agentId, {
+      source: "automation", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId, commentId: comment!.id }, contextSnapshot: { issueId, commentId: comment!.id, wakeReason: "issue_commented" },
+    });
+    expect(next).toBeNull();
+    expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: hold!.id });
+  });
+
+  it("a board reconciliation delivers a comment parked behind a pre-receipt hermes_gateway hold (ISOA-837 nudge)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "failed",
+      runErrorCode: "hermes_gateway_run_failed", runError: "model_unavailable",
+    });
+    const finishedAt = new Date(Date.now() - 60 * 60_000);
+    // The isol8.1 result: a Hermes terminal status, but no remoteExecutionStopped receipt.
+    await db.update(heartbeatRuns).set({ finishedAt, resultJson: { run_id: "hermes-run", status: "failed" } })
+      .where(eq(heartbeatRuns.id, runId));
+    await db.update(agents).set({ status: "error", adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } })
+      .where(eq(agents.id, agentId));
+    await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: agentId, cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${runId}`, nextAction: "Automatic recovery stopped.",
+      evidence: { runId, automaticRecovery: { runId, policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" } },
+    }).returning();
+    const heartbeat = heartbeatService(db);
+
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "Please continue" }).returning();
+    const parked = await heartbeat.wakeup(agentId, {
+      source: "automation", reason: "issue_reopened_via_comment", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId, commentId: comment!.id },
+      contextSnapshot: { issueId, commentId: comment!.id, wakeCommentId: comment!.id, wakeReason: "issue_reopened_via_comment" },
+    });
+    expect(parked).toBeNull();
+    const deferred = () => db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+    expect((await deferred())[0]?.payload).toMatchObject({ executionWait: { recoveryActionId: hold!.id } });
+
+    // The board's native decision (POST /recovery-actions/resolve with executionReconciliation).
+    await db.update(issues).set({ status: "todo" }).where(eq(issues.id, issueId));
+    await markExecutionReconciliation(db, issueRecoveryActionReadModel(hold!), {
+      runId, providerStopped: true, actionOutcome: "mixed",
+      outcomeEvidence: "Hermes reported the run failed (expired ChatGPT token); its earlier tool calls stay recorded.",
+    }, "board-user");
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    await deliverReconciledExecutions(db, heartbeat.wakeup);
+
+    await vi.waitFor(async () => {
+      const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+      expect(runs.some(run => run.id !== runId && JSON.stringify(run.contextSnapshot).includes(comment!.id))).toBe(true);
+    }, { timeout: 15_000 });
+    await vi.waitFor(async () => expect(await deferred()).toEqual([]), { timeout: 15_000 });
+  });
+
   it.each(["dedicated deferred donor", "non-coalescing recipient", "persistent agent conversation"] as const)(
     "does not adopt unrelated queued comments for a %s after Stop",
     async (direction) => {
@@ -10654,6 +10904,154 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     );
   });
 
+  // An accepted interaction with no successful follow-up run is requeued each
+  // reconcile tick. Consecutive failed continuation runs — with ANY error code,
+  // not just waiting-on-review cancellations — must stretch the requeue
+  // interval (exponential backoff, 1h ceiling) instead of re-firing a full
+  // agent run on every tick. The interaction is still never abandoned.
+  async function seedFailingAcceptedInteractionFixture(failedRunTimes: Date[]) {
+    const companyId = randomUUID();
+    const agentId = randomUUID();
+    const issueId = randomUUID();
+    const interactionId = randomUUID();
+    const resolvedAt = new Date(Math.min(...failedRunTimes.map((at) => at.getTime())) - 5 * 60 * 1000);
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values({
+      id: agentId,
+      companyId,
+      name: "CodexCoder",
+      role: "engineer",
+      status: "idle",
+      adapterType: "codex_local",
+      adapterConfig: {},
+      runtimeConfig: { heartbeat: { wakeOnDemand: true, maxConcurrentRuns: 1 } },
+      permissions: {},
+    });
+    await db.insert(issues).values({
+      id: issueId,
+      companyId,
+      title: "Accepted step whose continuation runs keep dying on the gateway",
+      status: "in_progress",
+      priority: "medium",
+      assigneeAgentId: agentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    await db.insert(issueThreadInteractions).values({
+      id: interactionId,
+      companyId,
+      issueId,
+      kind: "request_confirmation",
+      status: "accepted",
+      continuationPolicy: "wake_assignee_on_accept",
+      createdByAgentId: agentId,
+      resolvedByUserId: "responsible-user",
+      resolvedAt,
+      updatedAt: resolvedAt,
+      payload: { version: 1, prompt: "Run the registration step?" },
+      result: { outcome: "accepted" },
+    });
+    for (const at of failedRunTimes) {
+      await db.insert(heartbeatRuns).values({
+        id: randomUUID(),
+        companyId,
+        agentId,
+        invocationSource: "assignment",
+        triggerDetail: "system",
+        status: "failed",
+        errorCode: "openclaw_gateway_wait_error",
+        error: "gateway agent.wait ended without a terminal run state",
+        // Upstream now holds any failed run whose provider work may have
+        // started for operator reconciliation (legacy-execution-recovery), so
+        // the backoff path is only reachable for failures before provider work.
+        resultJson: { executionRecovery: { kind: "bootstrap", providerWorkStarted: false } },
+        contextSnapshot: {
+          issueId,
+          taskId: issueId,
+          interactionId,
+          interactionStatus: "accepted",
+          retryReason: "issue_continuation_needed",
+          source: "issue.interaction_continuation_recovery",
+        },
+        startedAt: at,
+        finishedAt: at,
+        createdAt: at,
+        updatedAt: at,
+      });
+    }
+
+    return { companyId, agentId, issueId, interactionId };
+  }
+
+  it("defers the accepted-interaction requeue while the failure backoff window is open", async () => {
+    // Three consecutive failures, the latest two minutes ago: the backoff for a
+    // streak of 3 is 20 minutes, so this tick must not dispatch another run.
+    const now = Date.now();
+    const { agentId, issueId } = await seedFailingAcceptedInteractionFixture([
+      new Date(now - 15 * 60 * 1000),
+      new Date(now - 8 * 60 * 1000),
+      new Date(now - 2 * 60 * 1000),
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(0);
+    expect(result.escalated).toBe(0);
+
+    const issue = await db
+      .select({ status: issues.status })
+      .from(issues)
+      .where(eq(issues.id, issueId))
+      .then((rows) => rows[0] ?? null);
+    expect(issue?.status).toBe("in_progress");
+
+    const runs = await db
+      .select({ id: heartbeatRuns.id })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(3);
+  });
+
+  it("requeues the accepted interaction again once the failure backoff window has elapsed", async () => {
+    // Same streak of 3 (20-minute backoff), but the latest failure is 25
+    // minutes old: the promise resumes — one more continuation run is queued.
+    const now = Date.now();
+    const { agentId, issueId, interactionId } = await seedFailingAcceptedInteractionFixture([
+      new Date(now - 45 * 60 * 1000),
+      new Date(now - 35 * 60 * 1000),
+      new Date(now - 25 * 60 * 1000),
+    ]);
+
+    const heartbeat = heartbeatService(db);
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+
+    expect(result.continuationRequeued).toBe(1);
+    expect(result.escalated).toBe(0);
+    expect(result.issueIds).toEqual([issueId]);
+
+    const runs = await db
+      .select({ status: heartbeatRuns.status, contextSnapshot: heartbeatRuns.contextSnapshot })
+      .from(heartbeatRuns)
+      .where(eq(heartbeatRuns.agentId, agentId));
+    expect(runs).toHaveLength(4);
+    const recoveryRun = runs.find((row) => row.status !== "failed");
+    expect(recoveryRun?.contextSnapshot).toMatchObject({
+      issueId,
+      interactionId,
+      source: "issue.interaction_continuation_recovery",
+    });
+  });
+
   // Scenario 3 (restart durability): a bounded continuation retry scheduled
   // before a server restart survives it. Promotion is DB-driven (scheduled_retry rows +
   // promoteDueScheduledRetries), not an in-memory setTimeout — so a brand-new heartbeat
@@ -11082,6 +11480,167 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     if (runId) {
       await waitForRunToSettle(heartbeat, runId);
     }
+  });
+
+  async function seedOrphanBlockerFixture(input: {
+    blockedAssignees: string[];
+  }) {
+    const companyId = randomUUID();
+    const creatorAgentId = randomUUID();
+    const otherAgentId = randomUUID();
+    const blockerIssueId = randomUUID();
+    const issuePrefix = `T${companyId.replace(/-/g, "").slice(0, 6).toUpperCase()}`;
+    await db.insert(companies).values({
+      id: companyId,
+      name: "Paperclip",
+      issuePrefix,
+      defaultResponsibleUserId: "responsible-user",
+      requireBoardApprovalForNewAgents: false,
+    });
+    await db.insert(agents).values(
+      [
+        { id: creatorAgentId, name: "Forge" },
+        { id: otherAgentId, name: "Other" },
+      ].map((agent) => ({
+        ...agent,
+        companyId,
+        role: "engineer",
+        status: "idle",
+        adapterType: "codex_local",
+        adapterConfig: {},
+        runtimeConfig: {},
+        permissions: {},
+      })),
+    );
+    await db.insert(issues).values({
+      id: blockerIssueId,
+      companyId,
+      title: "Unblock Forge",
+      status: "todo",
+      priority: "high",
+      createdByAgentId: creatorAgentId,
+      responsibleUserId: "responsible-user",
+      issueNumber: 1,
+      identifier: `${issuePrefix}-1`,
+    });
+    const blockedIssueIds: string[] = [];
+    for (const [index, assignee] of input.blockedAssignees.entries()) {
+      const blockedIssueId = randomUUID();
+      blockedIssueIds.push(blockedIssueId);
+      await db.insert(issues).values({
+        id: blockedIssueId,
+        companyId,
+        title: `Blocked work ${index + 1}`,
+        status: "blocked",
+        priority: "high",
+        assigneeAgentId: assignee === "creator" ? creatorAgentId : otherAgentId,
+        responsibleUserId: "responsible-user",
+        issueNumber: index + 2,
+        identifier: `${issuePrefix}-${index + 2}`,
+      });
+      await db.insert(issueRelations).values({
+        companyId,
+        issueId: blockerIssueId,
+        relatedIssueId: blockedIssueId,
+        type: "blocks",
+        createdByAgentId: creatorAgentId,
+      });
+    }
+    return { companyId, creatorAgentId, otherAgentId, blockerIssueId, blockedIssueIds, issuePrefix };
+  }
+
+  it("never hands an orphan blocker back to the assignee it blocks", async () => {
+    const { creatorAgentId, blockerIssueId, issuePrefix } = await seedOrphanBlockerFixture({
+      blockedAssignees: ["creator"],
+    });
+    const heartbeat = heartbeatService(db);
+
+    const first = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(first.orphanBlockersAssigned).toBe(0);
+    expect(first.orphanBlockersNeedingBoardOwner).toBe(1);
+    expect(first.issueIds).not.toContain(blockerIssueId);
+
+    const blocker = await db.select().from(issues).where(eq(issues.id, blockerIssueId)).then((rows) => rows[0]);
+    expect(blocker?.assigneeAgentId).toBeNull();
+
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId));
+    expect(wakeups).toHaveLength(0);
+
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Orphan Blocker Needs a Board Owner");
+    expect(comments[0]?.body).toContain(`[${issuePrefix}-2](/${issuePrefix}/issues/${issuePrefix}-2)`);
+
+    const activities = await db
+      .select()
+      .from(activityLog)
+      .where(
+        and(
+          eq(activityLog.entityId, blockerIssueId),
+          sql`${activityLog.details} ->> 'source' = 'recovery.orphan_blocker_needs_board_owner'`,
+        ),
+      );
+    expect(activities).toHaveLength(1);
+
+    // Second tick: still skipped, nothing new posted.
+    const second = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(second.orphanBlockersAssigned).toBe(0);
+    expect(second.orphanBlockersNeedingBoardOwner).toBe(1);
+    expect(await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId))).toHaveLength(1);
+    expect(
+      await db
+        .select()
+        .from(activityLog)
+        .where(
+          and(
+            eq(activityLog.entityId, blockerIssueId),
+            sql`${activityLog.details} ->> 'source' = 'recovery.orphan_blocker_needs_board_owner'`,
+          ),
+        ),
+    ).toHaveLength(1);
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId))).toHaveLength(0);
+  });
+
+  it("still reassigns an orphan blocker whose creator is not the blocked assignee", async () => {
+    const { creatorAgentId, blockerIssueId } = await seedOrphanBlockerFixture({
+      blockedAssignees: ["other"],
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.orphanBlockersAssigned).toBe(1);
+    expect(result.orphanBlockersNeedingBoardOwner).toBe(0);
+
+    const blocker = await db.select().from(issues).where(eq(issues.id, blockerIssueId)).then((rows) => rows[0]);
+    expect(blocker?.assigneeAgentId).toBe(creatorAgentId);
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Assigned Orphan Blocker");
+
+    const wakeups = await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId));
+    expect(wakeups).toHaveLength(1);
+    const runId = wakeups[0]?.runId;
+    if (runId) {
+      await waitForRunToSettle(heartbeat, runId);
+    }
+  });
+
+  it("treats a blocker of several issues as needing a board owner when any is assigned to its creator", async () => {
+    const { creatorAgentId, blockerIssueId } = await seedOrphanBlockerFixture({
+      blockedAssignees: ["other", "creator"],
+    });
+    const heartbeat = heartbeatService(db);
+
+    const result = await heartbeat.reconcileStrandedAssignedIssues();
+    expect(result.orphanBlockersAssigned).toBe(0);
+    expect(result.orphanBlockersNeedingBoardOwner).toBe(1);
+
+    const blocker = await db.select().from(issues).where(eq(issues.id, blockerIssueId)).then((rows) => rows[0]);
+    expect(blocker?.assigneeAgentId).toBeNull();
+    const comments = await db.select().from(issueComments).where(eq(issueComments.issueId, blockerIssueId));
+    expect(comments).toHaveLength(1);
+    expect(comments[0]?.body).toContain("Orphan Blocker Needs a Board Owner");
+    expect(await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.agentId, creatorAgentId))).toHaveLength(0);
   });
 
   it("re-enqueues continuation for stranded in-progress work with no active run", async () => {

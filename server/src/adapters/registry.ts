@@ -133,6 +133,7 @@ import { agentConfigurationDoc as piAgentConfigurationDoc } from "@paperclipai/a
 import { BUILTIN_ADAPTER_TYPES } from "./builtin-adapter-types.js";
 import { buildExternalAdapters } from "./plugin-loader.js";
 import { getDisabledAdapterTypes } from "../services/adapter-plugin-store.js";
+import { setExternalConversationAdapter } from "../services/conversation-continuation.js";
 import { processAdapter } from "./process/index.js";
 import { httpAdapter } from "./http/index.js";
 import {
@@ -801,6 +802,9 @@ const kimiLocalAdapter: ServerAdapterModule = {
 const hermesGatewayAdapter: ServerAdapterModule = {
   ...createHermesGatewayServerAdapter(),
   runtimeToolDelivery: "invocation_context",
+  // isol8: the issue-scoped session key resumes the same Hermes native session
+  // on the next wake, so a stopped run continues as a conversation turn.
+  supportsConversationContinuation: true,
 };
 
 const hermesLocalAdapter: ServerAdapterModule = {
@@ -892,6 +896,8 @@ function registerBuiltInAdapters() {
     httpAdapter,
   ]) {
     adaptersByType.set(adapter.type, adapter);
+    // isol8: built-in modules may opt in too, beyond the fixed list.
+    trackConversationSupport(adapter);
   }
 }
 
@@ -965,6 +971,7 @@ const externalAdaptersReady: Promise<void> = (async () => {
         externalAdapter.type,
         resolveExternalAdapterRegistration(externalAdapter),
       );
+      trackConversationSupport(externalAdapter);
     }
   } catch (err) {
     console.error("[paperclip] Failed to load external adapters:", err);
@@ -981,6 +988,11 @@ export function waitForExternalAdapters(): Promise<void> {
   return externalAdaptersReady;
 }
 
+/** Built-in conversation adapters are fixed; external ones opt in per module. */
+function trackConversationSupport(adapter: ServerAdapterModule): void {
+  setExternalConversationAdapter(adapter.type, adapter.supportsConversationContinuation === true);
+}
+
 export function registerServerAdapter(adapter: ServerAdapterModule): void {
   if (BUILTIN_ADAPTER_TYPES.has(adapter.type) && !builtinFallbacks.has(adapter.type)) {
     const existing = adaptersByType.get(adapter.type);
@@ -989,6 +1001,7 @@ export function registerServerAdapter(adapter: ServerAdapterModule): void {
     }
   }
   adaptersByType.set(adapter.type, adapter);
+  trackConversationSupport(adapter);
 }
 
 export function unregisterServerAdapter(type: string): void {
@@ -999,12 +1012,14 @@ export function unregisterServerAdapter(type: string): void {
     if (fallback) {
       adaptersByType.set(type, fallback);
     }
+    setExternalConversationAdapter(type, fallback?.supportsConversationContinuation === true);
     return;
   }
   if (BUILTIN_ADAPTER_TYPES.has(type)) {
     return;
   }
   adaptersByType.delete(type);
+  setExternalConversationAdapter(type, false);
 }
 
 export function requireServerAdapter(type: string): ServerAdapterModule {
@@ -1144,11 +1159,14 @@ export function setOverridePaused(type: string, paused: boolean): boolean {
   const wasPaused = pausedOverrides.has(type);
   if (paused && !wasPaused) {
     pausedOverrides.add(type);
+    setExternalConversationAdapter(type, builtinFallbacks.get(type)?.supportsConversationContinuation === true);
     console.log(`[paperclip] Override paused for "${type}" — builtin adapter restored`);
     return true;
   }
   if (!paused && wasPaused) {
     pausedOverrides.delete(type);
+    const external = adaptersByType.get(type);
+    if (external) trackConversationSupport(external);
     console.log(`[paperclip] Override resumed for "${type}" — external adapter active`);
     return true;
   }

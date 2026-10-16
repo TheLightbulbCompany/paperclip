@@ -18,7 +18,7 @@ import { buildExecutionContinuation } from "./execution-continuation.js";
 import { adapterExecutionControls } from "./adapter-execution-control.js";
 import { persistActivity } from "./activity-log.js";
 
-import { historicalAdapterType, isConversationAdapter } from "./conversation-continuation.js";
+import { historicalAdapterType, isConversationAdapter, remoteStopRecordedFor } from "./conversation-continuation.js";
 import { queuedCommentIdsFromWakePayload } from "./issue-queued-comment-queue.js";
 
 type Run = typeof heartbeatRuns.$inferSelect;
@@ -250,7 +250,9 @@ export async function admitExplicitNativeContinuation(input: {
       if (leases.some(lease => !lease.releasedAt || lease.cleanupStatus === "failed")) return blocked("local_cleanup", "Waiting for the previous environment to finish cleanup. Your message will start automatically.");
       if (!unusedAdmission && !cancelledStartup) {
         // A missing process identity is not evidence that a provider exited.
+        // isol8: a remote gateway run has no host process; its adapter's recorded stop is the proof.
         if (!run.processPid && !run.processGroupId &&
+            !(run.runtimeMode === "legacy" && remoteStopRecordedFor(await historicalAdapterType(db, run), run)) &&
             !await hasNativeLocalProcessStop(db, companyId, run.id) &&
             !await hasHistoricalSuspendedNativeSession(db, run)) return blocked("process_identity_missing", "The previous run has no verified stop record. Paperclip cannot start this message yet.");
         if (run.processPid && !processStopped(run.processPid)) return blocked("process_running", "Waiting for the previous process to stop. Your message will start automatically.");

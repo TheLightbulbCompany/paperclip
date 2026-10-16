@@ -352,6 +352,7 @@ export {
   updateAgentSchema,
   agentRuntimeConfigSchema,
   agentInstructionsBundleModeSchema,
+  createAgentInstructionsBundleSchema,
   updateAgentInstructionsBundleSchema,
   upsertAgentInstructionsFileSchema,
   updateAgentInstructionsPathSchema,

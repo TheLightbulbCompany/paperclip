@@ -43,7 +43,7 @@ import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiCon
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
-import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
+import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter, remoteStopProvenFor, remoteStopRecordedFor, historicalAdapterType } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
@@ -8865,10 +8865,10 @@ export function buildPaperclipTaskMarkdown(input: {
       );
     } else if (issue.workMode === "planning") {
       let directive =
-        "Make the plan only. Do not write code or perform implementation work.";
+        "Write the plan to the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.";
       if (wakeComment) {
         directive =
-          "Update the plan only. Do not write code or perform implementation work.";
+          "Update the plan in the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.";
       }
       if (acceptedPlanContinuation) {
         directive =
@@ -10420,7 +10420,14 @@ export function heartbeatService(
       await isCancelledNativeStartup(db, run, preparationCoordinator);
     if (run.runtimeMode !== "native" && !cancelledPreparation &&
         parseObject(run.resultJson?.startupCancellation).beforeNativeSelection !== true &&
-        !(await remoteExecutionHasStopped(db, run.companyId, run.id))) return;
+        !(await remoteExecutionHasStopped(db, run.companyId, run.id)) &&
+        // isol8: a remote gateway adapter's own recorded stop, as admission accepts it. Read the
+        // stored row: getRun() projects resultJson down to a summary without the stop fields.
+        !(run.runtimeMode === "legacy" && await (async () => {
+          const [stored] = await db.select().from(heartbeatRuns).where(and(
+            eq(heartbeatRuns.companyId, run.companyId), eq(heartbeatRuns.id, run.id)));
+          return Boolean(stored && remoteStopRecordedFor(await historicalAdapterType(db, stored), stored));
+        })())) return;
     const issueId = run.nativeIssueId ?? (typeof run.contextSnapshot?.issueId === "string" ? run.contextSnapshot.issueId : null);
     if (!issueId) return;
     const currentRun = run.runtimeMode === "native" ? await getRun(run.id, { includeExecutionEvidence: true }) : null;
@@ -18282,6 +18289,8 @@ export function heartbeatService(
       parseObject(result?.executionCancellation).state === "acknowledged";
     return options?.conversationContinuationEligible !== false && outcome !== "succeeded" &&
       (outcome !== "cancelled" || cancellationAcknowledged) &&
+      // isol8: a remote gateway run continues only when its adapter proved the remote run ended.
+      remoteStopProvenFor(agent.adapterType, result) &&
       isConversationAdapter(agent.adapterType)
       ? { ...result, conversationContinuation: CONVERSATION_CONTINUATION_POLICY }
       : result;

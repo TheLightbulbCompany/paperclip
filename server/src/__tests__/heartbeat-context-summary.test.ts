@@ -142,7 +142,7 @@ describe("buildPaperclipTaskMarkdown", () => {
         expect(prompt).toContain("revision 1 (revision)");
         expect(prompt).toContain("````text");
         expect(prompt).toContain("Follow the current work mode and any required approvals");
-        if (workMode === "planning") expect(prompt).toContain("Make the plan only");
+        if (workMode === "planning") expect(prompt).toContain("Write the plan to the Paperclip plan document");
         if (workMode === "ask") expect(prompt).toContain("Answer the question directly");
       }
     }
@@ -405,7 +405,7 @@ describe("buildPaperclipTaskMarkdown", () => {
     });
 
     expect(assignment).toContain("- Work mode: \"planning\"");
-    expect(assignment).toContain("Make the plan only. Do not write code or perform implementation work.");
+    expect(assignment).toContain("Write the plan to the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.");
 
     const commentWake = buildPaperclipTaskMarkdown({
       issue: {
@@ -421,7 +421,7 @@ describe("buildPaperclipTaskMarkdown", () => {
       },
     });
 
-    expect(commentWake).toContain("Update the plan only. Do not write code or perform implementation work.");
+    expect(commentWake).toContain("Update the plan in the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.");
 
     const acceptedConfirmation = buildPaperclipTaskMarkdown({
       issue: {
@@ -440,7 +440,7 @@ describe("buildPaperclipTaskMarkdown", () => {
     expect(acceptedConfirmation).toContain(
       "Implement the accepted plan on this issue when the work is small and cohesive.",
     );
-    expect(acceptedConfirmation).not.toContain("Make the plan only.");
+    expect(acceptedConfirmation).not.toContain("Write the plan to the Paperclip plan document");
   });
 
   it("adds accepted-plan continuation guidance for standard-work issues when the wake is flagged as a plan continuation", () => {
@@ -564,7 +564,7 @@ describe("buildPaperclipTaskMarkdown", () => {
       },
     });
 
-    expect(commentWake).toContain("Update the plan only. Do not write code or perform implementation work.");
+    expect(commentWake).toContain("Update the plan in the Paperclip plan document (PUT /api/issues/{id}/documents/plan) only — not a workspace file. Do not write code or perform implementation work.");
     expect(commentWake).not.toContain("Create child issues from the approved plan only");
   });
 });

@@ -1,5 +1,5 @@
 import { createHmac, randomUUID } from "node:crypto";
-import { eq } from "drizzle-orm";
+import { eq, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it, vi } from "vitest";
 import {
   activityLog,
@@ -1272,6 +1272,179 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
     expect(serialized).not.toContain(rotated.secretMaterial.webhookSecret);
     expect(serialized).not.toContain(created.trigger.secretId!);
     expect(revisions[0]?.snapshot.triggers).toHaveLength(0);
+  });
+
+  it("rejects agent webhook trigger creation with signing disabled or an oversized replay window", async () => {
+    const { agentId, routine, svc } = await seedFixture();
+
+    await expect(svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "none",
+      replayWindowSec: 300,
+    }, { agentId })).rejects.toMatchObject({
+      status: 400,
+      details: { code: "agent_cannot_weaken_trigger_auth", field: "signingMode" },
+    });
+
+    await expect(svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "hmac_sha256",
+      replayWindowSec: 3600,
+    }, { agentId })).rejects.toMatchObject({
+      status: 400,
+      details: { code: "agent_cannot_weaken_trigger_auth", field: "replayWindowSec" },
+    });
+  });
+
+  it("rejects agent updates that weaken an existing webhook trigger's signing mode", async () => {
+    const { agentId, routine, svc } = await seedFixture();
+    const created = await svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "hmac_sha256",
+      replayWindowSec: 300,
+    }, { agentId });
+
+    await expect(svc.updateTrigger(created.trigger.id, { signingMode: "bearer" }, { agentId })).rejects.toMatchObject({
+      status: 400,
+      details: { code: "agent_cannot_weaken_trigger_auth", field: "signingMode" },
+    });
+    await expect(svc.updateTrigger(created.trigger.id, { replayWindowSec: 3600 }, { agentId })).rejects.toMatchObject({
+      status: 400,
+      details: { code: "agent_cannot_weaken_trigger_auth", field: "replayWindowSec" },
+    });
+
+    // Equal-strength change stays open.
+    await expect(svc.updateTrigger(created.trigger.id, { signingMode: "github_hmac" }, { agentId }))
+      .resolves.toMatchObject({ trigger: { signingMode: "github_hmac" } });
+  });
+
+  it("keeps agent escape hatches open: rotate, disable, relabel, and tighten webhook auth", async () => {
+    const { agentId, routine, svc } = await seedFixture();
+    const created = await svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "bearer",
+      replayWindowSec: 300,
+    }, { agentId });
+
+    const rotated = await svc.rotateTriggerSecret(created.trigger.id, { agentId });
+    expect(rotated.secretMaterial.webhookSecret).toBeTruthy();
+
+    await expect(svc.updateTrigger(created.trigger.id, { enabled: false, label: "paused hook" }, { agentId }))
+      .resolves.toMatchObject({ trigger: { enabled: false, label: "paused hook" } });
+    await expect(svc.updateTrigger(created.trigger.id, { signingMode: "hmac_sha256", replayWindowSec: 60 }, { agentId }))
+      .resolves.toMatchObject({ trigger: { signingMode: "hmac_sha256", replayWindowSec: 60 } });
+    await expect(svc.deleteTrigger(created.trigger.id, { agentId })).resolves.toMatchObject({ deleted: true });
+  });
+
+  it("arms a webhook trigger with a caller-supplied secret (board), but forbids agents from choosing one", async () => {
+    const { agentId, routine, svc } = await seedFixture();
+    const created = await svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "hmac_sha256",
+      replayWindowSec: 300,
+    }, {});
+
+    // Board actor may arm the trigger with a SPECIFIC secret — the exact value
+    // passed is what gets stored, so a provider-imposed whsec_ can be verified
+    // natively instead of at an edge.
+    const armed = await svc.rotateTriggerSecret(created.trigger.id, {}, "whsec_supplied_value");
+    expect(armed.secretMaterial.webhookSecret).toBe("whsec_supplied_value");
+
+    // An agent may still rotate to a fresh RANDOM secret (escape hatch)...
+    const agentRotated = await svc.rotateTriggerSecret(created.trigger.id, { agentId });
+    expect(agentRotated.secretMaterial.webhookSecret).toBeTruthy();
+    expect(agentRotated.secretMaterial.webhookSecret).not.toBe("whsec_supplied_value");
+
+    // ...but may NOT choose a specific value: knowing it would let the agent
+    // forge externally-signed fires of the trigger.
+    await expect(svc.rotateTriggerSecret(created.trigger.id, { agentId }, "whsec_agent_chosen"))
+      .rejects.toThrow(/board actors/i);
+  });
+
+  it("still allows user actors to create and loosen webhook triggers with signing disabled", async () => {
+    const { routine, svc } = await seedFixture();
+
+    const created = await svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "hmac_sha256",
+      replayWindowSec: 300,
+    }, { userId: "board-user" });
+
+    await expect(svc.updateTrigger(created.trigger.id, { signingMode: "none", replayWindowSec: 3600 }, { userId: "board-user" }))
+      .resolves.toMatchObject({ trigger: { signingMode: "none", replayWindowSec: 3600 } });
+
+    const unsigned = await svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "none",
+      replayWindowSec: 300,
+    }, { userId: "board-user" });
+    expect(unsigned.trigger.signingMode).toBe("none");
+  });
+
+  it("rejects agent revision restores that weaken a webhook trigger, but not user restores or tightening ones", async () => {
+    const { agentId, routine, svc } = await seedFixture();
+
+    // rev2: user-created webhook trigger with signing disabled; rev3: tightened.
+    const created = await svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "none",
+      replayWindowSec: 300,
+    }, { userId: "board-user" });
+    await svc.updateTrigger(created.trigger.id, { signingMode: "hmac_sha256" }, { userId: "board-user" });
+
+    const revisions = await svc.listRevisions(routine.id);
+    const weakRevision = revisions.find((revision) => revision.revisionNumber === 2)!;
+    const strongRevision = revisions.find((revision) => revision.revisionNumber === 3)!;
+    expect(weakRevision.snapshot.triggers[0]?.signingMode).toBe("none");
+
+    await expect(svc.restoreRevision(routine.id, weakRevision.id, { agentId })).rejects.toMatchObject({
+      status: 400,
+      details: { code: "agent_cannot_weaken_trigger_auth", field: "signingMode" },
+    });
+    await expect(db.select().from(routineTriggers).where(eq(routineTriggers.id, created.trigger.id)))
+      .resolves.toMatchObject([{ signingMode: "hmac_sha256" }]);
+
+    // The same restore stays open to a user actor.
+    await expect(svc.restoreRevision(routine.id, weakRevision.id, { userId: "board-user" }))
+      .resolves.toMatchObject({ restoredFromRevisionId: weakRevision.id });
+    await expect(db.select().from(routineTriggers).where(eq(routineTriggers.id, created.trigger.id)))
+      .resolves.toMatchObject([{ signingMode: "none" }]);
+
+    // An agent restore that tightens is allowed.
+    await expect(svc.restoreRevision(routine.id, strongRevision.id, { agentId }))
+      .resolves.toMatchObject({ restoredFromRevisionId: strongRevision.id });
+    await expect(db.select().from(routineTriggers).where(eq(routineTriggers.id, created.trigger.id)))
+      .resolves.toMatchObject([{ signingMode: "hmac_sha256" }]);
+  });
+
+  it("validates agent trigger updates against the row read under the routine lock, not the pre-lock read", async () => {
+    const { agentId, routine, svc } = await seedFixture();
+    const created = await svc.createTrigger(routine.id, {
+      kind: "webhook",
+      signingMode: "none",
+      replayWindowSec: 300,
+    }, { userId: "board-user" });
+
+    // Hold the routine lock, let the agent PATCH take its pre-lock read while the
+    // trigger is still "none" (equal strength, would pass), then tighten to hmac
+    // before releasing. The guard must reject against the fresh row.
+    let pending!: Promise<unknown>;
+    await db.transaction(async (tx) => {
+      await tx.execute(sql`select id from ${routines} where ${routines.id} = ${routine.id} for update`);
+      pending = svc.updateTrigger(created.trigger.id, { signingMode: "none" }, { agentId }).catch((err) => err);
+      await new Promise((resolve) => setTimeout(resolve, 300));
+      await (tx as unknown as typeof db)
+        .update(routineTriggers)
+        .set({ signingMode: "hmac_sha256" })
+        .where(eq(routineTriggers.id, created.trigger.id));
+    });
+
+    await expect(pending).resolves.toMatchObject({
+      status: 400,
+      details: { code: "agent_cannot_weaken_trigger_auth", field: "signingMode" },
+    });
+    await expect(db.select().from(routineTriggers).where(eq(routineTriggers.id, created.trigger.id)))
+      .resolves.toMatchObject([{ signingMode: "hmac_sha256" }]);
   });
 
   it("wakes the assignee when a routine creates a fresh execution issue", async () => {
@@ -2551,6 +2724,85 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
 
     expect(run.source).toBe("webhook");
     expect(run.status).toBe("issue_created");
+  });
+
+  it("accepts an HMAC-SHA1 raw-body signature with hmac_sha1 signing mode", async () => {
+    const { routine, svc } = await seedFixture();
+    const { trigger, secretMaterial } = await svc.createTrigger(
+      routine.id,
+      {
+        kind: "webhook",
+        signingMode: "hmac_sha1",
+      },
+      {},
+    );
+
+    const payload = { type: "deployment.succeeded", id: "dpl_1" };
+    const rawBody = Buffer.from(JSON.stringify(payload));
+    // Vercel-style: bare hex in the signature header, no prefix.
+    const signature = createHmac("sha1", secretMaterial!.webhookSecret)
+      .update(rawBody)
+      .digest("hex");
+
+    // Native x-vercel-signature header, no proxy rewrite.
+    const run = await svc.firePublicTrigger(trigger.publicId!, {
+      vercelSignatureHeader: signature,
+      rawBody,
+      payload,
+    });
+
+    expect(run.source).toBe("webhook");
+    expect(run.status).toBe("issue_created");
+  });
+
+  it("accepts a sha1=-prefixed HMAC-SHA1 signature (Intercom-style X-Hub-Signature)", async () => {
+    const { routine, svc } = await seedFixture();
+    const { trigger, secretMaterial } = await svc.createTrigger(
+      routine.id,
+      {
+        kind: "webhook",
+        signingMode: "hmac_sha1",
+      },
+      {},
+    );
+
+    const payload = { type: "conversation.user.created" };
+    const rawBody = Buffer.from(JSON.stringify(payload));
+    const signature = `sha1=${createHmac("sha1", secretMaterial!.webhookSecret)
+      .update(rawBody)
+      .digest("hex")}`;
+
+    // The route carries a native X-Hub-Signature as firefliesSignatureHeader.
+    const run = await svc.firePublicTrigger(trigger.publicId!, {
+      firefliesSignatureHeader: signature,
+      rawBody,
+      payload,
+    });
+
+    expect(run.source).toBe("webhook");
+    expect(run.status).toBe("issue_created");
+  });
+
+  it("rejects invalid signature for hmac_sha1 signing mode", async () => {
+    const { routine, svc } = await seedFixture();
+    const { trigger } = await svc.createTrigger(
+      routine.id,
+      {
+        kind: "webhook",
+        signingMode: "hmac_sha1",
+      },
+      {},
+    );
+
+    const rawBody = Buffer.from(JSON.stringify({ ok: true }));
+
+    await expect(
+      svc.firePublicTrigger(trigger.publicId!, {
+        signatureHeader: "0000000000000000000000000000000000000000",
+        rawBody,
+        payload: { ok: true },
+      }),
+    ).rejects.toThrow();
   });
 
   it("rejects invalid signature for github_hmac signing mode", async () => {
