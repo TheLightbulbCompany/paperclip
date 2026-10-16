@@ -117,7 +117,18 @@ describeEmbeddedPostgres("agent create idempotency routes", () => {
       await db.select().from(activityLog).where(eq(activityLog.action, "agent.created")),
     ).toHaveLength(1);
     expect(await db.select().from(companyMemberships)).toHaveLength(1);
-    expect(await db.select().from(principalPermissionGrants)).toHaveLength(1);
+    // Upstream grants new agents a default configuration set (#15283); the
+    // keyed create must grant exactly what one plain create grants.
+    const keyedGrants = await db.select().from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.companyId, company.id));
+    const plainCompany = await seedCompany("Plain create");
+    const plain = await request(app).post(`/api/companies/${plainCompany.id}/agents`).send(agentBody());
+    expect(plain.status).toBe(201);
+    const plainGrants = await db.select().from(principalPermissionGrants)
+      .where(eq(principalPermissionGrants.companyId, plainCompany.id));
+    expect(keyedGrants.length).toBeGreaterThan(0);
+    expect(keyedGrants.map((grant) => grant.permissionKey).sort())
+      .toEqual(plainGrants.map((grant) => grant.permissionKey).sort());
   });
 
   it("replays the original agent when a retry changes its volatile payload", async () => {
