@@ -1045,6 +1045,10 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
         ? "Hermes gateway run was cancelled."
         : "Hermes gateway run was cancelled, but Hermes did not confirm that the remote run stopped.",
       provider: "hermes_gateway",
+      // isol8: keep the stopped turn's accounting, as mapFinalResultForTest does.
+      model: extractModel(finalStatus),
+      ...(parseUsage(finalStatus) ? { usage: parseUsage(finalStatus) } : {}),
+      ...(parseCostUsd(finalStatus) !== null ? { costUsd: parseCostUsd(finalStatus) } : {}),
       resultJson: {
         run_id: runId,
         status: status ?? "unconfirmed",
