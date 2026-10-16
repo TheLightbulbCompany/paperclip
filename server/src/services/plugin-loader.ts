@@ -128,6 +128,7 @@ const K8S_IN_CLUSTER_ENV_PASSTHROUGH = [
  * the token.
  */
 const ISOL8_NOTIFICATIONS_PLUGIN_ID = "isol8.notifications";
+const ISOL8_NOTIFICATIONS_PACKAGE_NAME = "@paperclipai/plugin-isol8-notifications";
 const ISOL8_NOTIFICATIONS_ENV_PASSTHROUGH = [
   "PAPERCLIP_ISOL8_NOTIFY_URL",
   "PAPERCLIP_ISOL8_NOTIFY_TOKEN",
@@ -180,7 +181,16 @@ export function buildPluginWorkerEnv(input: {
     PAPERCLIP_DEPLOYMENT_MODE: input.instanceInfo.deploymentMode ?? "",
     PAPERCLIP_DEPLOYMENT_EXPOSURE: input.instanceInfo.deploymentExposure ?? "",
   };
-  if (input.manifest.id === ISOL8_NOTIFICATIONS_PLUGIN_ID) {
+  const trustedLocalRoots = input.trustedLocalPluginRoots
+    ?? [BUNDLED_LOCAL_PLUGIN_ROOT, resolveBundledCatalogRoot(processEnv)];
+  // The manifest id is plugin-controlled, so the notify token also requires
+  // the bundled package identity: our package name, installed from a local
+  // path inside the image's plugin tree (never a registry install).
+  const isBundledIsol8Notifications = input.manifest.id === ISOL8_NOTIFICATIONS_PLUGIN_ID
+    && input.packageName === ISOL8_NOTIFICATIONS_PACKAGE_NAME
+    && input.packagePath != null
+    && trustedLocalRoots.some((root) => isPathWithin(root, path.resolve(input.packagePath as string)));
+  if (isBundledIsol8Notifications) {
     for (const key of ISOL8_NOTIFICATIONS_ENV_PASSTHROUGH) {
       const value = processEnv[key];
       if (value && value.trim().length > 0) {
@@ -192,8 +202,6 @@ export function buildPluginWorkerEnv(input: {
     && input.manifest.capabilities.includes("environment.drivers.register");
   if (!canRegisterEnvironmentDrivers) return env;
 
-  const trustedLocalRoots = input.trustedLocalPluginRoots
-    ?? [BUNDLED_LOCAL_PLUGIN_ROOT, resolveBundledCatalogRoot(processEnv)];
   const installOriginTrusted =
     input.packagePath == null
     || trustedLocalRoots.some((root) => isPathWithin(root, path.resolve(input.packagePath as string)));

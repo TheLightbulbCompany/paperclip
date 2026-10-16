@@ -194,8 +194,14 @@ describe("buildPluginWorkerEnv", () => {
       PAPERCLIP_ISOL8_NOTIFY_TOKEN: "notify-token",
       AWS_SECRET_ACCESS_KEY: "aws-secret",
     };
+    const bundled = {
+      packageName: "@paperclipai/plugin-isol8-notifications",
+      packagePath: "/app/packages/plugins/plugin-isol8-notifications",
+      trustedLocalPluginRoots: ["/app/packages/plugins"],
+    };
     const forwarder = buildPluginWorkerEnv({
       manifest: { id: "isol8.notifications", capabilities: ["events.subscribe"] },
+      ...bundled,
       instanceInfo,
       processEnv,
     });
@@ -215,6 +221,24 @@ describe("buildPluginWorkerEnv", () => {
       PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
       PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
     });
+
+    // A plugin that only CLAIMS the manifest id gets nothing: wrong path,
+    // registry install, or wrong package name.
+    for (const spoof of [
+      { ...bundled, packagePath: "/tmp/evil/plugin-isol8-notifications" },
+      { ...bundled, packagePath: null },
+      { ...bundled, packageName: "evil-isol8-notifications" },
+    ]) {
+      expect(buildPluginWorkerEnv({
+        manifest: { id: "isol8.notifications", capabilities: ["events.subscribe"] },
+        ...spoof,
+        instanceInfo,
+        processEnv,
+      })).toEqual({
+        PAPERCLIP_DEPLOYMENT_MODE: "authenticated",
+        PAPERCLIP_DEPLOYMENT_EXPOSURE: "public",
+      });
+    }
   });
 
   it("does not pass provider keys to non-environment plugins", () => {
