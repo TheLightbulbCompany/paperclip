@@ -38,7 +38,12 @@ import { badRequest, conflict, forbidden, notFound, unprocessable } from "../err
 import { PORTABLE_ZIP_UPLOAD_LIMIT_BYTES } from "../http/body-limits.js";
 import { logger } from "../middleware/logger.js";
 import { validate } from "../middleware/validate.js";
-import { readIdempotencyHeaders, runIdempotentOperation } from "../services/idempotent-operations.js";
+import {
+  completeIdempotentOperation,
+  createActivityLogged,
+  readIdempotencyHeaders,
+  runIdempotentOperation,
+} from "../services/idempotent-operations.js";
 import {
   assembleImportTransferZip,
   importTransferPartName,
@@ -1237,16 +1242,17 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     };
     const idempotency = readIdempotencyHeaders(req);
     if (idempotency) {
+      const target = {
+        operation: "company.create" as const,
+        key: idempotency.key,
+        companyId: null,
+        // Keys are per creating principal: another admin's key never replays
+        // someone else's company.
+        scope: `user:${ownerPrincipalId}`,
+      };
       const { result, replayed } = await runIdempotentOperation(
         db,
-        {
-          operation: "company.create",
-          key: idempotency.key,
-          companyId: null,
-          // Keys are per creating principal: another admin's key never replays
-          // someone else's company.
-          scope: `user:${ownerPrincipalId}`,
-        },
+        target,
         { replayOnly: idempotency.replayOnly },
         {
           replay: async (record, tx) => (record.companyId ? companyService(tx).getById(record.companyId) : null),
@@ -1256,12 +1262,19 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
           },
         },
       );
-      if (replayed) {
-        res.status(200).json(result);
-        return;
-      }
-      await logCompanyCreated(req, result);
-      res.status(201).json(result);
+      // The audit runs once per record under the key's lock, so a retry
+      // finishes an audit the first attempt lost.
+      await completeIdempotentOperation(
+        db,
+        target,
+        async () => {
+          if (!(await createActivityLogged(db, result.id, "company.created", result.id))) {
+            await logCompanyCreated(req, result);
+          }
+        },
+        async () => undefined,
+      );
+      res.status(replayed ? 200 : 201).json(result);
       return;
     }
     const company = await createCompany(db);

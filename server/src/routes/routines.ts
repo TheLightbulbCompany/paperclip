@@ -16,7 +16,12 @@ import { validate, validateIssueMutationBody } from "../middleware/validate.js";
 import { accessService, documentAnnotationService, logActivity, routineService } from "../services/index.js";
 import { assertCompanyAccess, getAccessibleResource, getActorInfo, hasCompanyAccess } from "./authz.js";
 import { badRequest, forbidden, unauthorized, unsupportedMediaType } from "../errors.js";
-import { readIdempotencyHeaders, runIdempotentOperation } from "../services/idempotent-operations.js";
+import {
+  completeIdempotentOperation,
+  createActivityLogged,
+  readIdempotencyHeaders,
+  runIdempotentOperation,
+} from "../services/idempotent-operations.js";
 import { getTelemetryClient } from "../telemetry.js";
 import type { PluginWorkerManager } from "../services/plugin-worker-manager.js";
 
@@ -168,55 +173,68 @@ export function routineRoutes(
     // and a retry replays it (200) instead of creating a duplicate.
     const idempotency = readIdempotencyHeaders(req);
     type CreatedRoutine = Awaited<ReturnType<typeof svc.create>>;
-    let created: CreatedRoutine;
-    if (idempotency) {
-      const outcome = await runIdempotentOperation<CreatedRoutine>(
-        db,
-        { operation: "routine.create", key: idempotency.key, companyId },
-        { replayOnly: idempotency.replayOnly },
-        {
-          replay: async (record, tx) => (record.resourceId ? routineService(tx).get(record.resourceId) : null),
-          create: async (tx) => {
-            const routine = await routineService(tx, { pluginWorkerManager: options.pluginWorkerManager })
-              .create(companyId, req.body, createActor);
-            return { result: routine, resourceId: routine.id, companyId };
-          },
-        },
-      );
-      if (outcome.replayed) {
-        res.status(200).json(outcome.result);
-        return;
+    const auditCreated = async (created: CreatedRoutine) => {
+      const actor = getActorInfo(req);
+      await logActivity(db, {
+        companyId,
+        actorType: actor.actorType,
+        actorId: actor.actorId,
+        agentId: actor.agentId,
+        runId: actor.runId,
+        agentApiKeyId: actor.agentApiKeyId,
+        action: "routine.created",
+        entityType: "routine",
+        entityId: created.id,
+        details: { title: created.title, assigneeAgentId: created.assigneeAgentId },
+      });
+      const telemetryClient = getTelemetryClient();
+      if (telemetryClient) {
+        trackRoutineCreated(telemetryClient);
       }
-      created = outcome.result;
-    } else {
-      created = await svc.create(companyId, req.body, createActor);
+      await logRoutineRevisionCreated(req, {
+        companyId,
+        routineId: created.id,
+        revisionId: created.latestRevisionId,
+        revisionNumber: created.latestRevisionNumber,
+        changeSummary: "Created routine",
+        triggerCount: 0,
+      });
+    };
+    if (!idempotency) {
+      const created = await svc.create(companyId, req.body, createActor);
+      await auditCreated(created);
+      res.status(201).json(created);
+      return;
     }
-    const actor = getActorInfo(req);
-    await logActivity(db, {
-      companyId,
-      actorType: actor.actorType,
-      actorId: actor.actorId,
-      agentId: actor.agentId,
-      runId: actor.runId,
-      agentApiKeyId: actor.agentApiKeyId,
-      action: "routine.created",
-      entityType: "routine",
-      entityId: created.id,
-      details: { title: created.title, assigneeAgentId: created.assigneeAgentId },
-    });
-    const telemetryClient = getTelemetryClient();
-    if (telemetryClient) {
-      trackRoutineCreated(telemetryClient);
-    }
-    await logRoutineRevisionCreated(req, {
-      companyId,
-      routineId: created.id,
-      revisionId: created.latestRevisionId,
-      revisionNumber: created.latestRevisionNumber,
-      changeSummary: "Created routine",
-      triggerCount: 0,
-    });
-    res.status(201).json(created);
+    const target = { operation: "routine.create" as const, key: idempotency.key, companyId };
+    const outcome = await runIdempotentOperation<CreatedRoutine>(
+      db,
+      target,
+      { replayOnly: idempotency.replayOnly },
+      {
+        replay: async (record, tx) => (record.resourceId ? routineService(tx).get(record.resourceId) : null),
+        create: async (tx) => {
+          const routine = await routineService(tx, { pluginWorkerManager: options.pluginWorkerManager })
+            .create(companyId, req.body, createActor);
+          return { result: routine, resourceId: routine.id, companyId };
+        },
+      },
+    );
+    // The routine commits before its audit rows. The audit runs once per
+    // record under the key's lock, so a retry finishes an audit the first
+    // attempt lost (records from before this phase existed are checked
+    // against the activity log instead of being audited twice).
+    await completeIdempotentOperation(
+      db,
+      target,
+      async () => {
+        if (!(await createActivityLogged(db, companyId, "routine.created", outcome.result.id))) {
+          await auditCreated(outcome.result);
+        }
+      },
+      async () => undefined,
+    );
+    res.status(outcome.replayed ? 200 : 201).json(outcome.result);
   });
 
   router.get("/routines/:id", async (req, res) => {
@@ -697,6 +715,7 @@ export function routineRoutes(
       signatureHeader: req.header("x-paperclip-signature"),
       hubSignatureHeader: req.header("x-hub-signature-256"),
       firefliesSignatureHeader: req.header("x-hub-signature"),
+      vercelSignatureHeader: req.header("x-vercel-signature"),
       timestampHeader: req.header("x-paperclip-timestamp"),
       idempotencyKey: req.header("idempotency-key") ?? req.header("x-github-delivery"),
       rawBody: (req as { rawBody?: Buffer }).rawBody ?? null,

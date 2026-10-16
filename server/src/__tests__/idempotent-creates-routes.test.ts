@@ -186,6 +186,23 @@ describeEmbeddedPostgres("idempotent create routes", () => {
       ).toHaveLength(1);
     });
 
+    it("a retry finishes the audit a committed first attempt lost", async () => {
+      const { companyId, agentId, projectId, userId } = await seedCompany();
+      const app = boardApp({ type: "board", userId, source: "session", isInstanceAdmin: false, companyIds: [companyId] });
+      const path = `/api/companies/${companyId}/routines`;
+      const key = `lost-audit:${companyId}`;
+      const first = await request(app).post(path).set("Idempotency-Key", key).send(routineBody(agentId, projectId)).expect(201);
+      // Simulate a crash between the routine commit and its audit writes.
+      await db.delete(activityLog).where(eq(activityLog.entityId, first.body.id));
+      await db.update(idempotentOperations).set({ completedAt: null }).where(eq(idempotentOperations.idempotencyKey, key));
+
+      await request(app).post(path).set("Idempotency-Key", key).send(routineBody(agentId, projectId)).expect(200);
+      await request(app).post(path).set("Idempotency-Key", key).send(routineBody(agentId, projectId)).expect(200);
+      expect(
+        await db.select().from(activityLog).where(and(eq(activityLog.action, "routine.created"), eq(activityLog.entityId, first.body.id))),
+      ).toHaveLength(1);
+    });
+
     it("replays the original routine and refuses a replay-only miss", async () => {
       const { companyId, agentId, projectId, userId } = await seedCompany();
       const app = boardApp({ type: "board", userId, source: "session", isInstanceAdmin: false, companyIds: [companyId] });

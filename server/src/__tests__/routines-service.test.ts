@@ -2744,8 +2744,9 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .update(rawBody)
       .digest("hex");
 
+    // Native x-vercel-signature header, no proxy rewrite.
     const run = await svc.firePublicTrigger(trigger.publicId!, {
-      signatureHeader: signature,
+      vercelSignatureHeader: signature,
       rawBody,
       payload,
     });
@@ -2771,8 +2772,9 @@ describeEmbeddedPostgres("routine service live-execution coalescing", () => {
       .update(rawBody)
       .digest("hex")}`;
 
+    // The route carries a native X-Hub-Signature as firefliesSignatureHeader.
     const run = await svc.firePublicTrigger(trigger.publicId!, {
-      hubSignatureHeader: signature,
+      firefliesSignatureHeader: signature,
       rawBody,
       payload,
     });

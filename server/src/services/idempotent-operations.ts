@@ -1,7 +1,7 @@
 import { and, eq, sql } from "drizzle-orm";
 import type { Request } from "express";
 import type { Db } from "@paperclipai/db";
-import { idempotentOperations } from "@paperclipai/db";
+import { activityLog, idempotentOperations } from "@paperclipai/db";
 import { conflict, notFound, unprocessable } from "../errors.js";
 
 /**
@@ -155,6 +155,20 @@ export async function completeIdempotentOperation<T>(
       .where(eq(idempotentOperations.id, record.id));
     return result;
   });
+}
+
+/**
+ * True when the create's audit row exists. A keyed create commits before its
+ * activity write, so a replay uses this to finish an audit the first attempt
+ * lost instead of skipping it forever.
+ */
+export async function createActivityLogged(db: Db, companyId: string, action: string, entityId: string) {
+  const rows = await db
+    .select({ id: activityLog.id })
+    .from(activityLog)
+    .where(and(eq(activityLog.companyId, companyId), eq(activityLog.action, action), eq(activityLog.entityId, entityId)))
+    .limit(1);
+  return rows.length > 0;
 }
 
 /** Overwrites a record's resource and payload in place (agent key rotation). */

@@ -3182,6 +3182,7 @@ export function routineService(
       signatureHeader?: string | null;
       hubSignatureHeader?: string | null;
       firefliesSignatureHeader?: string | null;
+      vercelSignatureHeader?: string | null;
       timestampHeader?: string | null;
       idempotencyKey?: string | null;
       rawBody?: Buffer | null;
@@ -3258,7 +3259,14 @@ export function routineService(
             // hub-style header, with an optional "sha1=" prefix.
             const secretValue = await resolveTriggerSecret(trigger, routine.companyId);
             const rawBody = input.rawBody ?? Buffer.from(JSON.stringify(input.payload ?? {}));
-            const providedSignature = (input.signatureHeader ?? input.hubSignatureHeader)?.trim() ?? "";
+            // Native headers: Vercel's x-vercel-signature, Intercom's
+            // X-Hub-Signature (carried as firefliesSignatureHeader).
+            const providedSignature = (
+              input.signatureHeader
+              ?? input.vercelSignatureHeader
+              ?? input.firefliesSignatureHeader
+              ?? input.hubSignatureHeader
+            )?.trim() ?? "";
             if (!providedSignature) throw unauthorized();
             const expectedHmac = crypto
               .createHmac("sha1", secretValue)
