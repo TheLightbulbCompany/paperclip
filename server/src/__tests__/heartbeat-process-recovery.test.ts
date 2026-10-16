@@ -7756,6 +7756,80 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     ))).toEqual([]);
   });
 
+  it.each(["isol8.1 Hermes terminal result", "remoteExecutionStopped receipt"] as const)(
+    "a parked comment resumes a task held after a hermes_gateway run with a %s, with no board action (ISOA-837)",
+    async (shape) => {
+      const { companyId, agentId, issueId, runId } = await seedRunFixture({
+        adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "failed",
+        runErrorCode: "hermes_gateway_run_failed", runError: "model_unavailable",
+      });
+      await db.update(heartbeatRuns).set({
+        finishedAt: new Date(Date.now() - 60 * 60_000),
+        resultJson: shape === "isol8.1 Hermes terminal result"
+          ? { run_id: "hermes-run", status: "failed" }
+          : { run_id: "hermes-run", status: "failed", remoteExecutionStopped: true },
+      }).where(eq(heartbeatRuns.id, runId));
+      await db.update(agents).set({ status: "error", adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } })
+        .where(eq(agents.id, agentId));
+      await db.update(issues).set({ status: "blocked" }).where(eq(issues.id, issueId));
+      const [hold] = await db.insert(issueRecoveryActions).values({
+        companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+        ownerType: "board", returnOwnerAgentId: agentId, cause: "legacy_execution_requires_reconciliation",
+        fingerprint: `legacy-execution:${runId}`, nextAction: "Automatic recovery stopped.",
+        evidence: { runId, automaticRecovery: { runId, policy: "preserve_without_replay_v1", replay: "blocked", actionOutcome: "unknown" } },
+      }).returning();
+      const heartbeat = heartbeatService(db);
+      const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "responsible-user", body: "Please continue" }).returning();
+      const deferred = () => db.select().from(agentWakeupRequests).where(and(
+        eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution")));
+      // The prod shape: the comment was parked behind the hold (e.g. by isol8.2's admission).
+      await db.insert(agentWakeupRequests).values({
+        companyId, agentId, source: "automation", triggerDetail: "system", reason: "issue_reopened_via_comment",
+        status: "deferred_issue_execution", requestedByActorType: "user", requestedByActorId: "responsible-user",
+        updatedAt: new Date(Date.now() - 60_000),
+        payload: { issueId, commentId: comment!.id, mutation: "comment",
+          executionWait: { reason: "process_identity_missing", message: "The previous run has no verified stop record.", recoveryActionId: hold!.id },
+          _paperclipWakeContext: { issueId, taskId: issueId, commentId: comment!.id, wakeCommentId: comment!.id,
+            wakeCommentIds: [comment!.id], wakeReason: "issue_reopened_via_comment", wakeSource: "automation", wakeTriggerDetail: "system" } },
+      });
+
+      await heartbeat.resumeExecutionWaitComments(); // the periodic sweep; nobody resolves a card
+
+      await vi.waitFor(async () => {
+        const runs = await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.agentId, agentId));
+        expect(runs.some(run => run.id !== runId && JSON.stringify(run.contextSnapshot).includes(comment!.id))).toBe(true);
+      }, { timeout: 15_000 });
+      expect(await deferred()).toEqual([]);
+      const [retired] = await db.select().from(issueRecoveryActions).where(eq(issueRecoveryActions.id, hold!.id));
+      expect(retired!.evidence).toMatchObject({ automaticRecovery: { replay: "explicit_user_continuation" } });
+      expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+    },
+  );
+
+  it("keeps a hermes_gateway hold without a Hermes stop record (timeout, no receipt)", async () => {
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "failed",
+      runErrorCode: "hermes_gateway_timeout", runError: "Hermes gateway run timed out",
+    });
+    await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 60 * 60_000),
+      resultJson: { status: "unconfirmed", remoteExecutionStopped: false } }).where(eq(heartbeatRuns.id, runId));
+    await db.update(agents).set({ adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } }).where(eq(agents.id, agentId));
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",
+      ownerType: "board", returnOwnerAgentId: agentId, cause: "legacy_execution_requires_reconciliation",
+      fingerprint: `legacy-execution:${runId}`, nextAction: "Automatic recovery stopped.",
+      evidence: { runId, automaticRecovery: { replay: "blocked" } },
+    }).returning();
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorType: "user", authorUserId: "responsible-user", body: "Continue" }).returning();
+    const heartbeat = heartbeatService(db);
+    const next = await heartbeat.wakeup(agentId, {
+      source: "automation", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId, commentId: comment!.id }, contextSnapshot: { issueId, commentId: comment!.id, wakeReason: "issue_commented" },
+    });
+    expect(next).toBeNull();
+    expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: hold!.id });
+  });
+
   it("a board reconciliation delivers a comment parked behind a pre-receipt hermes_gateway hold (ISOA-837 nudge)", async () => {
     const { companyId, agentId, issueId, runId } = await seedRunFixture({
       adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "failed",
