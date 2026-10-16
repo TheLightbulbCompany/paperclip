@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import express from "express";
 import request from "supertest";
-import { and, eq, isNull } from "drizzle-orm";
+import { and, eq, isNull, sql } from "drizzle-orm";
 import { afterAll, afterEach, beforeAll, describe, expect, it } from "vitest";
 import {
   activityLog,
@@ -191,16 +191,28 @@ describeEmbeddedPostgres("idempotent create routes", () => {
       const app = boardApp({ type: "board", userId, source: "session", isInstanceAdmin: false, companyIds: [companyId] });
       const path = `/api/companies/${companyId}/routines`;
       const key = `lost-audit:${companyId}`;
-      const first = await request(app).post(path).set("Idempotency-Key", key).send(routineBody(agentId, projectId)).expect(201);
-      // Simulate a crash between the routine commit and its audit writes.
-      await db.delete(activityLog).where(eq(activityLog.entityId, first.body.id));
-      await db.update(idempotentOperations).set({ completedAt: null }).where(eq(idempotentOperations.idempotencyKey, key));
+      // The first attempt commits the routine, then its audit insert fails.
+      await db.execute(sql`create function fail_routine_audit() returns trigger language plpgsql as $$
+        begin if new.action = 'routine.created' then raise exception 'audit down'; end if; return new; end $$`);
+      await db.execute(sql`create trigger fail_routine_audit before insert on activity_log
+        for each row execute function fail_routine_audit()`);
+      try {
+        await request(app).post(path).set("Idempotency-Key", key).send(routineBody(agentId, projectId)).expect(500);
+      } finally {
+        await db.execute(sql`drop trigger fail_routine_audit on activity_log`);
+        await db.execute(sql`drop function fail_routine_audit()`);
+      }
+      const [routine] = await db.select().from(routines).where(eq(routines.companyId, companyId));
+      const first = { body: { id: routine!.id } };
 
+      // A different board actor retries; the audit still names the creator.
+      const retrier = boardApp({ type: "board", userId: "u_retrier", source: "session", isInstanceAdmin: true, companyIds: [companyId] });
+      await request(retrier).post(path).set("Idempotency-Key", key).send(routineBody(agentId, projectId)).expect(200);
       await request(app).post(path).set("Idempotency-Key", key).send(routineBody(agentId, projectId)).expect(200);
-      await request(app).post(path).set("Idempotency-Key", key).send(routineBody(agentId, projectId)).expect(200);
-      expect(
-        await db.select().from(activityLog).where(and(eq(activityLog.action, "routine.created"), eq(activityLog.entityId, first.body.id))),
-      ).toHaveLength(1);
+      const audits = await db.select().from(activityLog)
+        .where(and(eq(activityLog.action, "routine.created"), eq(activityLog.entityId, first.body.id)));
+      expect(audits).toHaveLength(1);
+      expect(audits[0]!.actorId).toBe(userId);
     });
 
     it("replays the original routine and refuses a replay-only miss", async () => {

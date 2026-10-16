@@ -1258,7 +1258,13 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
           replay: async (record, tx) => (record.companyId ? companyService(tx).getById(record.companyId) : null),
           create: async (tx) => {
             const created = await createCompany(tx);
-            return { result: created, resourceId: created.id, companyId: created.id };
+            return {
+              result: created,
+              resourceId: created.id,
+              companyId: created.id,
+              // Frozen so a recovery audit by a retry names the creator.
+              completionPayload: { actorId: req.actor.userId ?? "board" },
+            };
           },
         },
       );
@@ -1267,9 +1273,10 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
       await completeIdempotentOperation(
         db,
         target,
-        async () => {
+        async (record) => {
           if (!(await createActivityLogged(db, result.id, "company.created", result.id))) {
-            await logCompanyCreated(req, result);
+            const frozenActorId = record.completionPayload.actorId;
+            await logCompanyCreated(req, result, typeof frozenActorId === "string" ? frozenActorId : undefined);
           }
         },
         async () => undefined,
@@ -1282,11 +1289,11 @@ export function companyRoutes(db: Db, storage?: StorageService, options?: Compan
     res.status(201).json(company);
   });
 
-  async function logCompanyCreated(req: Request, company: { id: string; name: string }) {
+  async function logCompanyCreated(req: Request, company: { id: string; name: string }, actorId?: string) {
     await logActivity(db, {
       companyId: company.id,
       actorType: "user",
-      actorId: req.actor.userId ?? "board",
+      actorId: actorId ?? req.actor.userId ?? "board",
       action: "company.created",
       entityType: "company",
       entityId: company.id,

@@ -130,9 +130,9 @@ export function routineRoutes(
     revisionNumber: number;
     changeSummary?: string | null;
     triggerCount?: number | null;
-  }) {
+  }, actorOverride?: ReturnType<typeof getActorInfo>) {
     if (!input.revisionId) return;
-    const actor = getActorInfo(req);
+    const actor = actorOverride ?? getActorInfo(req);
     await logActivity(db, {
       companyId: input.companyId,
       actorType: actor.actorType,
@@ -173,8 +173,8 @@ export function routineRoutes(
     // and a retry replays it (200) instead of creating a duplicate.
     const idempotency = readIdempotencyHeaders(req);
     type CreatedRoutine = Awaited<ReturnType<typeof svc.create>>;
-    const auditCreated = async (created: CreatedRoutine) => {
-      const actor = getActorInfo(req);
+    type AuditActor = ReturnType<typeof getActorInfo>;
+    const auditCreated = async (created: CreatedRoutine, actor: AuditActor = getActorInfo(req)) => {
       await logActivity(db, {
         companyId,
         actorType: actor.actorType,
@@ -198,7 +198,7 @@ export function routineRoutes(
         revisionNumber: created.latestRevisionNumber,
         changeSummary: "Created routine",
         triggerCount: 0,
-      });
+      }, actor);
     };
     if (!idempotency) {
       const created = await svc.create(companyId, req.body, createActor);
@@ -216,7 +216,9 @@ export function routineRoutes(
         create: async (tx) => {
           const routine = await routineService(tx, { pluginWorkerManager: options.pluginWorkerManager })
             .create(companyId, req.body, createActor);
-          return { result: routine, resourceId: routine.id, companyId };
+          // The creating actor, frozen so a recovery audit by a retry is
+          // still attributed to whoever created the routine.
+          return { result: routine, resourceId: routine.id, companyId, completionPayload: { actor: getActorInfo(req) } };
         },
       },
     );
@@ -227,9 +229,10 @@ export function routineRoutes(
     await completeIdempotentOperation(
       db,
       target,
-      async () => {
+      async (record) => {
         if (!(await createActivityLogged(db, companyId, "routine.created", outcome.result.id))) {
-          await auditCreated(outcome.result);
+          const frozen = record.completionPayload.actor as AuditActor | undefined;
+          await auditCreated(outcome.result, frozen ?? getActorInfo(req));
         }
       },
       async () => undefined,
