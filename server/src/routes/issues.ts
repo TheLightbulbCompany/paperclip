@@ -8,7 +8,7 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
-import { requiresExecutionReconciliation } from "@paperclipai/shared";
+import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
@@ -9089,9 +9089,18 @@ export function issueRoutes(
       trigger: "read_projection",
       actor: getActorInfo(req),
     });
+    // Upstream #16169 (carried): a settled hold that still blocks replay is listed, so the
+    // board can see and reconcile it. isol8: the fork has no legacy workspace-recovery schema,
+    // so only the execution-reconciliation arm of upstream's or() applies.
+    const retainedHolds = await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
+    )).orderBy(desc(issueRecoveryActions.createdAt));
     res.json({
       active,
-      actions: active ? [active] : [],
+      actions: [...(active ? [active] : []), ...retainedHolds
+        .filter(action => action.id !== active?.id).map(issueRecoveryActionReadModel)],
     });
   });
 

@@ -7719,6 +7719,41 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
   });
 
+  it("starts a run for a user comment after a hermes_gateway run failed with a Hermes terminal status (ISOA-837)", async () => {
+    // What the hermes_gateway adapter returns when Hermes reports the run failed (mapFinalResultForTest).
+    mockAdapterExecute.mockImplementationOnce(async () => ({
+      exitCode: 1, signal: null, timedOut: false, errorCode: "hermes_gateway_run_failed",
+      errorMessage: "model_unavailable", provider: "hermes_gateway", model: "test-model",
+      resultJson: { run_id: "hermes-run", status: "failed", remoteExecutionStopped: true },
+    }) as never);
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "queued",
+    });
+    await db.update(agents).set({ adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(async () => expect((await heartbeat.getRun(runId))?.status).toBe("failed"));
+    expect((await heartbeat.getRun(runId))?.resultJson).toMatchObject({ conversationContinuation: "continue_conversation_v1" });
+    // No recovery hold once the run's lease is released: Hermes reported the remote run ended.
+    await vi.waitFor(async () => expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull());
+    await vi.waitFor(async () => expect((await db.select().from(agents).where(eq(agents.id, agentId)))[0]?.status).toBe("error"));
+
+    // An agent in `error` stays invokable: the user's next comment starts a fresh run.
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "Try again" }).returning();
+    const next = await heartbeat.wakeup(agentId, {
+      source: "automation", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId, commentId: comment!.id }, contextSnapshot: { issueId, commentId: comment!.id, wakeReason: "issue_commented" },
+    });
+    expect(next?.id).toBeTruthy();
+    expect(next!.id).not.toBe(runId);
+    expect(next!.contextSnapshot).toMatchObject({ issueId, wakeCommentIds: [comment!.id] });
+    // Paperclip's own failed-run retry carries the comment; nothing is left deferred.
+    expect(next!.status === "scheduled_retry" ? next!.retryOfRunId : runId).toBe(runId);
+    expect(await db.select().from(agentWakeupRequests).where(and(
+      eq(agentWakeupRequests.agentId, agentId), eq(agentWakeupRequests.status, "deferred_issue_execution"),
+    ))).toEqual([]);
+  });
+
   it.each(["dedicated deferred donor", "non-coalescing recipient", "persistent agent conversation"] as const)(
     "does not adopt unrelated queued comments for a %s after Stop",
     async (direction) => {
