@@ -7659,6 +7659,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
   });
 
+  it("continues a hermes_gateway run stopped with a confirmed provider stop when the user comments", async () => {
+    let context!: { onCancellationReady?: () => Promise<void>; signal?: AbortSignal };
+    mockAdapterExecute.mockImplementationOnce(async (input) => {
+      context = input as typeof context;
+      await context.onCancellationReady?.();
+      await new Promise<void>((resolve) => {
+        if (context.signal?.aborted) resolve();
+        else context.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      // The hermes_gateway adapter returns this only after Hermes reports the run cancelled.
+      return {
+        exitCode: 1, signal: "SIGTERM", timedOut: false, errorCode: "hermes_gateway_cancelled",
+        errorMessage: "Hermes gateway run was cancelled.", provider: "hermes_gateway", model: "test-model",
+        resultJson: { status: "cancelled", executionCancellation: {
+          state: "acknowledged", acknowledgedAt: new Date().toISOString(), proof: "hermes_gateway_terminal_cancelled",
+        } },
+      } as never;
+    });
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "queued",
+    });
+    await db.update(agents).set({ adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(() => expect(adapterExecutionControls.has(runId)).toBe(true));
+
+    await heartbeat.cancelRun(runId, "Cancelled by a board operator");
+    const stopped = await heartbeat.getRun(runId);
+    expect(stopped?.status).toBe("cancelled");
+    expect(stopped?.resultJson).toMatchObject({
+      conversationContinuation: "continue_conversation_v1",
+      executionCancellation: { state: "acknowledged" },
+    });
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "Carry on" }).returning();
+    const next = await heartbeat.wakeup(agentId, {
+      source: "automation", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId, commentId: comment!.id }, contextSnapshot: { issueId, commentId: comment!.id, wakeReason: "issue_commented" },
+    });
+    expect(next?.id).toBeTruthy();
+    expect(next!.id).not.toBe(runId);
+    expect(next!.contextSnapshot).toMatchObject({ issueId, wakeCommentIds: [comment!.id] });
+    await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
+  });
+
   it.each(["dedicated deferred donor", "non-coalescing recipient", "persistent agent conversation"] as const)(
     "does not adopt unrelated queued comments for a %s after Stop",
     async (direction) => {

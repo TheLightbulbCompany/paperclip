@@ -267,6 +267,12 @@ describe("server adapter registry", () => {
     expect(conversationAdapterTypes().filter((type) => type === "opencode_local")).toHaveLength(1);
   });
 
+  it("lets the built-in hermes_gateway adapter opt into conversation continuation", () => {
+    expect(findActiveServerAdapter("hermes_gateway")?.supportsConversationContinuation).toBe(true);
+    expect(isConversationAdapter("hermes_gateway")).toBe(true);
+    expect(isConversationAdapter("openclaw_gateway")).toBe(false);
+  });
+
   it("built-in claude_local adapter declares capability flags", () => {
     const adapter = findActiveServerAdapter("claude_local");
     expect(adapter).not.toBeNull();

@@ -802,6 +802,9 @@ const kimiLocalAdapter: ServerAdapterModule = {
 const hermesGatewayAdapter: ServerAdapterModule = {
   ...createHermesGatewayServerAdapter(),
   runtimeToolDelivery: "invocation_context",
+  // isol8: the issue-scoped session key resumes the same Hermes native session
+  // on the next wake, so a stopped run continues as a conversation turn.
+  supportsConversationContinuation: true,
 };
 
 const hermesLocalAdapter: ServerAdapterModule = {
@@ -893,6 +896,8 @@ function registerBuiltInAdapters() {
     httpAdapter,
   ]) {
     adaptersByType.set(adapter.type, adapter);
+    // isol8: built-in modules may opt in too, beyond the fixed list.
+    trackConversationSupport(adapter);
   }
 }
 
@@ -1007,7 +1012,7 @@ export function unregisterServerAdapter(type: string): void {
     if (fallback) {
       adaptersByType.set(type, fallback);
     }
-    setExternalConversationAdapter(type, false);
+    setExternalConversationAdapter(type, fallback?.supportsConversationContinuation === true);
     return;
   }
   if (BUILTIN_ADAPTER_TYPES.has(type)) {
@@ -1154,7 +1159,7 @@ export function setOverridePaused(type: string, paused: boolean): boolean {
   const wasPaused = pausedOverrides.has(type);
   if (paused && !wasPaused) {
     pausedOverrides.add(type);
-    setExternalConversationAdapter(type, false);
+    setExternalConversationAdapter(type, builtinFallbacks.get(type)?.supportsConversationContinuation === true);
     console.log(`[paperclip] Override paused for "${type}" — builtin adapter restored`);
     return true;
   }
