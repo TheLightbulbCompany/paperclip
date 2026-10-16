@@ -28,6 +28,16 @@ export function isConversationAdapter(adapterType: string): boolean {
   return conversationAdapterTypes().includes(adapterType);
 }
 
+// isol8: remote gateway adapters leave no host PID or environment lease, so
+// nothing here can tell whether their remote run still executes. Their runs
+// continue only when stamped from the adapter's own stop receipt; the
+// adapter type alone never releases a hold (e.g. after a Paperclip restart).
+const RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES = new Set(["hermes_gateway"]);
+
+function inferableConversationAdapterTypes(): string[] {
+  return conversationAdapterTypes().filter((type) => !RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES.has(type));
+}
+
 export const CONVERSATION_CONTINUATION_POLICY = "continue_conversation_v1";
 
 export function hasConversationContinuationPolicy(result: Record<string, unknown> | null | undefined): boolean {
@@ -42,14 +52,14 @@ export function claimedAdapterType(run: Pick<typeof heartbeatRuns.$inferSelect, 
 
 function conversationRunPredicate() {
   return or(
-    inArray(sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`, conversationAdapterTypes()),
+    inArray(sql`${heartbeatRuns.runnerProfileJson}->'adapterDispatch'->>'adapterType'`, inferableConversationAdapterTypes()),
     sql`${heartbeatRuns.resultJson}->>'conversationContinuation' = ${CONVERSATION_CONTINUATION_POLICY}`,
     sql`exists (
       select 1 from ${heartbeatRunEvents}
       where ${heartbeatRunEvents.companyId} = ${heartbeatRuns.companyId}
         and ${heartbeatRunEvents.runId} = ${heartbeatRuns.id}
         and ${heartbeatRunEvents.eventType} = 'adapter.invoke'
-        and ${inArray(sql`${heartbeatRunEvents.payload}->>'adapterType'`, conversationAdapterTypes())}
+        and ${inArray(sql`${heartbeatRunEvents.payload}->>'adapterType'`, inferableConversationAdapterTypes())}
     )`,
   );
 }
@@ -70,7 +80,7 @@ export async function runUsedConversationAdapter(db: Db, run: typeof heartbeatRu
   if (run.resultJson?.workspaceRestoreFailure === "restore_unsafe_archive") return false;
   if (hasConversationContinuationPolicy(run.resultJson)) return true;
   const adapterType = await historicalAdapterType(db, run);
-  return adapterType !== null && isConversationAdapter(adapterType);
+  return adapterType !== null && inferableConversationAdapterTypes().includes(adapterType);
 }
 
 /** Only immutable run evidence can retire a historical conversation hold.

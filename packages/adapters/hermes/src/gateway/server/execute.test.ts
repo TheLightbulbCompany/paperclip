@@ -825,6 +825,21 @@ describe("execute", () => {
       proof: "hermes_gateway_terminal_cancelled",
     });
   });
+  it("settles a Stop that arrives while the create request hangs, without acknowledging it", async () => {
+    vi.stubGlobal("fetch", vi.fn(async (_input: RequestInfo | URL, init?: RequestInit) =>
+      new Promise<Response>((_resolve, reject) => {
+        init?.signal?.addEventListener("abort", () => reject(init.signal!.reason), { once: true });
+      })));
+    const controller = new AbortController();
+    const ctx = { ...makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key" }), signal: controller.signal };
+    const pending = execute(ctx);
+    setTimeout(() => controller.abort(), 50);
+    const result = await pending;
+    expect(result.errorCode).toBe("hermes_gateway_cancelled");
+    expect(result.resultJson).toMatchObject({ remoteExecutionStopped: false });
+    expect(result.resultJson).not.toHaveProperty("executionCancellation");
+  });
+
   it("keeps a timeout unconfirmed when Hermes never answers the final status", async () => {
     const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
       const url = String(input);

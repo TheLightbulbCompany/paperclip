@@ -1942,6 +1942,20 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     }
   });
 
+  it("keeps the hold on an interrupted hermes_gateway run that has no stop receipt", async () => {
+    const { runId, issueId, companyId } = await seedRunFixture({
+      adapterType: "hermes_gateway", agentStatus: "idle", runStatus: "interrupted", runErrorCode: "server_shutdown_interrupted",
+    });
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType: "hermes_gateway" } } }).where(eq(heartbeatRuns.id, runId));
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "active", ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      evidence: { runId, automaticRecovery: { replay: "blocked" } }, nextAction: "Reconcile the stopped run.",
+    }).returning();
+    // The remote Hermes run may still execute after a Paperclip restart: only a stop receipt releases it.
+    expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: hold!.id });
+  });
+
   it.each([false, true])("waits for a live terminal predecessor before a new turn (historical hold: %s)", async withHold => {
     const child = spawnAliveProcess();
     childProcesses.add(child);

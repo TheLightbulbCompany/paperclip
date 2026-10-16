@@ -907,6 +907,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await ctx.onLog("stdout", `[hermes-gateway] request headers (redacted): ${stringifyForLog(redactForLog(runHeaders, [], 0, redactText), 3_000)}\n`);
 
   let runId: string | null = null;
+  // isol8: Stop (and the run timeout) must also end a create that never answers.
+  const createSignal = AbortSignal.any([
+    ...(ctx.signal ? [ctx.signal] : []),
+    ...(timeoutMs > 0 ? [AbortSignal.timeout(timeoutMs)] : []),
+  ]);
   try {
     // This adapter has no local child process, so crossing into the first
     // remote create request is its dispatch boundary. Report it before the
@@ -916,6 +921,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       method: "POST",
       headers: runHeaders,
       body: JSON.stringify(body),
+      signal: createSignal,
     });
     runId = extractRunId(created);
     if (!runId) {
@@ -929,6 +935,19 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
   } catch (err) {
+    if (createSignal.aborted) {
+      // Hermes may have accepted the run before the request was cut, so its stop is unverified.
+      const cancelled = ctx.signal?.aborted === true;
+      return {
+        exitCode: 1,
+        signal: cancelled ? "SIGTERM" : null,
+        timedOut: !cancelled,
+        errorCode: cancelled ? "hermes_gateway_cancelled" : "hermes_gateway_timeout",
+        errorMessage: `Hermes gateway run ${cancelled ? "was cancelled" : `timed out after ${timeoutSec}s`} while it was being created; Hermes did not confirm it stopped.`,
+        provider: "hermes_gateway",
+        resultJson: { status: "unconfirmed", remoteExecutionStopped: false },
+      };
+    }
     return errorResult(err, redactText);
   }
 
