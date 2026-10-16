@@ -6229,11 +6229,19 @@ export function agentRoutes(
       });
     const idempotency = readIdempotencyHeaders(req);
     let key: Awaited<ReturnType<typeof svc.createApiKey>>;
+    let status = 201;
+    // Set when a replay past the token window revoked the recorded key and
+    // minted a replacement: a real credential mutation, so it is logged.
+    let rotatedFromKeyId: string | null = null;
     if (idempotency) {
       const outcome = await runIdempotentAgentKeyCreate(agent, idempotency, mintKey);
-      if (outcome.replayed) {
+      if (outcome.replayed && outcome.result.id === outcome.record.resourceId) {
         res.status(200).json(outcome.result);
         return;
+      }
+      if (outcome.replayed) {
+        status = 200;
+        rotatedFromKeyId = outcome.record.resourceId;
       }
       key = outcome.result;
     } else {
@@ -6252,10 +6260,11 @@ export function agentRoutes(
         name: key.name,
         scope: key.scope,
         responsibleUserId: key.responsibleUserId,
+        ...(rotatedFromKeyId ? { rotatedFromKeyId } : {}),
       },
     });
 
-    res.status(201).json(key);
+    res.status(status).json(key);
   });
 
   router.delete("/agents/:id/keys/:keyId", async (req, res) => {

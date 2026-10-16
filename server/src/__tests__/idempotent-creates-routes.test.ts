@@ -261,8 +261,17 @@ describeEmbeddedPostgres("idempotent create routes", () => {
       const live = await liveKeys(agentId);
       expect(live.map((key) => key.id)).toEqual([rotated.body.id]);
 
+      // The rotation is audited; plain replays are not.
+      const keyCreated = async () => (await db.select().from(activityLog).where(eq(activityLog.action, "agent.key_created")))
+        .map((row) => row.details as Record<string, unknown>);
+      expect(await keyCreated()).toEqual([
+        expect.objectContaining({ keyId: first.body.id }),
+        expect.objectContaining({ keyId: rotated.body.id, rotatedFromKeyId: first.body.id }),
+      ]);
+
       const again = await request(app).post(path).set("Idempotency-Key", "mcp:rotate").send({ name: "mcp" }).expect(200);
       expect(again.body.token).toBe(rotated.body.token);
+      expect(await keyCreated()).toHaveLength(2);
 
       // A stale record's plaintext is scrubbed by any later keyed key create.
       await db.update(idempotentOperations).set({ createdAt: stale });

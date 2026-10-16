@@ -2404,6 +2404,10 @@ export function routineService(
             variables,
             env,
             executionPolicy,
+            // Circuit-breaker overrides; null = instance default. An agent
+            // creating a routine always gets the default breaker.
+            autoPauseEnabled: actor.agentId ? null : (input.autoPauseEnabled ?? null),
+            autoPauseThreshold: actor.agentId ? null : (input.autoPauseThreshold ?? null),
             responsibleUserId,
             createdByAgentId: actor.agentId ?? null,
             createdByUserId: actor.userId ?? null,
@@ -2451,6 +2455,13 @@ export function routineService(
       if (actor.agentId && patch.executionPolicy !== undefined) {
         throw forbidden("Agents cannot modify routine execution policies", {
           code: "agent_cannot_modify_execution_policy",
+        });
+      }
+      // The circuit breaker guards against an agent's routine storming; the
+      // agent must not switch it off or raise its own threshold.
+      if (actor.agentId && (patch.autoPauseEnabled !== undefined || patch.autoPauseThreshold !== undefined)) {
+        throw forbidden("Agents cannot modify routine auto-pause settings", {
+          code: "agent_cannot_modify_auto_pause",
         });
       }
       const nextExecutionPolicy = patch.executionPolicy === undefined
@@ -2541,12 +2552,18 @@ export function routineService(
           variables: nextVariables,
           env: nextEnv,
           executionPolicy: nextExecutionPolicy === undefined ? locked.executionPolicy : nextExecutionPolicy,
+          autoPauseEnabled: patch.autoPauseEnabled === undefined ? locked.autoPauseEnabled : patch.autoPauseEnabled,
+          autoPauseThreshold: patch.autoPauseThreshold === undefined ? locked.autoPauseThreshold : patch.autoPauseThreshold,
           responsibleUserId: locked.responsibleUserId ?? responsibleUserId,
           updatedByAgentId: actor.agentId ?? null,
           updatedByUserId: actor.userId ?? null,
         };
 
         const folderChanged = patch.folderId !== undefined && locked.folderId !== candidate.folderId;
+        // The breaker overrides are row settings, not revision content, so a
+        // change to them alone takes the same in-place path as a folder move.
+        const autoPauseChanged = candidate.autoPauseEnabled !== locked.autoPauseEnabled
+          || candidate.autoPauseThreshold !== locked.autoPauseThreshold;
         if (locked.latestRevisionId && routineCurrentFieldsMatch(locked, candidate)) {
           // Same repair the snapshot-match no-op below performs: an echoed env
           // must still re-sync secret bindings (drift repair). This guard used
@@ -2561,11 +2578,13 @@ export function routineService(
               { db: tx },
             );
           }
-          if (!folderChanged) return locked;
+          if (!folderChanged && !autoPauseChanged) return locked;
           const [updated] = await txDb
             .update(routines)
             .set({
               folderId: candidate.folderId,
+              autoPauseEnabled: candidate.autoPauseEnabled,
+              autoPauseThreshold: candidate.autoPauseThreshold,
               updatedByAgentId: actor.agentId ?? null,
               updatedByUserId: actor.userId ?? null,
               updatedAt: new Date(),
@@ -2624,6 +2643,8 @@ export function routineService(
             variables: candidate.variables,
             env: candidate.env,
             executionPolicy: candidate.executionPolicy,
+            autoPauseEnabled: candidate.autoPauseEnabled,
+            autoPauseThreshold: candidate.autoPauseThreshold,
             responsibleUserId: candidate.responsibleUserId,
             updatedByAgentId: actor.agentId ?? null,
             updatedByUserId: actor.userId ?? null,

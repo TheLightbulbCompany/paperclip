@@ -253,6 +253,32 @@ describeEmbeddedPostgres("routine circuit breaker", () => {
     expect(r.autoPauseReason).toBeNull();
   });
 
+  it("counts a run's failure once when its issue moves between terminal statuses", async () => {
+    const { companyId, agentId, routine } = await seedRoutine({ consecutiveFailureCount: 0, autoPauseThreshold: 3 });
+    const { issueId } = await seedRoutineIssue(companyId, routine.id, agentId);
+    await issuesSvc.update(issueId, { status: "blocked" });
+    await issuesSvc.update(issueId, { status: "cancelled" });
+    expect((await getRoutine(routine.id)).consecutiveFailureCount).toBe(1);
+    // A blocked run that later finishes still resets the breaker.
+    const second = await seedRoutineIssue(companyId, routine.id, agentId);
+    await issuesSvc.update(second.issueId, { status: "blocked" });
+    await issuesSvc.update(second.issueId, { status: "done" });
+    expect((await getRoutine(routine.id)).consecutiveFailureCount).toBe(0);
+  });
+
+  it("persists board auto-pause overrides and refuses them from agents", async () => {
+    const { routine, agentId } = await seedRoutine({ autoPauseThreshold: null });
+    await routinesSvc.update(routine.id, { autoPauseEnabled: false, autoPauseThreshold: 7 }, { userId: "u_test" });
+    let r = await getRoutine(routine.id);
+    expect(r.autoPauseEnabled).toBe(false);
+    expect(r.autoPauseThreshold).toBe(7);
+    await expect(
+      routinesSvc.update(routine.id, { autoPauseEnabled: true }, { agentId }),
+    ).rejects.toMatchObject({ status: 403 });
+    r = await getRoutine(routine.id);
+    expect(r.autoPauseEnabled).toBe(false);
+  });
+
   it("does not fire a paused routine from tickScheduledTriggers", async () => {
     const { companyId, routine } = await seedRoutine({ status: "paused", consecutiveFailureCount: 3, autoPausedAt: new Date() });
     await db.insert(routineTriggers).values({

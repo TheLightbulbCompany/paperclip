@@ -11604,11 +11604,16 @@ export function issueService(db: Db) {
         // This is the universal hook — it fires for recovery-driven blocks too
         // (reconcile_stranded_assigned_issue), which never call
         // syncRunStatusForIssue.
+        // A failure counts once per run: a move between terminal statuses
+        // (blocked -> cancelled) is not a second failure. A later done still
+        // counts as the run's success and resets the breaker.
+        const alreadyTerminal = existing.status === "blocked" || existing.status === "cancelled" || existing.status === "done";
         if (
           existing.originKind === "routine_execution" &&
           existing.originRunId &&
           issueData.status &&
           issueData.status !== existing.status &&
+          !(alreadyTerminal && issueData.status !== "done") &&
           (issueData.status === "blocked" ||
             issueData.status === "cancelled" ||
             issueData.status === "done")
