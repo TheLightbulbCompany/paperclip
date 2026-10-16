@@ -7806,13 +7806,17 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     },
   );
 
-  it("keeps a hermes_gateway hold without a Hermes stop record (timeout, no receipt)", async () => {
+  it.each([
+    ["without a Hermes stop record (timeout, no receipt)", { status: "unconfirmed", remoteExecutionStopped: false }],
+    ["whose stopped session is not resumable (run/none session key)",
+      { run_id: "hermes-run", status: "failed", remoteExecutionStopped: true, sessionResumable: false }],
+  ] as const)("keeps a hermes_gateway hold %s", async (_label, resultJson) => {
     const { companyId, agentId, issueId, runId } = await seedRunFixture({
       adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "failed",
       runErrorCode: "hermes_gateway_timeout", runError: "Hermes gateway run timed out",
     });
     await db.update(heartbeatRuns).set({ finishedAt: new Date(Date.now() - 60 * 60_000),
-      resultJson: { status: "unconfirmed", remoteExecutionStopped: false } }).where(eq(heartbeatRuns.id, runId));
+      resultJson: { ...resultJson } }).where(eq(heartbeatRuns.id, runId));
     await db.update(agents).set({ adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } }).where(eq(agents.id, agentId));
     const [hold] = await db.insert(issueRecoveryActions).values({
       companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "resolved", outcome: "blocked",

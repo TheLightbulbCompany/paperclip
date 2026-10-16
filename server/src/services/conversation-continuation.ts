@@ -52,6 +52,8 @@ export function remoteStopRecordedFor(
 ): boolean {
   if (!adapterType || !RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES.has(adapterType)) return false;
   const result = run.resultJson;
+  // run/none session keys start a new Hermes session on the next wake: nothing to continue.
+  if (result?.sessionResumable === false) return false;
   if (result?.remoteExecutionStopped === true) return true;
   return result?.remoteExecutionStopped === undefined && run.status === "failed" &&
     run.errorCode === "hermes_gateway_run_failed" && ["failed", "error"].includes(String(result?.status)) &&
