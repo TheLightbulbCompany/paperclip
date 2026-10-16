@@ -799,6 +799,17 @@ function errorResult(err: unknown, redactText: TextRedactor = sanitizeSensitiveT
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  const result = await executeTurn(ctx);
+  // isol8: with the "run"/"none" strategies the next wake opens a new Hermes session, so a
+  // stopped run cannot continue its conversation; the server then keeps the hold.
+  const strategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
+  if (strategy === "run" || strategy === "none") {
+    return { ...result, resultJson: { ...result.resultJson, sessionResumable: false } };
+  }
+  return result;
+}
+
+async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const apiBaseUrlValue = asString(ctx.config.apiBaseUrl ?? ctx.config.url, "").trim();
   if (!apiBaseUrlValue) {
     return {

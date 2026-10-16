@@ -595,6 +595,10 @@ describe("execute", () => {
     expect(result.errorMessage).toContain("Check adapterConfig.apiKey matches the Hermes API_SERVER_KEY");
     // A rejected create proves no remote run exists.
     expect(result.resultJson).toMatchObject({ remoteExecutionStopped: true });
+    expect(result.resultJson).not.toHaveProperty("sessionResumable");
+    const perRun = await execute(makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", sessionKeyStrategy: "run" }));
+    // A per-run session cannot continue the stopped conversation.
+    expect(perRun.resultJson).toMatchObject({ remoteExecutionStopped: true, sessionResumable: false });
   });
 
   it("includes network causes in connection failure messages", async () => {
