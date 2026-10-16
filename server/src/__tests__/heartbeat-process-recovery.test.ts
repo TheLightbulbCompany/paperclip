@@ -86,7 +86,7 @@ import {
   getEmbeddedPostgresTestSupport,
   startEmbeddedPostgresTestDatabase,
 } from "./helpers/embedded-postgres.js";
-import { runningProcesses } from "../adapters/index.ts";
+import { registerServerAdapter, runningProcesses, unregisterServerAdapter } from "../adapters/index.ts";
 import {
   resolveDefaultAgentWorkspaceDir,
   resolvePaperclipInstanceRoot,
@@ -1912,6 +1912,48 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     expect(run.status).toBe("failed");
     expect(run.resultJson?.conversationContinuation).toBeUndefined();
     expect(await db.select().from(heartbeatRuns).where(eq(heartbeatRuns.retryOfRunId, runId))).toHaveLength(0);
+  });
+
+  it.each([true, false])("treats a stopped run of an external adapter as a conversation only when it opts in: %s", async optedIn => {
+    const adapterType = "external_conversation_test";
+    registerServerAdapter({
+      type: adapterType,
+      execute: async () => ({ exitCode: 0, signal: null, timedOut: false }),
+      testEnvironment: async () => ({ adapterType, status: "pass", checks: [], testedAt: new Date(0).toISOString() }),
+      ...(optedIn ? { supportsConversationContinuation: true } : {}),
+    });
+    try {
+      const { runId, issueId, companyId } = await seedRunFixture({
+        adapterType, agentStatus: "idle", runStatus: "interrupted", runErrorCode: "server_shutdown_interrupted",
+      });
+      // Only the recorded adapter (dispatch profile and adapter.invoke event) identifies the
+      // conversation; no continuation policy is stored on the run.
+      await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType } } }).where(eq(heartbeatRuns.id, runId));
+      const [hold] = await db.insert(issueRecoveryActions).values({
+        companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "active", ownerType: "board",
+        cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+        evidence: { runId, automaticRecovery: { replay: "blocked" } }, nextAction: "Reconcile the stopped run.",
+      }).returning();
+      const blocker = await getExecutionBlocker(db, companyId, issueId);
+      if (optedIn) expect(blocker).toBeNull();
+      else expect(blocker).toMatchObject({ recoveryActionId: hold!.id, cause: "legacy_execution_requires_reconciliation" });
+    } finally {
+      unregisterServerAdapter(adapterType);
+    }
+  });
+
+  it("keeps the hold on an interrupted hermes_gateway run that has no stop receipt", async () => {
+    const { runId, issueId, companyId } = await seedRunFixture({
+      adapterType: "hermes_gateway", agentStatus: "idle", runStatus: "interrupted", runErrorCode: "server_shutdown_interrupted",
+    });
+    await db.update(heartbeatRuns).set({ runnerProfileJson: { adapterDispatch: { adapterType: "hermes_gateway" } } }).where(eq(heartbeatRuns.id, runId));
+    const [hold] = await db.insert(issueRecoveryActions).values({
+      companyId, sourceIssueId: issueId, kind: "active_run_watchdog", status: "active", ownerType: "board",
+      cause: "legacy_execution_requires_reconciliation", fingerprint: `legacy-execution:${runId}`,
+      evidence: { runId, automaticRecovery: { replay: "blocked" } }, nextAction: "Reconcile the stopped run.",
+    }).returning();
+    // The remote Hermes run may still execute after a Paperclip restart: only a stop receipt releases it.
+    expect(await getExecutionBlocker(db, companyId, issueId)).toMatchObject({ recoveryActionId: hold!.id });
   });
 
   it.each([false, true])("waits for a live terminal predecessor before a new turn (historical hold: %s)", async withHold => {
@@ -7628,6 +7670,52 @@ describeEmbeddedPostgres("heartbeat orphaned process recovery", () => {
     });
     expect(next?.contextSnapshot?.wakeCommentIds).toEqual([pending!.id, go!.id]);
     expect((await db.select().from(agentWakeupRequests).where(eq(agentWakeupRequests.id, deferred!.id)))[0]).toMatchObject({ status: "coalesced", runId: next!.id });
+    await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
+  });
+
+  it("continues a hermes_gateway run stopped with a confirmed provider stop when the user comments", async () => {
+    let context!: { onCancellationReady?: () => Promise<void>; signal?: AbortSignal };
+    mockAdapterExecute.mockImplementationOnce(async (input) => {
+      context = input as typeof context;
+      await context.onCancellationReady?.();
+      await new Promise<void>((resolve) => {
+        if (context.signal?.aborted) resolve();
+        else context.signal?.addEventListener("abort", () => resolve(), { once: true });
+      });
+      // The hermes_gateway adapter returns this only after Hermes reports the run cancelled.
+      return {
+        exitCode: 1, signal: "SIGTERM", timedOut: false, errorCode: "hermes_gateway_cancelled",
+        errorMessage: "Hermes gateway run was cancelled.", provider: "hermes_gateway", model: "test-model",
+        resultJson: { status: "cancelled", remoteExecutionStopped: true, executionCancellation: {
+          state: "acknowledged", acknowledgedAt: new Date().toISOString(), proof: "hermes_gateway_terminal_cancelled",
+        } },
+      } as never;
+    });
+    const { companyId, agentId, issueId, runId } = await seedRunFixture({
+      adapterType: "hermes_gateway", runtimeMode: "legacy", agentStatus: "idle", runStatus: "queued",
+    });
+    await db.update(agents).set({ adapterConfig: { apiBaseUrl: "http://127.0.0.1:8642", apiKey: "test" } }).where(eq(agents.id, agentId));
+    const heartbeat = heartbeatService(db);
+    await heartbeat.resumeQueuedRuns();
+    await vi.waitFor(() => expect(adapterExecutionControls.has(runId)).toBe(true));
+
+    await heartbeat.cancelRun(runId, "Cancelled by a board operator");
+    const stopped = await heartbeat.getRun(runId);
+    expect(stopped?.status).toBe("cancelled");
+    expect(stopped?.resultJson).toMatchObject({
+      conversationContinuation: "continue_conversation_v1",
+      executionCancellation: { state: "acknowledged" },
+    });
+    expect(await getExecutionBlocker(db, companyId, issueId)).toBeNull();
+
+    const [comment] = await db.insert(issueComments).values({ companyId, issueId, authorUserId: "responsible-user", body: "Carry on" }).returning();
+    const next = await heartbeat.wakeup(agentId, {
+      source: "automation", reason: "issue_commented", requestedByActorType: "user", requestedByActorId: "responsible-user",
+      payload: { issueId, commentId: comment!.id }, contextSnapshot: { issueId, commentId: comment!.id, wakeReason: "issue_commented" },
+    });
+    expect(next?.id).toBeTruthy();
+    expect(next!.id).not.toBe(runId);
+    expect(next!.contextSnapshot).toMatchObject({ issueId, wakeCommentIds: [comment!.id] });
     await vi.waitFor(async () => expect((await heartbeat.getRun(next!.id))?.status).not.toBe("running"));
   });
 

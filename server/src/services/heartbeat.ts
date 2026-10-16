@@ -43,7 +43,7 @@ import { aiConnectionBindingSchema, aiRuntimeConnectionBindingSchema, type AiCon
 import { aiConnectionRouterService, AiConnectionPoolExhausted, applyAiConnectionRouterTaskSettings } from "./ai-connection-router.js";
 import { aiConnectionSessionCompatibilityInputs, managedAiSessionIdentityCompatible } from "./ai-connection-session.js";
 import { executionBlockerPredicate, getExecutionBlocker } from "./execution-blocker.js";
-import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter } from "./conversation-continuation.js";
+import { CONVERSATION_CONTINUATION_POLICY, claimedAdapterType, runUsedConversationAdapter, hasConversationContinuationPolicy, isConversationAdapter, remoteStopProvenFor } from "./conversation-continuation.js";
 import { recordExecutionWait } from "./execution-wait.js";
 import { getNativeReviewAssignment, readNativeReviewAssignmentContext } from "./native-runtime/native-review-participant.js";
 import { claimQueuedNativeReviewRun } from "./native-runtime/native-review-dispatch.js";
@@ -18282,6 +18282,8 @@ export function heartbeatService(
       parseObject(result?.executionCancellation).state === "acknowledged";
     return options?.conversationContinuationEligible !== false && outcome !== "succeeded" &&
       (outcome !== "cancelled" || cancellationAcknowledged) &&
+      // isol8: a remote gateway run continues only when its adapter proved the remote run ended.
+      remoteStopProvenFor(agent.adapterType, result) &&
       isConversationAdapter(agent.adapterType)
       ? { ...result, conversationContinuation: CONVERSATION_CONTINUATION_POLICY }
       : result;

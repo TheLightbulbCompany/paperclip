@@ -705,6 +705,17 @@ export function mapFinalResultForTest(input: {
       output: output ?? "",
       usage: usage ?? null,
       cost_usd: costUsd,
+      // isol8: Hermes reported a terminal status, so the remote run has ended.
+      remoteExecutionStopped: true,
+      ...(CANCELLED_STATUSES.has(input.terminal.status)
+        ? {
+            executionCancellation: {
+              state: "acknowledged",
+              acknowledgedAt: new Date().toISOString(),
+              proof: "hermes_gateway_terminal_cancelled",
+            },
+          }
+        : {}),
     },
   };
 }
@@ -720,6 +731,7 @@ async function stopRun(input: {
     const stopped = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}/stop`), {
       method: "POST",
       headers: input.headers,
+      signal: AbortSignal.timeout(STOP_GRACE_MS),
     });
     await input.ctx.onLog("stdout", `[hermes-gateway] stop requested for run ${input.runId}\n`);
     return asRecord(stopped);
@@ -741,6 +753,8 @@ async function fetchFinalStatus(input: {
       const status = await fetchJson(apiUrl(input.baseUrl, `/v1/runs/${encodeURIComponent(input.runId)}`), {
         method: "GET",
         headers: input.headers,
+        // isol8: a gateway that accepts the connection but never answers must not hold settlement.
+        signal: AbortSignal.timeout(Math.max(1, deadline - Date.now())),
       });
       const record = asRecord(status);
       const normalized = extractStatus(status);
@@ -765,10 +779,14 @@ function errorResult(err: unknown, redactText: TextRedactor = sanitizeSensitiveT
   const errorMessage = code === "hermes_gateway_auth_failed"
     ? `${redactErrorMessage(err, redactText)}. Check adapterConfig.apiKey matches the Hermes API_SERVER_KEY for the running gateway.`
     : redactErrorMessage(err, redactText);
+  // isol8: a 4xx rejection (not a 409 idempotency conflict) means Hermes created no run.
+  // A dropped connection or a 5xx may follow an accepted create, so it proves nothing.
+  const rejected = !!hermesError.status && hermesError.status >= 400 && hermesError.status < 500 && hermesError.status !== 409;
   return {
     exitCode: 1,
     signal: null,
     timedOut: false,
+    ...(rejected ? { resultJson: { remoteExecutionStopped: true } } : {}),
     errorCode: code,
     errorFamily: classified?.family ?? (code === "hermes_gateway_connect_failed" ? "transient_upstream" : null),
     retryNotBefore: hermesError.retryNotBefore ?? null,
@@ -781,6 +799,17 @@ function errorResult(err: unknown, redactText: TextRedactor = sanitizeSensitiveT
 }
 
 export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
+  const result = await executeTurn(ctx);
+  // isol8: with the "run"/"none" strategies the next wake opens a new Hermes session, so a
+  // stopped run cannot continue its conversation; the server then keeps the hold.
+  const strategy = normalizeSessionKeyStrategy(ctx.config.sessionKeyStrategy);
+  if (strategy === "run" || strategy === "none") {
+    return { ...result, resultJson: { ...result.resultJson, sessionResumable: false } };
+  }
+  return result;
+}
+
+async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecutionResult> {
   const apiBaseUrlValue = asString(ctx.config.apiBaseUrl ?? ctx.config.url, "").trim();
   if (!apiBaseUrlValue) {
     return {
@@ -860,6 +889,26 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   const body = buildRunBody(ctx, sessionKey);
   const createRunUrl = apiUrl(baseUrl, "/v1/runs");
 
+  await ctx.onCancellationReady?.();
+
+  if (ctx.signal?.aborted) {
+    return {
+      exitCode: 1,
+      signal: "SIGTERM",
+      timedOut: false,
+      errorCode: "hermes_gateway_cancelled",
+      errorMessage: "Hermes gateway run was cancelled before start.",
+      resultJson: {
+        remoteExecutionStopped: true,
+        executionCancellation: {
+          state: "acknowledged",
+          acknowledgedAt: new Date().toISOString(),
+          proof: "hermes_gateway_terminal_cancelled",
+        },
+      },
+    };
+  }
+
   await ctx.onMeta?.({
     adapterType: ADAPTER_TYPE,
     command: "POST /v1/runs",
@@ -876,6 +925,11 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
   await ctx.onLog("stdout", `[hermes-gateway] request headers (redacted): ${stringifyForLog(redactForLog(runHeaders, [], 0, redactText), 3_000)}\n`);
 
   let runId: string | null = null;
+  // isol8: Stop (and the run timeout) must also end a create that never answers.
+  const createSignal = AbortSignal.any([
+    ...(ctx.signal ? [ctx.signal] : []),
+    ...(timeoutMs > 0 ? [AbortSignal.timeout(timeoutMs)] : []),
+  ]);
   try {
     // This adapter has no local child process, so crossing into the first
     // remote create request is its dispatch boundary. Report it before the
@@ -885,6 +939,7 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       method: "POST",
       headers: runHeaders,
       body: JSON.stringify(body),
+      signal: createSignal,
     });
     runId = extractRunId(created);
     if (!runId) {
@@ -898,10 +953,42 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       };
     }
   } catch (err) {
+    if (createSignal.aborted) {
+      // Hermes may have accepted the run before the request was cut, so its stop is unverified.
+      const cancelled = ctx.signal?.aborted === true;
+      return {
+        exitCode: 1,
+        signal: cancelled ? "SIGTERM" : null,
+        timedOut: !cancelled,
+        errorCode: cancelled ? "hermes_gateway_cancelled" : "hermes_gateway_timeout",
+        errorMessage: `Hermes gateway run ${cancelled ? "was cancelled" : `timed out after ${timeoutSec}s`} while it was being created; Hermes did not confirm it stopped.`,
+        provider: "hermes_gateway",
+        resultJson: { status: "unconfirmed", remoteExecutionStopped: false },
+      };
+    }
     return errorResult(err, redactText);
   }
 
   await ctx.onLog("stdout", `[hermes-gateway] run created: ${runId}\n`);
+
+  let stopRequested = false;
+  const requestStop = async () => {
+    if (stopRequested || !runId) return;
+    stopRequested = true;
+    await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
+  };
+
+  const abortListener = () => {
+    void requestStop();
+  };
+
+  if (ctx.signal) {
+    if (ctx.signal.aborted) {
+      void requestStop();
+    } else {
+      ctx.signal.addEventListener("abort", abortListener, { once: true });
+    }
+  }
 
   const state = createExecutionState(runId);
   const controller = new AbortController();
@@ -930,25 +1017,53 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
     timeoutTimer = setTimeout(() => resolve("timeout"), timeoutMs);
   });
 
-  const outcome = await Promise.race([state.terminalPromise, timeoutPromise]);
-  if (timeoutTimer) clearTimeout(timeoutTimer);
-  controller.abort();
+  let stopTimer: ReturnType<typeof setTimeout> | null = null;
+  let onAbortForGrace: (() => void) | null = null;
+  const stopGracePromise = new Promise<"cancelled_timeout">((resolve) => {
+    onAbortForGrace = () => {
+      stopTimer = setTimeout(() => resolve("cancelled_timeout"), STOP_GRACE_MS);
+    };
+    if (ctx.signal?.aborted) {
+      onAbortForGrace();
+    } else {
+      ctx.signal?.addEventListener("abort", onAbortForGrace, { once: true });
+    }
+  });
 
-  if (outcome === "timeout") {
-    await stopRun({ ctx, baseUrl, headers: eventHeaders, runId, redactText });
-    const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+  // Report an operator stop. Acknowledge it only when Hermes reports a
+  // cancelled/stopped terminal status; a rejected /stop or a run that is still
+  // active must not read as a verified cancellation.
+  const cancelledResult = (finalStatus: Record<string, unknown> | null) => {
+    const status = extractStatus(finalStatus);
+    const confirmed = status !== null && CANCELLED_STATUSES.has(status);
     return {
       exitCode: 1,
-      signal: null,
-      timedOut: true,
-      errorCode: "hermes_gateway_timeout",
-      errorMessage: `Hermes gateway run timed out after ${timeoutSec}s.`,
+      signal: "SIGTERM",
+      timedOut: false,
+      errorCode: "hermes_gateway_cancelled",
+      errorMessage: confirmed
+        ? "Hermes gateway run was cancelled."
+        : "Hermes gateway run was cancelled, but Hermes did not confirm that the remote run stopped.",
       provider: "hermes_gateway",
+      // isol8: keep the stopped turn's accounting, as mapFinalResultForTest does.
+      model: extractModel(finalStatus),
+      ...(parseUsage(finalStatus) ? { usage: parseUsage(finalStatus) } : {}),
+      ...(parseCostUsd(finalStatus) !== null ? { costUsd: parseCostUsd(finalStatus) } : {}),
       resultJson: {
         run_id: runId,
-        status: extractStatus(finalStatus) ?? "timeout",
+        status: status ?? "unconfirmed",
         last_event: state.lastEventName,
         final_status: redactForLog(finalStatus, [], 0, redactText),
+        remoteExecutionStopped: finalStatus !== null,
+        ...(confirmed
+          ? {
+              executionCancellation: {
+                state: "acknowledged",
+                acknowledgedAt: new Date().toISOString(),
+                proof: "hermes_gateway_terminal_cancelled",
+              },
+            }
+          : {}),
       },
       sessionParams: {
         hermesRunId: runId,
@@ -956,13 +1071,61 @@ export async function execute(ctx: AdapterExecutionContext): Promise<AdapterExec
       },
       sessionDisplayId: sessionKey ? redactText(sessionKey) : null,
     };
-  }
+  };
 
-  return mapFinalResultForTest({
-    terminal: outcome,
-    outputChunks: state.outputChunks,
-    sessionKey,
-    strategy,
-    redactText,
-  });
+  try {
+    const outcome = await Promise.race([state.terminalPromise, timeoutPromise, stopGracePromise]);
+    if (timeoutTimer) clearTimeout(timeoutTimer);
+    if (stopTimer) clearTimeout(stopTimer);
+    controller.abort();
+
+    if (outcome === "timeout") {
+      await requestStop();
+      const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: STOP_GRACE_MS });
+      // The operator may have cancelled just before the timeout won the race.
+      if (ctx.signal?.aborted) return cancelledResult(finalStatus);
+      return {
+        exitCode: 1,
+        signal: null,
+        timedOut: true,
+        errorCode: "hermes_gateway_timeout",
+        errorMessage: `Hermes gateway run timed out after ${timeoutSec}s.`,
+        provider: "hermes_gateway",
+        resultJson: {
+          run_id: runId,
+          status: extractStatus(finalStatus) ?? "timeout",
+          last_event: state.lastEventName,
+          final_status: redactForLog(finalStatus, [], 0, redactText),
+          // isol8: without a terminal Hermes status the remote turn may still run, so the
+          // server keeps its reconciliation hold instead of continuing the conversation.
+          remoteExecutionStopped: finalStatus !== null,
+        },
+        sessionParams: {
+          hermesRunId: runId,
+          strategy,
+        },
+        sessionDisplayId: sessionKey ? redactText(sessionKey) : null,
+      };
+    }
+
+    if (outcome === "cancelled_timeout") {
+      const finalStatus = await fetchFinalStatus({ baseUrl, headers: eventHeaders, runId, deadlineMs: 1_000 });
+      return cancelledResult(finalStatus);
+    }
+
+    return mapFinalResultForTest({
+      terminal: outcome,
+      outputChunks: state.outputChunks,
+      sessionKey,
+      strategy,
+      redactText,
+    });
+  } finally {
+    if (ctx.signal) {
+      ctx.signal.removeEventListener("abort", abortListener);
+      if (onAbortForGrace) {
+        ctx.signal.removeEventListener("abort", onAbortForGrace);
+      }
+    }
+  }
 }
