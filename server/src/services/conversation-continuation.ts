@@ -40,6 +40,26 @@ export function remoteStopProvenFor(adapterType: string, result: Record<string, 
     (result?.remoteExecutionStopped === true && result?.sessionResumable !== false);
 }
 
+/**
+ * isol8: the receipt-only adapter recorded that its remote run ended, so no host process
+ * proof applies. isol8.2+ results carry remoteExecutionStopped; an isol8.1 hermes_gateway
+ * result has the mapped Hermes terminal status instead (hermes_gateway_run_failed is set
+ * only from a failed/error status Hermes reported for that remote run).
+ */
+export function remoteStopRecordedFor(
+  adapterType: string | null,
+  run: Pick<typeof heartbeatRuns.$inferSelect, "status" | "errorCode" | "resultJson">,
+): boolean {
+  if (!adapterType || !RECEIPT_ONLY_CONVERSATION_ADAPTER_TYPES.has(adapterType)) return false;
+  const result = run.resultJson;
+  // run/none session keys start a new Hermes session on the next wake: nothing to continue.
+  if (result?.sessionResumable === false) return false;
+  if (result?.remoteExecutionStopped === true) return true;
+  return result?.remoteExecutionStopped === undefined && run.status === "failed" &&
+    run.errorCode === "hermes_gateway_run_failed" && ["failed", "error"].includes(String(result?.status)) &&
+    typeof result?.run_id === "string";
+}
+
 /** The adapter's type alone lets a stopped run continue (what the UI's Retry may assume). */
 export function isInferableConversationAdapter(adapterType: string): boolean {
   return inferableConversationAdapterTypes().includes(adapterType);
