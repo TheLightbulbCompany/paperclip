@@ -259,6 +259,10 @@ describeEmbeddedPostgres("routine circuit breaker", () => {
     await issuesSvc.update(issueId, { status: "blocked" });
     await issuesSvc.update(issueId, { status: "cancelled" });
     expect((await getRoutine(routine.id)).consecutiveFailureCount).toBe(1);
+    // Retried and blocked again: still the same run, still one failure.
+    await issuesSvc.update(issueId, { status: "todo" });
+    await issuesSvc.update(issueId, { status: "blocked" });
+    expect((await getRoutine(routine.id)).consecutiveFailureCount).toBe(1);
     // A blocked run that later finishes still resets the breaker.
     const second = await seedRoutineIssue(companyId, routine.id, agentId);
     await issuesSvc.update(second.issueId, { status: "blocked" });

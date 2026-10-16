@@ -142,6 +142,9 @@ export async function completeIdempotentOperation<T>(
   target: IdempotentOperationTarget,
   complete: (record: IdempotentOperationRecord) => Promise<T>,
   alreadyComplete: (record: IdempotentOperationRecord) => Promise<T>,
+  // Agent API keys keep their payload (the replayable token) until the
+  // replay window sweep; everything else scrubs it once complete.
+  options: { scrubPayload?: boolean } = {},
 ): Promise<T> {
   return db.transaction(async (rawTx) => {
     const tx = rawTx as unknown as Db;
@@ -151,7 +154,7 @@ export async function completeIdempotentOperation<T>(
     const result = await complete(record);
     await tx
       .update(idempotentOperations)
-      .set({ completedAt: new Date(), completionPayload: {} })
+      .set({ completedAt: new Date(), ...(options.scrubPayload === false ? {} : { completionPayload: {} }) })
       .where(eq(idempotentOperations.id, record.id));
     return result;
   });

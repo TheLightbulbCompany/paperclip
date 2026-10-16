@@ -276,6 +276,27 @@ describeEmbeddedPostgres("idempotent create routes", () => {
       expect(await liveKeys(agentId)).toHaveLength(1);
     });
 
+    it("a retry finishes a key-create audit the first attempt lost", async () => {
+      const { agentId } = await seedCompany();
+      const app = agentApp();
+      const path = `/api/agents/${agentId}/keys`;
+      await db.execute(sql`create function fail_key_audit() returns trigger language plpgsql as $$
+        begin if new.action = 'agent.key_created' then raise exception 'audit down'; end if; return new; end $$`);
+      await db.execute(sql`create trigger fail_key_audit before insert on activity_log
+        for each row execute function fail_key_audit()`);
+      try {
+        await request(app).post(path).set("Idempotency-Key", "mcp:lost-audit").send({ name: "mcp" }).expect(500);
+      } finally {
+        await db.execute(sql`drop trigger fail_key_audit on activity_log`);
+        await db.execute(sql`drop function fail_key_audit()`);
+      }
+      const replay = await request(app).post(path).set("Idempotency-Key", "mcp:lost-audit").send({ name: "mcp" }).expect(200);
+      await request(app).post(path).set("Idempotency-Key", "mcp:lost-audit").send({ name: "mcp" }).expect(200);
+      const audits = await db.select().from(activityLog).where(eq(activityLog.action, "agent.key_created"));
+      expect(audits.map((row) => (row.details as Record<string, unknown>).keyId)).toEqual([replay.body.id]);
+      expect(replay.body.token).toBeTruthy();
+    });
+
     it("rotates once the replay window has passed and scrubs stale tokens", async () => {
       const { agentId } = await seedCompany();
       const app = agentApp();

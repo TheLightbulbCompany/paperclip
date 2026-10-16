@@ -6228,43 +6228,60 @@ export function agentRoutes(
         responsibleUserId: req.actor.userId ?? null,
       });
     const idempotency = readIdempotencyHeaders(req);
-    let key: Awaited<ReturnType<typeof svc.createApiKey>>;
-    let status = 201;
-    // Set when a replay past the token window revoked the recorded key and
-    // minted a replacement: a real credential mutation, so it is logged.
-    let rotatedFromKeyId: string | null = null;
-    if (idempotency) {
-      const outcome = await runIdempotentAgentKeyCreate(agent, idempotency, mintKey);
-      if (outcome.replayed && outcome.result.id === outcome.record.resourceId) {
-        res.status(200).json(outcome.result);
-        return;
-      }
-      if (outcome.replayed) {
-        status = 200;
-        rotatedFromKeyId = outcome.record.resourceId;
-      }
-      key = outcome.result;
-    } else {
-      key = await mintKey(db);
+    const logKeyCreated = async (key: Awaited<ReturnType<typeof svc.createApiKey>>, rotatedFromKeyId: string | null) => {
+      await logActivity(db, {
+        companyId: agent.companyId,
+        actorType: "user",
+        // The key records who minted it, so a recovery audit by a retry
+        // still names the original actor.
+        actorId: key.responsibleUserId ?? req.actor.userId ?? "board",
+        action: "agent.key_created",
+        entityType: "agent",
+        entityId: agent.id,
+        details: {
+          keyId: key.id,
+          name: key.name,
+          scope: key.scope,
+          responsibleUserId: key.responsibleUserId,
+          ...(rotatedFromKeyId ? { rotatedFromKeyId } : {}),
+        },
+      });
+    };
+    if (!idempotency) {
+      const key = await mintKey(db);
+      await logKeyCreated(key, null);
+      res.status(201).json(key);
+      return;
     }
-
-    await logActivity(db, {
-      companyId: agent.companyId,
-      actorType: "user",
-      actorId: req.actor.userId ?? "board",
-      action: "agent.key_created",
-      entityType: "agent",
-      entityId: agent.id,
-      details: {
-        keyId: key.id,
-        name: key.name,
-        scope: key.scope,
-        responsibleUserId: key.responsibleUserId,
-        ...(rotatedFromKeyId ? { rotatedFromKeyId } : {}),
+    const outcome = await runIdempotentAgentKeyCreate(agent, idempotency, mintKey);
+    const key = outcome.result;
+    // A replay past the token window revoked the recorded key and minted this
+    // one: a real credential mutation, audited like a create.
+    const rotatedFromKeyId = outcome.replayed && key.id !== outcome.record.resourceId
+      ? outcome.record.resourceId
+      : null;
+    // Once per minted key, under the key's lock: a retry finishes an audit
+    // the first attempt lost; a plain replay of an audited key logs nothing.
+    await completeIdempotentOperation(
+      db,
+      { operation: "agent_key.create", key: idempotency.key, companyId: agent.companyId },
+      async () => {
+        const audited = await db
+          .select({ id: activityLog.id })
+          .from(activityLog)
+          .where(and(
+            eq(activityLog.companyId, agent.companyId),
+            eq(activityLog.action, "agent.key_created"),
+            eq(activityLog.entityId, agent.id),
+            sql`${activityLog.details}->>'keyId' = ${key.id}`,
+          ))
+          .limit(1);
+        if (audited.length === 0) await logKeyCreated(key, rotatedFromKeyId);
       },
-    });
-
-    res.status(status).json(key);
+      async () => undefined,
+      { scrubPayload: false },
+    );
+    res.status(outcome.replayed ? 200 : 201).json(key);
   });
 
   router.delete("/agents/:id/keys/:keyId", async (req, res) => {

@@ -1,6 +1,6 @@
 import { and, eq, ne, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
-import { routineRuns, routines } from "@paperclipai/db";
+import { activityLog, routineRuns, routines } from "@paperclipai/db";
 import { instanceSettingsService } from "./instance-settings.js";
 import { logActivity } from "./activity-log.js";
 
@@ -85,10 +85,37 @@ export async function recordRoutineOutcomeForIssueRun(
   companyId: string,
   outcome: "completed" | "failed",
 ): Promise<void> {
+  // Row lock: two transitions of the same run's issue serialize here.
   const [run] = await executor
     .select({ routineId: routineRuns.routineId })
     .from(routineRuns)
-    .where(eq(routineRuns.id, originRunId));
+    .where(eq(routineRuns.id, originRunId))
+    .for("update");
   if (!run) return;
+  if (outcome === "failed") {
+    // A run's failure counts once, however often its issue is retried and
+    // blocked again; the marker row is the dedupe key.
+    const [counted] = await executor
+      .select({ id: activityLog.id })
+      .from(activityLog)
+      .where(and(
+        eq(activityLog.companyId, companyId),
+        eq(activityLog.action, ROUTINE_RUN_FAILURE_COUNTED),
+        eq(activityLog.entityId, originRunId),
+      ))
+      .limit(1);
+    if (counted) return;
+    await logActivity(executor, {
+      companyId,
+      actorType: "system",
+      actorId: "routine-scheduler",
+      action: ROUTINE_RUN_FAILURE_COUNTED,
+      entityType: "routine_run",
+      entityId: originRunId,
+      details: { routineId: run.routineId },
+    });
+  }
   await applyRoutineOutcome(executor, run.routineId, companyId, outcome);
 }
+
+const ROUTINE_RUN_FAILURE_COUNTED = "routine.run_failure_counted";
