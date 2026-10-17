@@ -1,89 +1,49 @@
-import { describe, expect, it, vi } from "vitest";
-import type { AdapterEnvironmentTestResult, Environment } from "@paperclipai/shared";
+import { describe, expect, it } from "vitest";
+import type { Environment } from "@paperclipai/shared";
 import {
-  getAgentConfigTestActionLabel,
-  runAgentConfigEnvironmentTest,
+  resolvePaperclipRunnerTransitionModel,
   supportsAdapterModelRefresh,
 } from "./AgentConfigForm";
 import { resolveForcedKubernetesEnvironment } from "../lib/forced-kubernetes-environment";
 
 describe("supportsAdapterModelRefresh", () => {
-  it("enables the model refresh action for Claude, Codex, and ACPX adapters", () => {
+  it("enables the model refresh action for Claude and Codex adapters", () => {
     expect(supportsAdapterModelRefresh("claude_local")).toBe(true);
     expect(supportsAdapterModelRefresh("codex_local")).toBe(true);
-    expect(supportsAdapterModelRefresh("acpx_local")).toBe(true);
+    expect(supportsAdapterModelRefresh("acpx_local")).toBe(false);
   });
 
   it("keeps the refresh action hidden for adapters without a live refresh hook", () => {
-    expect(supportsAdapterModelRefresh("opencode_local")).toBe(false);
+    expect(supportsAdapterModelRefresh("opencode_local")).toBe(true);
+    expect(supportsAdapterModelRefresh("paperclip_runner")).toBe(true);
     expect(supportsAdapterModelRefresh("process")).toBe(false);
   });
 });
 
-describe("agent config test action", () => {
-  it("labels dirty edit-mode tests as save-and-test", () => {
-    expect(getAgentConfigTestActionLabel({ isCreate: false, isDirty: true })).toBe("Save + Test");
-    expect(getAgentConfigTestActionLabel({ isCreate: false, isDirty: false })).toBe("Test");
-    expect(getAgentConfigTestActionLabel({ isCreate: true, isDirty: true })).toBe("Test");
+describe("resolvePaperclipRunnerTransitionModel", () => {
+  it("preserves Claude custom model IDs", () => {
+    expect(resolvePaperclipRunnerTransitionModel("claude_local", "custom-claude-model")).toBe("custom-claude-model");
+  });
+  it("preserves an explicit model from codex_local", () => {
+    expect(resolvePaperclipRunnerTransitionModel("codex_local", "gpt-5.5"))
+      .toBe("gpt-5.5");
   });
 
-  it("saves a dirty edit draft before running the environment test", async () => {
-    const callOrder: string[] = [];
-    const saveDraft = vi.fn(async () => {
-      callOrder.push("save");
-    });
-    const runTest = vi.fn(async (): Promise<AdapterEnvironmentTestResult> => {
-      callOrder.push("test");
-      return {
-        adapterType: "claude_local",
-        status: "pass",
-        checks: [],
-        testedAt: new Date(0).toISOString(),
-      };
-    });
-
-    await runAgentConfigEnvironmentTest({
-      isCreate: false,
-      isDirty: true,
-      saveDraft,
-      runTest,
-    });
-
-    expect(saveDraft).toHaveBeenCalledTimes(1);
-    expect(runTest).toHaveBeenCalledTimes(1);
-    expect(callOrder).toEqual(["save", "test"]);
-  });
-
-  it("runs create-mode tests without saving first", async () => {
-    const saveDraft = vi.fn(async () => {});
-    const runTest = vi.fn(async (): Promise<AdapterEnvironmentTestResult> => ({
-      adapterType: "claude_local",
-      status: "pass",
-      checks: [],
-      testedAt: new Date(0).toISOString(),
-    }));
-
-    await runAgentConfigEnvironmentTest({
-      isCreate: true,
-      isDirty: true,
-      saveDraft,
-      runTest,
-    });
-
-    expect(saveDraft).not.toHaveBeenCalled();
-    expect(runTest).toHaveBeenCalledTimes(1);
+  it("uses the current Codex default when the source model is blank", () => {
+    expect(resolvePaperclipRunnerTransitionModel("codex_local", ""))
+      .toBe("gpt-5.6-sol");
   });
 });
 
 function makeEnvironment(overrides: Partial<Environment>): Environment {
   return {
     id: "env-1",
-    companyId: "co-1",
     name: "Env",
     description: null,
     driver: "local",
     status: "active",
     config: {},
+    envVars: {},
     metadata: null,
     createdAt: new Date(0),
     updatedAt: new Date(0),

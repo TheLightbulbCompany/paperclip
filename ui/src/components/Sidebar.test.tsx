@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 
-import { act, type ReactNode } from "react";
+import { type ReactNode } from "react";
 import { flushSync } from "react-dom";
 import { createRoot } from "react-dom/client";
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
@@ -10,6 +10,10 @@ import { TooltipProvider } from "@/components/ui/tooltip";
 
 const mockHeartbeatsApi = vi.hoisted(() => ({
   liveRunsForCompany: vi.fn(),
+}));
+
+const mockAttentionApi = vi.hoisted(() => ({
+  list: vi.fn(),
 }));
 
 const mockInstanceSettingsApi = vi.hoisted(() => ({
@@ -66,6 +70,10 @@ vi.mock("../api/heartbeats", () => ({
   heartbeatsApi: mockHeartbeatsApi,
 }));
 
+vi.mock("../api/attention", () => ({
+  attentionApi: mockAttentionApi,
+}));
+
 vi.mock("../api/instanceSettings", () => ({
   instanceSettingsApi: mockInstanceSettingsApi,
 }));
@@ -92,12 +100,22 @@ vi.mock("./SidebarCompanyMenu", () => ({
 
 vi.mock("./SidebarAgents", () => ({
   SidebarAgents: ({ streamlined }: { streamlined?: boolean }) => (
-    <div data-testid="sidebar-agents" data-streamlined={String(streamlined)} />
+    <div data-testid="sidebar-agents" data-streamlined={String(streamlined)}>
+      Active agents
+    </div>
   ),
 }));
 
 vi.mock("./SidebarProjects", () => ({
-  SidebarProjects: () => <div data-testid="sidebar-projects">Projects collapsible</div>,
+  SidebarProjects: () => <div data-testid="sidebar-projects">Classic projects</div>,
+}));
+
+vi.mock("./SidebarStarredProjects", () => ({
+  SidebarStarredProjects: () => <div data-testid="sidebar-starred-projects" />,
+}));
+
+vi.mock("./SidebarRecentTasks", () => ({
+  SidebarRecentTasks: () => <div data-testid="sidebar-recent-tasks">Recent Tasks</div>,
 }));
 
 async function flushReact() {
@@ -135,8 +153,10 @@ describe("Sidebar", () => {
     container = document.createElement("div");
     document.body.appendChild(container);
     mockHeartbeatsApi.liveRunsForCompany.mockResolvedValue([]);
+    mockAttentionApi.list.mockResolvedValue({ items: [] });
     mockSidebar.isMobile = false;
     mockSidebar.collapsed = false;
+    mockSidebar.collapseLocked = false;
     mockSidebar.peeking = false;
   });
 
@@ -146,14 +166,31 @@ describe("Sidebar", () => {
     vi.clearAllMocks();
   });
 
-  it("links the top search icon to the search page without showing Search in Work nav", async () => {
+  it("keeps the default sidebar edge borderless", async () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
     const root = await renderSidebar();
 
-    const topSearchLink = container.querySelector('a[aria-label="Open search"]');
-    expect(topSearchLink?.getAttribute("href")).toBe("/search");
-    const workLinks = [...container.querySelectorAll("nav a")].map((anchor) => anchor.textContent?.trim());
-    expect(workLinks).not.toContain("Search");
+    const sidebar = container.querySelector("aside");
+    expect(sidebar?.classList).not.toContain("border-r");
+    expect(sidebar?.classList).not.toContain("border-border");
+    expect(sidebar?.classList).toContain("primary-sidebar-surface");
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("shows Search as a nav item instead of a header icon", async () => {
+    // The header's spare width goes to the workspace name (which otherwise
+    // truncates at ~78px), so search lives in the nav list — still
+    // exactly one pointer affordance, just relocated.
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
+    const root = await renderSidebar();
+
+    expect(container.querySelector('a[aria-label="Open search"]')).toBeNull();
+    const navSearchLink = [...container.querySelectorAll("nav a")]
+      .find((anchor) => anchor.textContent?.trim() === "Search");
+    expect(navSearchLink?.getAttribute("href")).toBe("/search");
 
     flushSync(() => {
       root.unmount();
@@ -170,17 +207,22 @@ describe("Sidebar", () => {
     const workSection = [...container.querySelectorAll("nav [data-plugin-launcher-zone]")]
       .find((node) => node.getAttribute("data-plugin-launcher-zone") === "sidebar");
     expect(workSection?.textContent).toContain("Plugin launcher outlet");
-    const workSectionContainer = workSection?.parentElement?.parentElement;
+    // The Work section is a Collapsible now (one extra wrapper level), so
+    // resolve the section root by walking up until the header label appears.
+    let workSectionContainer = workSection?.parentElement ?? null;
+    while (workSectionContainer && !workSectionContainer.textContent?.includes("Work")) {
+      workSectionContainer = workSectionContainer.parentElement;
+    }
     expect(workSectionContainer?.textContent).toContain("Work");
     expect(workSectionContainer?.textContent).toContain("Tasks");
-    expect(workSectionContainer?.textContent).toContain("Goals");
+    expect(workSectionContainer?.textContent).not.toContain("Goals");
 
     flushSync(() => {
       root.unmount();
     });
   });
 
-  it("streamlined (flag ON): keeps Task wording, top-level Projects link, no per-project collapsible", async () => {
+  it("uses the simplified work navigation with one Agents destination", async () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
       enableIsolatedWorkspaces: false,
       enableStreamlinedLeftNavigation: true,
@@ -196,40 +238,87 @@ describe("Sidebar", () => {
 
     const projectsLink = [...container.querySelectorAll("nav a")].find((a) => a.textContent?.trim() === "Projects");
     expect(projectsLink?.getAttribute("href")).toBe("/projects");
+    const agentLinks = [...container.querySelectorAll('a[href="/agents"]')];
+    expect(agentLinks).toHaveLength(1);
+    expect([...container.querySelectorAll('a[href="/activity"]')]).toHaveLength(1);
+    expect(navLabels).toContain("Audit");
+    expect(navLabels).not.toContain("Settings");
+    expect(navLabels).not.toContain("Activity");
+    expect(navLabels).not.toContain("Costs");
+    expect(container.querySelector('[data-testid="sidebar-recent-tasks"]')).not.toBeNull();
 
-    expect(container.querySelector('[data-testid="sidebar-projects"]')).toBeNull();
-    expect(
-      container.querySelector('[data-testid="sidebar-agents"]')?.getAttribute("data-streamlined"),
-    ).toBe("true");
-
-    await act(async () => {
+    flushSync(() => {
       root.unmount();
     });
   });
 
-  it("classic (flag OFF): New Task button, Tasks label, per-project collapsible, no top-level Projects link", async () => {
+  it("keeps the simplified navigation while experimental settings are loading", async () => {
+    mockInstanceSettingsApi.getExperimental.mockImplementation(() => new Promise(() => {}));
+    const root = await renderSidebar();
+
+    const navLabels = [...container.querySelectorAll("nav a")].map((a) => a.textContent?.trim());
+    expect(navLabels).toContain("Projects");
+    expect(navLabels).toContain("Agents");
+    expect(container.textContent).not.toContain("Organization");
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("ignores the retired streamlined navigation opt-out", async () => {
+    // PAP-12472 retired the experimental opt-out; the streamlined sidebar is the
+    // only path, so an old `false` setting no longer restores classic mode.
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({
       enableIsolatedWorkspaces: false,
       enableStreamlinedLeftNavigation: false,
     });
     const root = await renderSidebar();
 
-    expect(container.textContent).toContain("New Task");
-    expect(container.textContent).not.toContain("New Issue");
-
     const navLabels = [...container.querySelectorAll("nav a")].map((a) => a.textContent?.trim());
     expect(navLabels).toContain("Tasks");
-    expect(navLabels).not.toContain("Issues");
-    // No top-level Projects nav link in classic mode (D5 option A).
-    expect(navLabels).not.toContain("Projects");
+    // Top-level Projects link + starred children stay, per-project collapsible gone.
+    expect(navLabels).toContain("Projects");
+    expect(container.querySelector('[data-testid="sidebar-starred-projects"]')).not.toBeNull();
+    expect(navLabels).toContain("Agents");
 
-    // Per-project collapsible restored below Work.
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("restores legacy agent and organization navigation when Streamlined UI is off", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableStreamlinedUi: false,
+      enableApps: true,
+    });
+    const root = await renderSidebar();
+
+    const labels = [...container.querySelectorAll("nav a")].map((anchor) => anchor.textContent?.trim());
+    expect(container.querySelector('[data-testid="sidebar-recent-tasks"]')).toBeNull();
     expect(container.querySelector('[data-testid="sidebar-projects"]')).not.toBeNull();
-    expect(
-      container.querySelector('[data-testid="sidebar-agents"]')?.getAttribute("data-streamlined"),
-    ).toBe("false");
+    expect(container.querySelector('[data-testid="sidebar-agents"]')?.getAttribute("data-streamlined")).toBe("undefined");
+    expect(container.textContent).toContain("Organization");
+    expect(labels).toEqual(expect.arrayContaining(["Org", "Connectors", "Timeline", "Costs", "Activity", "Settings"]));
+    expect(labels).not.toContain("Audit");
+    expect(labels).not.toContain("Projects");
+    expect(container.querySelector('a[href="/agents"]')).toBeNull();
+    expect(container.querySelector("aside")?.classList).toContain("border-r");
 
-    await act(async () => {
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("locks the legacy collapse control while a secondary sidebar forces the rail", async () => {
+    mockSidebar.collapseLocked = true;
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableStreamlinedUi: false });
+    const root = await renderSidebar();
+
+    expect(container.querySelector('button[aria-label="Collapse sidebar"]')).toBeNull();
+    expect(container.querySelector('button[aria-label="Expand sidebar"]')).toBeNull();
+
+    flushSync(() => {
       root.unmount();
     });
   });
@@ -267,19 +356,119 @@ describe("Sidebar", () => {
     });
   });
 
-  it("shows an Artifacts nav item directly below Goals", async () => {
+  it("does not poll attention until Decisions is enabled", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableDecisions: false });
+    const root = await renderSidebar();
+
+    expect(mockAttentionApi.list).not.toHaveBeenCalled();
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("shows Status directly below Decisions in primary navigation", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableDecisions: true,
+      enableStatusCards: true,
+    });
+    const root = await renderSidebar();
+
+    const primaryNavLinks = [...container.querySelectorAll("nav > div:first-child a")];
+    const decisionsLink = primaryNavLinks.find(
+      (anchor) => anchor.textContent?.trim() === "Decisions",
+    );
+    const statusLink = primaryNavLinks.find((anchor) => anchor.getAttribute("href") === "/status");
+
+    expect(statusLink?.textContent).toContain("Status");
+    expect(statusLink?.textContent).toContain("beta");
+    expect(statusLink?.textContent).not.toContain("exp");
+    expect(statusLink?.textContent).not.toContain("cards");
+    expect(primaryNavLinks.indexOf(statusLink!)).toBe(primaryNavLinks.indexOf(decisionsLink!) + 1);
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("groups and orders the streamlined Work and Org navigation", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIsolatedWorkspaces: false,
+      enableApps: true,
+    });
+    const root = await renderSidebar();
+
+    const sections = [...container.querySelectorAll("nav > div")];
+    const workSection = sections.find((section) => section.textContent?.startsWith("Work"));
+    const orgSection = sections.find((section) => section.textContent?.startsWith("Org"));
+    const labels = (section: Element | undefined) => [...(section?.querySelectorAll("a") ?? [])]
+      .map((anchor) => anchor.textContent?.trim());
+
+    expect(labels(workSection)).toEqual(["Tasks", "Projects", "Routines", "Artifacts"]);
+    expect(labels(orgSection)).toEqual(["Agents", "Skills", "Connectors", "Audit"]);
+    expect(sections.indexOf(workSection!)).toBeLessThan(sections.indexOf(orgSection!));
+    expect(
+      workSection?.querySelector('a[href="/issues"] svg')?.classList.contains("lucide-circle-check"),
+    ).toBe(true);
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("hides the Goals nav item by default", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIsolatedWorkspaces: false,
+      enableGoalsSidebarLink: false,
+    });
+    const root = await renderSidebar();
+
+    expect([...container.querySelectorAll("nav a")].map((a) => a.textContent?.trim())).not.toContain("Goals");
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("reserves the Goals nav slot while experimental settings are loading", async () => {
+    mockInstanceSettingsApi.getExperimental.mockImplementation(() => new Promise(() => {}));
+    const root = await renderSidebar();
+
+    expect([...container.querySelectorAll("nav a")].map((a) => a.textContent?.trim())).not.toContain("Goals");
+    expect(container.querySelector('[data-testid="sidebar-goals-placeholder"]')).not.toBeNull();
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("shows the Goals nav item when the experimental setting is enabled", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIsolatedWorkspaces: false,
+      enableGoalsSidebarLink: true,
+    });
+    const root = await renderSidebar();
+
+    const link = [...container.querySelectorAll("a")].find((anchor) => anchor.textContent === "Goals");
+    expect(link?.getAttribute("href")).toBe("/goals");
+
+    const navText = container.querySelector("nav")?.textContent ?? "";
+    expect(navText.indexOf("Artifacts")).toBeLessThan(navText.indexOf("Goals"));
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("keeps Timeline out of the global navigation", async () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
     const root = await renderSidebar();
 
-    const artifactsLink = [...container.querySelectorAll("a")].find(
-      (anchor) => anchor.textContent === "Artifacts",
-    );
-    expect(artifactsLink?.getAttribute("href")).toBe("/artifacts");
-
-    const navText = container.querySelector("nav")?.textContent ?? "";
-    expect(navText).toContain("Goals");
-    expect(navText).toContain("Artifacts");
-    expect(navText.indexOf("Goals")).toBeLessThan(navText.indexOf("Artifacts"));
+    const sections = [...container.querySelectorAll("nav > div")];
+    const workSection = sections.find((section) => section.textContent?.startsWith("Work"));
+    expect(workSection?.textContent).toContain("Projects");
+    expect(workSection?.textContent).not.toContain("Timeline");
+    expect(container.querySelector('a[href="/timeline"]')).toBeNull();
 
     flushSync(() => {
       root.unmount();
@@ -328,6 +517,66 @@ describe("Sidebar", () => {
     });
   });
 
+  it("hides the Pipelines nav item when pipelines are disabled", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIsolatedWorkspaces: false,
+      enablePipelines: false,
+    });
+    const root = await renderSidebar();
+
+    expect(container.textContent).not.toContain("Pipelines");
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("always shows Connectors in the Org section", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableApps: false });
+    const root = await renderSidebar();
+
+    const links = [...container.querySelectorAll("a")];
+    const link = links.find((anchor) => anchor.textContent === "Connectors");
+    expect(link?.getAttribute("href")).toBe("/apps");
+    expect(link?.querySelector("svg")?.classList).toContain("lucide-unplug");
+    expect(links.findIndex((anchor) => anchor.textContent === "Connectors")).toBeGreaterThan(
+      links.findIndex((anchor) => anchor.textContent === "Skills"),
+    );
+    expect(links.findIndex((anchor) => anchor.textContent === "Connectors")).toBeLessThan(
+      links.findIndex((anchor) => anchor.textContent === "Audit"),
+    );
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("shows the Pipelines nav item when pipelines are enabled", async () => {
+    mockInstanceSettingsApi.getExperimental.mockResolvedValue({
+      enableIsolatedWorkspaces: false,
+      enablePipelines: true,
+    });
+    const root = await renderSidebar();
+
+    const link = [...container.querySelectorAll("a")].find((anchor) => anchor.textContent === "Pipelines");
+    expect(link?.getAttribute("href")).toBe("/pipelines");
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
+  it("does not flash the Pipelines nav item while experimental settings are loading", async () => {
+    mockInstanceSettingsApi.getExperimental.mockImplementation(() => new Promise(() => {}));
+    const root = await renderSidebar();
+
+    expect(container.textContent).not.toContain("Pipelines");
+
+    flushSync(() => {
+      root.unmount();
+    });
+  });
+
   it("shows the Workspaces link when isolated workspaces are enabled", async () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: true });
     const root = await renderSidebar();
@@ -340,75 +589,14 @@ describe("Sidebar", () => {
     });
   });
 
-  it("header toggle collapses an expanded sidebar (aria-expanded reflects state)", async () => {
+  it("does not render a global navigation collapse affordance", async () => {
     mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
-    const root = await renderSidebar();
-
-    const toggle = container.querySelector<HTMLButtonElement>('button[aria-label="Collapse sidebar"]');
-    expect(toggle).not.toBeNull();
-    expect(toggle?.getAttribute("aria-expanded")).toBe("true");
-
-    act(() => {
-      toggle?.click();
-    });
-    expect(mockSidebar.toggleCollapsed).toHaveBeenCalledTimes(1);
-
-    flushSync(() => {
-      root.unmount();
-    });
-  });
-
-  it("hides the expand/collapse toggle while a secondary sidebar locks the rail", async () => {
-    // A secondary sidebar forces the rail; the user must not be able to expand
-    // the primary while it is shown (PAP-10694).
-    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
-    mockSidebar.collapseLocked = true;
     const root = await renderSidebar();
 
     expect(container.querySelector('button[aria-label="Collapse sidebar"]')).toBeNull();
     expect(container.querySelector('button[aria-label="Expand sidebar"]')).toBeNull();
-
-    mockSidebar.collapseLocked = false;
-    flushSync(() => {
-      root.unmount();
-    });
-  });
-
-  it("keeps the collapsed rail top bar to just the company logo (no clipped search/toggle)", async () => {
-    // In the narrow rail the search/toggle controls don't fit beside the logo and
-    // would overflow/clip, shoving the logo out of the icon column (PAP-10676), so
-    // they are dropped in the rail. Expansion stays reachable via hover-peek + Pin
-    // and Cmd/Ctrl+B. The full controls return as soon as the panel is expanded or
-    // peeking (covered by the other top-bar tests).
-    mockSidebar.collapsed = true;
-    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
-    const root = await renderSidebar();
-
-    expect(container.querySelector('button[aria-label="Expand sidebar"]')).toBeNull();
-    expect(container.querySelector('a[aria-label="Open search"]')).toBeNull();
-    // The company menu (workspace switcher / logo) is still present in the rail.
+    expect(container.querySelector('button[aria-label="Keep sidebar expanded"]')).toBeNull();
     expect(container.textContent).toContain("Company menu");
-
-    flushSync(() => {
-      root.unmount();
-    });
-  });
-
-  it("peek header shows a pin that promotes the peek to pinned-expanded", async () => {
-    mockSidebar.collapsed = true;
-    mockSidebar.peeking = true;
-    mockInstanceSettingsApi.getExperimental.mockResolvedValue({ enableIsolatedWorkspaces: false });
-    const root = await renderSidebar();
-
-    // The collapse toggle is replaced by the pin while peeking.
-    expect(container.querySelector('button[aria-label="Expand sidebar"]')).toBeNull();
-    const pin = container.querySelector<HTMLButtonElement>('button[aria-label="Keep sidebar expanded"]');
-    expect(pin).not.toBeNull();
-
-    act(() => {
-      pin?.click();
-    });
-    expect(mockSidebar.setCollapsed).toHaveBeenCalledWith(false);
 
     flushSync(() => {
       root.unmount();

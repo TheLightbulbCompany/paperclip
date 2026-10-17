@@ -6,7 +6,6 @@ export type WorkModeTone = "neutral" | "ask" | "planning";
 export interface WorkModeMeta {
   value: IssueWorkMode;
   label: string;
-  shortLabel: string;
   icon: LucideIcon;
   tone: WorkModeTone;
   classes: {
@@ -42,28 +41,25 @@ export function isIssueWorkMode(value: unknown): value is IssueWorkMode {
   return value === "standard" || value === "ask" || value === "planning";
 }
 
-export function workModeMetaList(conferenceRoomChat: boolean): WorkModeMeta[] {
+export function workModeMetaList(): WorkModeMeta[] {
   return [
     {
       value: "standard",
-      label: conferenceRoomChat ? "Agent mode" : "Standard",
-      shortLabel: conferenceRoomChat ? "Agent" : "Standard",
+      label: "Auto mode",
       icon: Hammer,
       tone: "neutral",
       classes: STANDARD_CLASSES,
     },
     {
       value: "planning",
-      label: conferenceRoomChat ? "Plan mode" : "Planning",
-      shortLabel: conferenceRoomChat ? "Plan" : "Planning",
+      label: "Plan mode",
       icon: ClipboardList,
       tone: "planning",
       classes: PLANNING_CLASSES,
     },
     {
       value: "ask",
-      label: conferenceRoomChat ? "Ask mode" : "Ask",
-      shortLabel: "Ask",
+      label: "Ask mode",
       icon: MessageCircleQuestion,
       tone: "ask",
       classes: ASK_CLASSES,
@@ -71,23 +67,23 @@ export function workModeMetaList(conferenceRoomChat: boolean): WorkModeMeta[] {
   ];
 }
 
-export function workModeMetaFor(mode: IssueWorkMode, conferenceRoomChat: boolean): WorkModeMeta {
-  const modes = workModeMetaList(conferenceRoomChat);
+export function workModeMetaFor(mode: IssueWorkMode): WorkModeMeta {
+  const modes = workModeMetaList();
   return modes.find((meta) => meta.value === mode) ?? modes[0]!;
 }
 
-export function nextWorkMode(mode: IssueWorkMode, conferenceRoomChat: boolean): IssueWorkMode {
-  const modes = workModeMetaList(conferenceRoomChat);
+export function nextWorkMode(mode: IssueWorkMode): IssueWorkMode {
+  const modes = workModeMetaList();
   const index = modes.findIndex((meta) => meta.value === mode);
   return modes[(index + 1) % modes.length]?.value ?? "standard";
 }
 
-export function titleForPendingWorkMode(mode: IssueWorkMode, conferenceRoomChat: boolean): string {
+export function titleForPendingWorkMode(mode: IssueWorkMode): string {
   if (mode === "ask") {
-    return "Ask mode for this submission. Click to change. The assignee will answer in this thread; no implementation work.";
+    return "Ask mode for this submission. Click to change. The responsible will answer in this thread; no implementation work.";
   }
   if (mode === "planning") {
-    return `${conferenceRoomChat ? "Plan" : "Planning"} mode is on for this submission. Click to change.`;
+    return "Plan mode is on for this submission. Click to change.";
   }
-  return `${conferenceRoomChat ? "Agent" : "Standard"} mode for this submission. Click to change.`;
+  return "Auto mode for this submission. Click to change.";
 }

@@ -1,10 +1,12 @@
-import { and, asc, desc, eq, inArray, sql } from "drizzle-orm";
+import { and, asc, desc, eq, inArray, isNull, sql } from "drizzle-orm";
 import type { Db } from "@paperclipai/db";
 import {
   projects,
   projectGoals,
   goals,
   issues,
+  costEvents,
+  financeEvents,
   budgetPolicies,
   pluginManagedResources,
   plugins,
@@ -28,6 +30,7 @@ import {
   type PluginManagedProjectDeclaration,
   type PluginManagedProjectResolution,
 } from "@paperclipai/shared";
+import { unprocessable } from "../errors.js";
 import { listCurrentRuntimeServicesForProjectWorkspaces } from "./workspace-runtime-read-model.js";
 import { parseProjectExecutionWorkspacePolicy } from "./execution-workspace-policy.js";
 import { mergeProjectWorkspaceRuntimeConfig, readProjectWorkspaceRuntimeConfig } from "./project-workspace-runtime-config.js";
@@ -368,7 +371,7 @@ async function attachListMetrics(
         count: sql<number>`count(*)::int`,
       })
       .from(issues)
-      .where(and(eq(issues.companyId, companyId), inArray(issues.projectId, projectIds)))
+      .where(and(eq(issues.companyId, companyId), inArray(issues.projectId, projectIds), isNull(issues.conversationAgentId)))
       .groupBy(issues.projectId),
     db
       .select({
@@ -401,6 +404,31 @@ async function attachListMetrics(
 }
 
 /** Sync the project_goals join table for a single project. */
+/**
+ * Every goal a project links to must exist and belong to the same company.
+ * Without this check a nonexistent id only dies at the projects.goal_id
+ * foreign key — an opaque 500 the caller retries (observed live
+ * 2026-09-03: four identical retries of one bad id) — and a goal from
+ * another company would link silently, because the foreign key proves
+ * existence, not ownership.
+ */
+async function assertGoalsBelongToCompany(db: Db, companyId: string, goalIds: string[]): Promise<void> {
+  if (goalIds.length === 0) return;
+  const unique = [...new Set(goalIds)];
+  const found = await db
+    .select({ id: goals.id })
+    .from(goals)
+    .where(and(eq(goals.companyId, companyId), inArray(goals.id, unique)));
+  const foundIds = new Set(found.map((row) => row.id));
+  const unknown = unique.filter((goalId) => !foundIds.has(goalId));
+  if (unknown.length > 0) {
+    throw unprocessable(
+      `Unknown goal id(s) for this company: ${unknown.join(", ")}`,
+      { unknownGoalIds: unknown },
+    );
+  }
+}
+
 async function syncGoalLinks(db: Db, projectId: string, companyId: string, goalIds: string[]) {
   // Delete existing links
   await db.delete(projectGoals).where(eq(projectGoals.projectId, projectId));
@@ -547,6 +575,7 @@ export function projectService(db: Db) {
   ): Promise<ProjectWithGoals> => {
     const { goalIds: inputGoalIds, ...projectData } = data;
     const ids = resolveGoalIds({ goalIds: inputGoalIds, goalId: projectData.goalId });
+    if (ids && ids.length > 0) await assertGoalsBelongToCompany(db, companyId, ids);
 
     // Note: color is intentionally NOT auto-assigned. New projects default to
     // `color = null` (neutral gray) unless an explicit color is supplied. See PAP-68.
@@ -558,7 +587,11 @@ export function projectService(db: Db) {
     projectData.name = resolveProjectNameForUniqueShortname(projectData.name, existingProjects);
 
     // Also write goalId to the legacy column (first goal or null)
-    const legacyGoalId = ids && ids.length > 0 ? ids[0] : projectData.goalId ?? null;
+    // The resolved set is canonical for persistence as well as validation:
+    // falling back to the raw legacy field here would write an id that
+    // skipped validation whenever `goalIds: []` and `goalId` arrive
+    // together (goalIds wins resolution, mirroring the update path).
+    const legacyGoalId = ids?.[0] ?? null;
 
     const row = await db
       .insert(projects)
@@ -589,8 +622,17 @@ export function projectService(db: Db) {
   };
 
   return {
-    list: async (companyId: string): Promise<ProjectWithGoals[]> => {
-      const rows = await db.select().from(projects).where(eq(projects.companyId, companyId));
+    list: async (companyId: string, opts: { includeArchived?: boolean } = {}): Promise<ProjectWithGoals[]> => {
+      // NOTE: this service default is intentionally the inverse of the HTTP route default.
+      // The route (`GET /companies/:companyId/projects`) defaults `includeArchived` to `false`
+      // (active-only) for its callers, but the service defaults to `true` so that existing
+      // server-internal callers that pass no opts keep their pre-existing "return everything,
+      // including archived" behaviour. Pass `{ includeArchived: false }` explicitly for active-only.
+      const includeArchived = opts.includeArchived ?? true;
+      const where = includeArchived
+        ? eq(projects.companyId, companyId)
+        : and(eq(projects.companyId, companyId), isNull(projects.archivedAt));
+      const rows = await db.select().from(projects).where(where);
       const withGoals = await attachGoals(db, rows);
       const withWorkspaces = await attachWorkspaces(db, withGoals);
       return attachListMetrics(db, companyId, withWorkspaces);
@@ -771,6 +813,52 @@ export function projectService(db: Db) {
       };
     },
 
+    createWithRepositories: async (companyId: string, data: Parameters<typeof createProject>[1], repositories: import("@paperclipai/shared").ProjectRepository[]): Promise<ProjectWithGoals> => {
+      return db.transaction(async (tx) => {
+        const service = projectService(tx as unknown as Db);
+        const project = await service.create(companyId, data);
+        for (const repo of repositories) {
+          await service.createWorkspace(project.id, { name: repo.fullName, repoUrl: repo.url, metadata: { githubRepositoryId: repo.id } });
+        }
+        return (await service.getById(project.id))!;
+      });
+    },
+
+    replaceRepositories: async (projectId: string, repositories: import("@paperclipai/shared").ProjectRepository[]): Promise<ProjectWithGoals | null> => {
+      return db.transaction(async (tx) => {
+        const [project] = await tx.select().from(projects).where(eq(projects.id, projectId)).for("update");
+        if (!project) return null;
+        const service = projectService(tx as unknown as Db);
+        const existing = await service.listWorkspaces(projectId);
+        const ids = new Set(repositories.map((repo) => repo.id));
+        for (const workspace of existing) {
+          const repoId = workspace.metadata?.githubRepositoryId;
+          if (typeof repoId === "string" && !ids.has(repoId)) {
+            // Keep local/runtime workspace configuration when detaching source.
+            if (workspace.cwd || workspace.remoteWorkspaceRef) {
+              const { githubRepositoryId: _id, ...metadata } = workspace.metadata!;
+              await service.updateWorkspace(projectId, workspace.id, { repoUrl: null, metadata });
+            } else await service.removeWorkspace(projectId, workspace.id);
+          }
+        }
+        for (const repo of repositories) {
+          const retained = existing.find((workspace) => workspace.metadata?.githubRepositoryId === repo.id);
+          if (retained) {
+            if (retained.repoUrl !== repo.url || retained.name !== repo.fullName) {
+              await service.updateWorkspace(projectId, retained.id, { name: repo.fullName, repoUrl: repo.url });
+            }
+            continue;
+          }
+          const legacy = existing.find((workspace) => !workspace.metadata?.githubRepositoryId && workspace.repoUrl?.replace(/\.git$/, "").replace(/\/$/, "").toLowerCase() === repo.url.toLowerCase());
+          if (legacy) {
+            await service.updateWorkspace(projectId, legacy.id, { metadata: { ...legacy.metadata, githubRepositoryId: repo.id } });
+          } else await service.createWorkspace(projectId, { name: repo.fullName, repoUrl: repo.url, metadata: { githubRepositoryId: repo.id } });
+        }
+        await tx.update(projects).set({ updatedAt: new Date() }).where(eq(projects.id, projectId));
+        return service.getById(projectId);
+      });
+    },
+
     create: createProject,
 
     update: async (
@@ -785,6 +873,9 @@ export function projectService(db: Db) {
         .where(eq(projects.id, id))
         .then((rows) => rows[0] ?? null);
       if (!existingProject) return null;
+      if (ids && ids.length > 0) {
+        await assertGoalsBelongToCompany(db, existingProject.companyId, ids);
+      }
 
       if (projectData.name !== undefined) {
         const existingShortname = normalizeProjectUrlKey(existingProject.name);
@@ -856,16 +947,41 @@ export function projectService(db: Db) {
       return cleared;
     },
 
+    // isol8: these FKs into projects.id have no delete policy, so a linked task
+    // (or a cost/finance row) made the delete fail with SQLSTATE 23503.
+    // Detach them in the same transaction; the rows outlive the project. The
+    // row lock blocks new references until we commit, and every sweep is scoped
+    // to the project's own company.
     remove: (id: string) =>
-      db
-        .delete(projects)
-        .where(eq(projects.id, id))
-        .returning()
-        .then((rows) => {
-          const row = rows[0] ?? null;
-          if (!row) return null;
-          return { ...row, urlKey: deriveProjectUrlKey(row.name, row.id) };
-        }),
+      db.transaction(async (tx) => {
+        const project = await tx
+          .select({ companyId: projects.companyId })
+          .from(projects)
+          .where(eq(projects.id, id))
+          .for("update")
+          .then((rows) => rows[0] ?? null);
+        if (!project) return null;
+        const { companyId } = project;
+        await tx
+          .update(issues)
+          .set({ projectId: null })
+          .where(and(eq(issues.companyId, companyId), eq(issues.projectId, id)));
+        await tx
+          .update(costEvents)
+          .set({ projectId: null })
+          .where(and(eq(costEvents.companyId, companyId), eq(costEvents.projectId, id)));
+        await tx
+          .update(financeEvents)
+          .set({ projectId: null })
+          .where(and(eq(financeEvents.companyId, companyId), eq(financeEvents.projectId, id)));
+        const row = await tx
+          .delete(projects)
+          .where(eq(projects.id, id))
+          .returning()
+          .then((rows) => rows[0] ?? null);
+        if (!row) return null;
+        return { ...row, urlKey: deriveProjectUrlKey(row.name, row.id) };
+      }),
 
     listWorkspaces: async (projectId: string): Promise<ProjectWorkspace[]> => {
       const rows = await db

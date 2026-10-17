@@ -4,10 +4,31 @@ import { parseAssigneeValue } from "./assignees";
 type StageType = "review" | "approval";
 
 function newId() {
-  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
-    return crypto.randomUUID();
+  const webCrypto = globalThis.crypto;
+  if (typeof webCrypto?.randomUUID === "function") {
+    return webCrypto.randomUUID();
   }
-  return `stage-${Math.random().toString(36).slice(2)}`;
+
+  const bytes = new Uint8Array(16);
+  if (typeof webCrypto?.getRandomValues === "function") {
+    webCrypto.getRandomValues(bytes);
+  } else {
+    for (let index = 0; index < bytes.length; index += 1) {
+      bytes[index] = Math.floor(Math.random() * 256);
+    }
+  }
+
+  bytes[6] = (bytes[6] & 0x0f) | 0x40;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+
+  const hex = Array.from(bytes, (byte) => byte.toString(16).padStart(2, "0"));
+  return [
+    hex.slice(0, 4).join(""),
+    hex.slice(4, 6).join(""),
+    hex.slice(6, 8).join(""),
+    hex.slice(8, 10).join(""),
+    hex.slice(10, 16).join(""),
+  ].join("-");
 }
 
 function principalKey(principal: IssueExecutionStagePrincipal | IssueExecutionStageParticipant) {
@@ -86,12 +107,25 @@ export function buildExecutionPolicy(input: {
     });
   }
 
-  if (stages.length === 0 && !monitor) return null;
+  // Carried through, never rebuilt: no form that calls this has a control for
+  // these, so rebuilding the policy without them lets an unrelated reviewer or
+  // approver edit silently delete governance that was set through the API,
+  // weakening every issue the policy subsequently gates.
+  const reviewPreset = input.existingPolicy?.reviewPreset;
+  const authorizationPolicy = input.existingPolicy?.authorizationPolicy;
+  const maxReviewRounds = input.existingPolicy?.maxReviewRounds;
+
+  // maxReviewRounds counts as content: collapsing to null here would delete an
+  // API-set round cap when the last stage/monitor is removed.
+  if (stages.length === 0 && !monitor && !reviewPreset && !authorizationPolicy && maxReviewRounds == null) return null;
 
   return {
     mode,
     commentRequired: true,
     stages,
     ...(monitor ? { monitor } : {}),
+    ...(reviewPreset ? { reviewPreset } : {}),
+    ...(authorizationPolicy ? { authorizationPolicy } : {}),
+    ...(maxReviewRounds != null ? { maxReviewRounds } : {}),
   };
 }

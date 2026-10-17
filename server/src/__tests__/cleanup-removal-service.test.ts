@@ -6,6 +6,9 @@ import {
   agents,
   companies,
   companySkills,
+  companySkillTestRuns,
+  companySkillVersions,
+  costEvents,
   createDb,
   documents,
   documentRevisions,
@@ -16,6 +19,7 @@ import {
   issueExecutionDecisions,
   issueReadStates,
   issues,
+  routines,
 } from "@paperclipai/db";
 import {
   getEmbeddedPostgresTestSupport,
@@ -23,6 +27,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { agentService } from "../services/agents.ts";
 import { companyService } from "../services/companies.ts";
+import { issueService } from "../services/issues.ts";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
 const describeEmbeddedPostgres = embeddedPostgresSupport.supported ? describe : describe.skip;
@@ -45,14 +50,18 @@ describeEmbeddedPostgres("cleanup removal services", () => {
   afterEach(async () => {
     await db.delete(heartbeatRunEvents);
     await db.delete(activityLog);
+    await db.delete(costEvents);
     await db.delete(issueReadStates);
     await db.delete(issueComments);
     await db.delete(issueExecutionDecisions);
     await db.delete(documentRevisions);
     await db.delete(documents);
+    await db.delete(companySkillTestRuns);
+    await db.delete(companySkillVersions);
     await db.delete(companySkills);
     await db.delete(heartbeatRuns);
     await db.delete(issues);
+    await db.delete(routines);
     await db.delete(agents);
     await db.delete(companies);
   });
@@ -151,6 +160,27 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(0);
     await expect(db.select().from(activityLog).where(eq(activityLog.companyId, companyId))).resolves.toHaveLength(0);
+  });
+
+  it("removes routines assigned to the agent before deleting it", async () => {
+    const { agentId, companyId } = await seedFixture();
+
+    const routineId = randomUUID();
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Weekly report",
+      assigneeAgentId: agentId,
+    });
+
+    // Without clearing the assigned routine first this throws on the
+    // routines_assignee_agent_id_agents_id_fk constraint (the agent delete
+    // returns 500 to the caller).
+    const removed = await agentService(db).remove(agentId);
+
+    expect(removed?.id).toBe(agentId);
+    await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
+    await expect(db.select().from(routines).where(eq(routines.id, routineId))).resolves.toHaveLength(0);
   });
 
   it("removes issue read states and activity rows before deleting the company", async () => {
@@ -257,5 +287,122 @@ describeEmbeddedPostgres("cleanup removal services", () => {
     await expect(db.select().from(heartbeatRuns).where(eq(heartbeatRuns.id, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(heartbeatRunEvents).where(eq(heartbeatRunEvents.runId, runId))).resolves.toHaveLength(0);
     await expect(db.select().from(companies).where(eq(companies.id, otherCompanyId))).resolves.toHaveLength(1);
+  });
+
+  it("removes routines before deleting company agents", async () => {
+    const { agentId, companyId } = await seedFixture();
+    const routineId = randomUUID();
+
+    await db.insert(routines).values({
+      id: routineId,
+      companyId,
+      title: "Daily cleanup",
+      assigneeAgentId: agentId,
+    });
+
+    const removed = await companyService(db).remove(companyId);
+
+    expect(removed?.id).toBe(companyId);
+    await expect(db.select().from(routines).where(eq(routines.id, routineId))).resolves.toHaveLength(0);
+    await expect(db.select().from(agents).where(eq(agents.id, agentId))).resolves.toHaveLength(0);
+    await expect(db.select().from(companies).where(eq(companies.id, companyId))).resolves.toHaveLength(0);
+  });
+
+  it("deletes an issue that has comments, read states, cost events, and sub-issues", async () => {
+    const { agentId, companyId, issueId } = await seedFixture();
+
+    const commentId = randomUUID();
+    await db.insert(issueComments).values({
+      id: commentId,
+      companyId,
+      issueId,
+      authorUserId: "user-1",
+      body: "Comment that used to block the delete",
+    });
+
+    await db.insert(issueReadStates).values({
+      id: randomUUID(),
+      companyId,
+      issueId,
+      userId: "user-1",
+    });
+
+    const costEventId = randomUUID();
+    await db.insert(costEvents).values({
+      id: costEventId,
+      companyId,
+      agentId,
+      issueId,
+      provider: "bedrock",
+      model: "sonnet",
+      costCents: 12,
+      occurredAt: new Date(),
+    });
+
+    const childIssueId = randomUUID();
+    await db.insert(issues).values({
+      id: childIssueId,
+      companyId,
+      parentId: issueId,
+      title: "Sub-issue",
+      status: "todo",
+      priority: "medium",
+      createdByUserId: "user-1",
+    });
+
+    // company_skill_test_runs.issueId is notNull with ON DELETE restrict (new
+    // in 2026.7 Skill Studio). Without clearing it the delete throws on the
+    // company_skill_test_runs_issue_id_issues_id_fk constraint and returns 500.
+    const skillId = randomUUID();
+    await db.insert(companySkills).values({
+      id: skillId,
+      companyId,
+      key: "paperclipai/paperclip/skill-studio",
+      slug: "skill-studio",
+      name: "Skill Studio",
+      markdown: "# Skill Studio",
+    });
+
+    const skillVersionId = randomUUID();
+    await db.insert(companySkillVersions).values({
+      id: skillVersionId,
+      companyId,
+      companySkillId: skillId,
+      revisionNumber: 1,
+    });
+
+    const testRunId = randomUUID();
+    await db.insert(companySkillTestRuns).values({
+      id: testRunId,
+      companyId,
+      skillId,
+      inputSnapshot: "input",
+      skillVersionId,
+      agentId,
+      issueId,
+    });
+
+    // Without clearing these first the delete throws on the
+    // issue_comments_issue_id_issues_id_fk constraint (and the sibling
+    // no-ON-DELETE FKs) and DELETE /api/issues/:id returns 500.
+    const removed = await issueService(db).remove(issueId);
+
+    expect(removed?.id).toBe(issueId);
+    await expect(db.select().from(issues).where(eq(issues.id, issueId))).resolves.toHaveLength(0);
+    await expect(db.select().from(issueComments).where(eq(issueComments.issueId, issueId))).resolves.toHaveLength(0);
+    await expect(db.select().from(issueReadStates).where(eq(issueReadStates.issueId, issueId))).resolves.toHaveLength(0);
+
+    // The skill-test run row is gone (it cannot survive — issueId is notNull).
+    await expect(
+      db.select().from(companySkillTestRuns).where(eq(companySkillTestRuns.issueId, issueId)),
+    ).resolves.toHaveLength(0);
+
+    // Ledger rows survive with the issue reference detached.
+    const [costEvent] = await db.select().from(costEvents).where(eq(costEvents.id, costEventId));
+    expect(costEvent?.issueId).toBeNull();
+
+    // Sub-issues survive, promoted to top level.
+    const [child] = await db.select().from(issues).where(eq(issues.id, childIssueId));
+    expect(child?.parentId).toBeNull();
   });
 });
