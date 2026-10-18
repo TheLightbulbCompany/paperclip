@@ -25,7 +25,7 @@ import {
 } from "./helpers/embedded-postgres.js";
 import { errorHandler } from "../middleware/index.js";
 import { companyRoutes } from "../routes/companies.js";
-import { companyArtifactsService } from "../services/company-artifacts.js";
+import { companyArtifactsService, normalizePreviewText } from "../services/company-artifacts.js";
 import type { StorageService } from "../storage/types.js";
 
 const embeddedPostgresSupport = await getEmbeddedPostgresTestSupport();
@@ -914,5 +914,19 @@ describe("company artifacts route authorization", () => {
 
     expect(res.status).toBe(403);
     expect(res.body.error).toBe("Agent key cannot access another company");
+  });
+});
+
+describe("normalizePreviewText", () => {
+  it("drops ~~~ fences", () => {
+    expect(normalizePreviewText("Pick one.\n\n~~~openui\nroot = Stack([q])\n~~~\n\nThanks")).toBe("Pick one. Thanks");
+  });
+
+  it("drops an unterminated ``` fence to the end", () => {
+    expect(normalizePreviewText("Pick one.\n\n```openui lang\nroot = Stack([q])\nq = Choice(1)")).toBe("Pick one.");
+  });
+
+  it("removes markdown backslash escapes", () => {
+    expect(normalizePreviewText("a \\= b \\[x] \\# tag \\\\ end\\")).toBe("a = b [x] tag \\ end\\");
   });
 });
