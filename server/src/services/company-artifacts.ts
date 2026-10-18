@@ -86,10 +86,12 @@ function escapeLikePattern(value: string) {
   return value.replace(/[\\%_]/g, (match) => `\\${match}`);
 }
 
-function normalizePreviewText(input: string | null | undefined) {
+export function normalizePreviewText(input: string | null | undefined) {
   if (!input) return null;
   const stripped = input
-    .replace(/```[\s\S]*?```/g, " ")
+    .replace(/\r\n/g, "\n")
+    .replace(/^ {0,3}(`{3,}|~{3,})[^\n]*(?:\n[\s\S]*?(?:\n {0,3}\1[`~]*[ \t]*(?=\n|(?![\s\S]))|(?![\s\S])))?/gm, " ")
+    .replace(/\\([^A-Za-z0-9\s])/g, "$1")
     .replace(/`([^`]+)`/g, "$1")
     .replace(/!\[[^\]]*]\([^)]*\)/g, " ")
     .replace(/\[([^\]]+)]\([^)]*\)/g, "$1")
