@@ -926,6 +926,10 @@ describe("normalizePreviewText", () => {
     expect(normalizePreviewText("Pick one.\n\n```openui lang\nroot = Stack([q])\nq = Choice(1)")).toBe("Pick one.");
   });
 
+  it("keeps prose after a closed fence in a CRLF body", () => {
+    expect(normalizePreviewText("Pick one.\r\n\r\n```openui\r\nroot = Stack([q])\r\n```\r\n\r\nThanks")).toBe("Pick one. Thanks");
+  });
+
   it("removes markdown backslash escapes", () => {
     expect(normalizePreviewText("a \\= b \\[x] \\# tag \\\\ end\\")).toBe("a = b [x] tag \\ end\\");
   });
