@@ -31,6 +31,10 @@ export function noteServerActivity(at = Date.now()): void {
   for (const wake of wakers) wake();
 }
 
+export function lastServerActivityAt(): number {
+  return lastActivityAt;
+}
+
 /** True when the server has seen no activity for `quietMs`. */
 export function isServerIdle(quietMs = 60_000, now = Date.now()): boolean {
   return now - lastActivityAt >= quietMs;

@@ -99,9 +99,14 @@ describe("GET /health", () => {
     expect(execute).toHaveBeenCalledTimes(1);
     expect(select).toHaveBeenCalledTimes(1);
 
-    noteServerActivity();
+    // Activity (say, demoting the last admin) invalidates the ready reading,
+    // even once the server is idle again.
+    const activityAt = Date.now() + 1;
+    noteServerActivity(activityAt);
+    vi.spyOn(Date, "now").mockReturnValue(activityAt + 90_000);
     await request(app).get("/health");
     expect(execute).toHaveBeenCalledTimes(2);
+    expect(select).toHaveBeenCalledTimes(2);
   });
 
   it("returns 200 with status ok", async () => {

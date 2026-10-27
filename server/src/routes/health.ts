@@ -1,4 +1,4 @@
-import { isServerIdle } from "../services/idle-backoff.js";
+import { isServerIdle, lastServerActivityAt } from "../services/idle-backoff.js";
 import { supportsLocalAiLogin } from "../services/local-ai-login-policy.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { Router } from "express";
@@ -231,8 +231,9 @@ export function healthRoutes(
     });
   });
 
-  // An instance never leaves "ready" once an instance admin exists.
-  let bootstrapSeenReady = false;
+  // When bootstrap was last read as ready. Only a request (activity) can change
+  // it, so a reading newer than the last activity still holds.
+  let bootstrapReadyAt: number | null = null;
   router.get("/", async (req, res) => {
     const actorType = "actor" in req ? req.actor?.type : null;
     const exposeFullDetails = shouldExposeFullHealthDetails(
@@ -316,9 +317,10 @@ export function healthRoutes(
 
     // isol8: an idle server answers the anonymous probe (the ECS container
     // health check) without SQL. Probing SQL every 30 s kept the pool open and
-    // Aurora Serverless v2 from ever pausing. Only once bootstrap has been seen
-    // ready, so the response keeps its bootstrap fields.
-    const skipSql = bootstrapSeenReady && !exposeFullDetails && !exposeWorkspaceReadiness && isServerIdle();
+    // Aurora Serverless v2 from ever pausing. Only when bootstrap was read as
+    // ready after the last activity, so the bootstrap fields stay true.
+    const skipSql = bootstrapReadyAt !== null && bootstrapReadyAt >= lastServerActivityAt()
+      && !exposeFullDetails && !exposeWorkspaceReadiness && isServerIdle();
     if (!skipSql) try {
       await db.execute(sql`SELECT 1`);
     } catch (error) {
@@ -377,7 +379,7 @@ export function healthRoutes(
     }
 
     const persistedDevServerStatus = readPersistedDevServerStatus();
-    if (bootstrapStatus === "ready") bootstrapSeenReady = true;
+    if (!skipSql) bootstrapReadyAt = bootstrapStatus === "ready" ? Date.now() : null;
     let devServer: ReturnType<typeof toDevServerHealthStatus> | undefined;
     if (exposeDevServerDetails && persistedDevServerStatus && typeof (db as { select?: unknown }).select === "function") {
       const instanceSettings = instanceSettingsService(db);
