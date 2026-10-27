@@ -6,6 +6,7 @@ import express from "express";
 import request from "supertest";
 import type { Db } from "@paperclipai/db";
 import { healthRoutes } from "../routes/health.js";
+import { noteServerActivity } from "../services/idle-backoff.js";
 import * as devServerStatus from "../dev-server-status.js";
 import { serverVersion } from "../version.js";
 
@@ -72,6 +73,37 @@ describe("GET /health", () => {
     vi.restoreAllMocks();
     vi.unstubAllEnvs();
   });
+  it("isol8: an idle server answers the anonymous probe without SQL once bootstrap is ready", async () => {
+    const execute = vi.fn().mockResolvedValue([{ "?column?": 1 }]);
+    const select = vi.fn(() => ({ from: () => ({ where: () => Promise.resolve([{ count: 1 }]) }) }));
+    const app = express();
+    app.use("/health", healthRoutes({ execute, select } as unknown as Db, {
+      deploymentMode: "authenticated",
+      deploymentExposure: "public",
+      authReady: true,
+      companyDeletionEnabled: true,
+      serverInfo: testServerInfo,
+      runtimeEnv: {},
+    }));
+    noteServerActivity(Date.now() - 120_000);
+
+    // Bootstrap not yet seen ready: the probe still checks the database.
+    const first = await request(app).get("/health");
+    expect(first.body.bootstrapStatus).toBe("ready");
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(select).toHaveBeenCalledTimes(1);
+
+    const idle = await request(app).get("/health");
+    expect(idle.status).toBe(200);
+    expect(idle.body.bootstrapStatus).toBe("ready");
+    expect(execute).toHaveBeenCalledTimes(1);
+    expect(select).toHaveBeenCalledTimes(1);
+
+    noteServerActivity();
+    await request(app).get("/health");
+    expect(execute).toHaveBeenCalledTimes(2);
+  });
+
   it("returns 200 with status ok", async () => {
     const app = createApp();
     const res = await request(app).get("/health");

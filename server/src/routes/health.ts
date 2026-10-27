@@ -231,6 +231,8 @@ export function healthRoutes(
     });
   });
 
+  // An instance never leaves "ready" once an instance admin exists.
+  let bootstrapSeenReady = false;
   router.get("/", async (req, res) => {
     const actorType = "actor" in req ? req.actor?.type : null;
     const exposeFullDetails = shouldExposeFullHealthDetails(
@@ -313,22 +315,11 @@ export function healthRoutes(
     }
 
     // isol8: an idle server answers the anonymous probe (the ECS container
-    // health check) without SQL, as warm standby does above. Probing SQL every
-    // 30 s kept the pool open and Aurora Serverless v2 from ever pausing.
-    if (!exposeFullDetails && !exposeWorkspaceReadiness && isServerIdle()) {
-      res.json({
-        status: healthStatus,
-        deploymentMode: opts.deploymentMode,
-        deploymentExposure: opts.deploymentExposure,
-        commit,
-        idle: true,
-        ...(cloud ? { cloud } : {}),
-        ...(hiddenSettings.length ? { hiddenSettings } : {}),
-      });
-      return;
-    }
-
-    try {
+    // health check) without SQL. Probing SQL every 30 s kept the pool open and
+    // Aurora Serverless v2 from ever pausing. Only once bootstrap has been seen
+    // ready, so the response keeps its bootstrap fields.
+    const skipSql = bootstrapSeenReady && !exposeFullDetails && !exposeWorkspaceReadiness && isServerIdle();
+    if (!skipSql) try {
       await db.execute(sql`SELECT 1`);
     } catch (error) {
       logger.warn({ err: error }, "Health check database probe failed");
@@ -359,7 +350,7 @@ export function healthRoutes(
     // bootstrap_pending forever and lock every managed tenant out at the
     // claim screen. Self-hosted deployments (neither canonical managed signal)
     // are unaffected.
-    if (opts.deploymentMode === "authenticated" && !isCloudManagedInstance(runtimeEnv)) {
+    if (!skipSql && opts.deploymentMode === "authenticated" && !isCloudManagedInstance(runtimeEnv)) {
       const roleCount = await db
         .select({ count: count() })
         .from(instanceUserRoles)
@@ -386,6 +377,7 @@ export function healthRoutes(
     }
 
     const persistedDevServerStatus = readPersistedDevServerStatus();
+    if (bootstrapStatus === "ready") bootstrapSeenReady = true;
     let devServer: ReturnType<typeof toDevServerHealthStatus> | undefined;
     if (exposeDevServerDetails && persistedDevServerStatus && typeof (db as { select?: unknown }).select === "function") {
       const instanceSettings = instanceSettingsService(db);
