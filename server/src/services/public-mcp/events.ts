@@ -6,6 +6,7 @@ import { ISSUE_STATUSES } from "@paperclipai/shared";
 import { localEncryptedProvider } from "../../secrets/local-encrypted-provider.js";
 import { logActivity } from "../activity-log.js";
 import { logger } from "../../middleware/logger.js";
+import { startIdleBackoffInterval, type IdleBackoffInterval } from "../idle-backoff.js";
 import { type ApiDispatch } from "./capabilities.js";
 import { PublicMcpDisabledError, type McpPrincipal, type PublicMcpOAuth } from "./oauth.js";
 import { boundedJson, callbackUrl, eventFetch, McpEventError, postEvent, signingKey, verifyCallback, type EventFetch } from "./event-webhooks.js";
@@ -265,10 +266,10 @@ export function createPublicMcpEvents(db: Db, oauth: PublicMcpOAuth, api: ApiDis
     for (const s of active) await enqueue(s);
     for (let i = 0; i < 20; i++) if (!await deliverOne()) break;
   })().finally(() => { running = null; }));
-  let timer: NodeJS.Timeout | undefined;
+  let timer: IdleBackoffInterval | undefined;
   return { subscribe, unsubscribe, tick,
-    start() { if (!timer) { timer = setInterval(() => { void tick().catch(() => logger.warn("Public MCP event delivery tick failed")); }, 2000); timer.unref(); } },
-    async stop() { if (timer) clearInterval(timer); timer = undefined; await running?.catch(() => {}); },
+    start() { if (!timer) { timer = startIdleBackoffInterval(() => { void tick().catch(() => logger.warn("Public MCP event delivery tick failed")); }, 2000); } },
+    async stop() { timer?.stop(); timer = undefined; await running?.catch(() => {}); },
   };
 }
 export type PublicMcpEvents = ReturnType<typeof createPublicMcpEvents>;

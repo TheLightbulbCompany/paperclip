@@ -1,3 +1,4 @@
+import { isServerIdle } from "../services/idle-backoff.js";
 import { supportsLocalAiLogin } from "../services/local-ai-login-policy.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { Router } from "express";
@@ -305,6 +306,22 @@ export function healthRoutes(
         deploymentExposure: opts.deploymentExposure,
         commit,
         warmStandby: true,
+        ...(cloud ? { cloud } : {}),
+        ...(hiddenSettings.length ? { hiddenSettings } : {}),
+      });
+      return;
+    }
+
+    // isol8: an idle server answers the anonymous probe (the ECS container
+    // health check) without SQL, as warm standby does above. Probing SQL every
+    // 30 s kept the pool open and Aurora Serverless v2 from ever pausing.
+    if (!exposeFullDetails && !exposeWorkspaceReadiness && isServerIdle()) {
+      res.json({
+        status: healthStatus,
+        deploymentMode: opts.deploymentMode,
+        deploymentExposure: opts.deploymentExposure,
+        commit,
+        idle: true,
         ...(cloud ? { cloud } : {}),
         ...(hiddenSettings.length ? { hiddenSettings } : {}),
       });

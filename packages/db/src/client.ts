@@ -162,9 +162,11 @@ export interface DatabaseClientOptions {
  * `DATABASE_IDLE_TIMEOUT_SECONDS` says otherwise. The driver default keeps an
  * idle connection open forever, so a process that stops issuing queries still
  * holds every backend it ever opened. Set `DATABASE_IDLE_TIMEOUT_SECONDS=0`
- * to restore the driver default.
+ * to restore the driver default. isol8: 30 s, so an idle server drops to zero
+ * connections well inside Aurora Serverless v2's 300 s auto-pause window
+ * (postgres.js keeps no minimum pool).
  */
-export const DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS = 60;
+export const DEFAULT_DATABASE_IDLE_TIMEOUT_SECONDS = 30;
 /** `application_name` reported to PostgreSQL unless `DATABASE_APPLICATION_NAME` overrides it. */
 export const DEFAULT_DATABASE_APPLICATION_NAME = "paperclip";
 

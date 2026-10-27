@@ -64,6 +64,7 @@ import {
   AGENTMAIL_EVENTS,
   type AgentmailMessage,
 } from "./agentmail-api.js";
+import { startIdleBackoffInterval, type IdleBackoffInterval } from "./idle-backoff.js";
 
 export type EmailActor = {
   userId?: string;
@@ -129,7 +130,7 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
   let stopped = false;
   let ticking = false;
   let activeTick: Promise<void> | null = null;
-  let timer: ReturnType<typeof setInterval> | undefined;
+  let timer: IdleBackoffInterval | undefined;
 
   async function getEndpoint(id: string) {
     const [row] = await db
@@ -2642,16 +2643,15 @@ export function emailChannelService(db: Db, options: EmailChannelOptions) {
     },
     start: () => {
       if (!timer) {
-        timer = setInterval(() => {
+        timer = startIdleBackoffInterval(() => {
           void tick().catch(() => {});
         }, 1000);
-        timer.unref();
         void tick().catch(() => {});
       }
     },
     shutdown: async () => {
       stopped = true;
-      clearInterval(timer);
+      timer?.stop();
       await activeTick;
       const heldSockets = [...sockets.entries()];
       sockets.clear();

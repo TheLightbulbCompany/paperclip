@@ -187,6 +187,7 @@ import { COMPANY_IMPORT_API_PATH } from "./routes/company-import-paths.js";
 import { apiCompression } from "./middleware/api-compression.js";
 import { chatWebhookBodyParser } from "./middleware/chat-webhook-body.js";
 import { createChatWebhookDiagnostics } from "./services/chat-webhook-diagnostics.js";
+import { noteServerActivity, startIdleBackoffInterval, type IdleBackoffInterval } from "./services/idle-backoff.js";
 
 type UiMode = "none" | "static" | "vite-dev";
 const FEEDBACK_EXPORT_FLUSH_INTERVAL_MS = 5_000;
@@ -557,6 +558,12 @@ export async function createApp(
       verify: captureRawBody,
     }),
   );
+  // isol8: every API request except the health probe counts as activity for
+  // the pollers' idle back-off (services/idle-backoff.ts).
+  app.use("/api", (req, _res, next) => {
+    if (!req.path.startsWith("/health")) noteServerActivity();
+    next();
+  });
   app.use("/api", apiCompression());
   app.use(httpLogger);
   const privateHostnameGateEnabled = shouldEnablePrivateHostnameGuard({
@@ -1164,11 +1171,11 @@ export async function createApp(
   jobCoordinator.start();
   scheduler.start();
   let feedbackExportShuttingDown = false;
-  let feedbackExportTimer: ReturnType<typeof setInterval> | null = null;
+  let feedbackExportTimer: IdleBackoffInterval | null = null;
   const disableFeedbackExportFlushes = () => {
     feedbackExportShuttingDown = true;
     if (feedbackExportTimer) {
-      clearInterval(feedbackExportTimer);
+      feedbackExportTimer.stop();
       feedbackExportTimer = null;
     }
   };
@@ -1190,11 +1197,10 @@ export async function createApp(
   };
 
   feedbackExportTimer = opts.feedbackExportService
-    ? setInterval(() => {
+    ? startIdleBackoffInterval(() => {
         void flushPendingFeedbackExports();
       }, FEEDBACK_EXPORT_FLUSH_INTERVAL_MS)
     : null;
-  feedbackExportTimer?.unref?.();
   if (opts.feedbackExportService) {
     void flushPendingFeedbackExports();
   }
@@ -1220,19 +1226,22 @@ export async function createApp(
       logger.error({ err, lane }, `Failed to reconcile chat ${lane}`);
     },
   });
+  // isol8: a live event means something changed, so wake backed-off pollers.
+  const unsubscribeIdleActivitySignals = subscribeAllCompanyLiveEvents(() =>
+    noteServerActivity(),
+  );
   const unsubscribeChatPublicationSignals = subscribeAllCompanyLiveEvents(
     (event) => {
       if (!isWarmStandby() && isChatPublicationCommitSignal(event))
         chatReconciliation.notifyPublications();
     },
   );
-  let chatPublicationTimer: ReturnType<typeof setInterval> | null = setInterval(
+  let chatPublicationTimer: IdleBackoffInterval | null = startIdleBackoffInterval(
     () => {
       if (!isWarmStandby()) chatReconciliation.reconcile();
     },
     CHAT_PUBLICATION_FLUSH_INTERVAL_MS,
   );
-  chatPublicationTimer.unref?.();
   if (!isWarmStandby()) chatReconciliation.reconcile();
   // Abandoned chunked-import spool sweep: hourly (plus once at startup),
   // deleting spool dirs whose transfer saw no activity for 24h and cancelling
@@ -1254,11 +1263,10 @@ export async function createApp(
         );
       });
   };
-  const browserUseTimer = setInterval(() => {
+  const browserUseTimer = startIdleBackoffInterval(() => {
     if (isWarmStandby()) return;
     void browserUse.sweep().catch(() => logger.warn("Browser Use reconciliation failed; retrying."));
   }, 3000);
-  browserUseTimer.unref?.();
   if (!isWarmStandby()) void browserUse.sweep().catch(() => logger.warn("Browser Use startup reconciliation failed; retrying."));
   let importTransferSweepTimer: ReturnType<typeof setInterval> | null =
     setInterval(
@@ -1363,13 +1371,14 @@ export async function createApp(
       jobCoordinator.stop();
       disableFeedbackExportFlushes();
       unsubscribeChatPublicationSignals();
+      unsubscribeIdleActivitySignals();
       chatReconciliation.stop();
       if (chatPublicationTimer) {
-        clearInterval(chatPublicationTimer);
+        chatPublicationTimer.stop();
         chatPublicationTimer = null;
       }
       await chatReconciliation.drain();
-      clearInterval(browserUseTimer);
+      browserUseTimer.stop();
       if (importTransferSweepTimer) {
         clearInterval(importTransferSweepTimer);
         importTransferSweepTimer = null;
