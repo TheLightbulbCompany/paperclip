@@ -9,6 +9,7 @@ import { emailChannelService } from "../services/email-channels.js";
 import { createPluginJobScheduler } from "../services/plugin-job-scheduler.js";
 import { createPublicMcpEvents } from "../services/public-mcp/events.js";
 import type { PublicMcpOAuth } from "../services/public-mcp/oauth.js";
+import { noteServerActivity } from "../services/idle-backoff.js";
 
 const healthOptions = {
   deploymentMode: "authenticated" as const,
@@ -113,7 +114,9 @@ describe("unclaimed Cloud background work", () => {
       await events.tick();
       expect(isEnabled).not.toHaveBeenCalled();
       standby = false;
-      await vi.advanceTimersByTimeAsync(2000);
+      // The claim is an HTTP request, which wakes the backed-off pollers.
+      noteServerActivity();
+      await vi.advanceTimersByTimeAsync(1000);
       expect(isEnabled).toHaveBeenCalledOnce();
     } finally {
       await events.stop();
@@ -139,6 +142,7 @@ describe("unclaimed Cloud background work", () => {
       await vi.advanceTimersByTimeAsync(10 * 60_000);
       expect(select).not.toHaveBeenCalled();
       enabled = true;
+      noteServerActivity();
       await vi.advanceTimersByTimeAsync(1000);
       expect(select.mock.calls.length).toBeGreaterThanOrEqual(2);
     } finally {

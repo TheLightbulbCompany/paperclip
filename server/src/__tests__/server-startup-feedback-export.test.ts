@@ -208,6 +208,14 @@ function buildTestConfig(overrides: Record<string, unknown> = {}) {
   };
 }
 
+// The pollers' idle back-off has its own tests (idle-backoff.test.ts). Here it
+// is a plain setInterval, so these tests can capture the tick callbacks.
+vi.mock("../services/idle-backoff.js", () => ({
+  startIdleBackoffInterval: (tick: () => void, ms: number) => {
+    const handle = setInterval(tick, ms);
+    return { stop: () => clearInterval(handle), currentDelayMs: () => ms };
+  },
+}));
 vi.mock("node:http", () => ({
   createServer: vi.fn(() => fakeServer),
 }));
