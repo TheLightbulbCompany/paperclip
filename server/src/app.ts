@@ -560,8 +560,13 @@ export async function createApp(
   );
   // isol8: every API request except the health probe counts as activity for
   // the pollers' idle back-off (services/idle-backoff.ts).
-  app.use("/api", (req, _res, next) => {
-    if (!req.path.startsWith("/health")) noteServerActivity();
+  // A request also counts when it finishes, so a write that commits during a
+  // health read still invalidates what that read saw.
+  app.use("/api", (req, res, next) => {
+    if (!req.path.startsWith("/health")) {
+      noteServerActivity();
+      res.once("finish", () => noteServerActivity());
+    }
     next();
   });
   app.use("/api", apiCompression());
