@@ -5,3 +5,6 @@ export const DEFAULT_TIMEOUT_SEC = 600;
 export const DEFAULT_EVENT_RECONNECT_MS = 2_000;
 export const DEFAULT_POLL_INTERVAL_MS = 1_000;
 export const STOP_GRACE_MS = 10_000;
+// isol8: a sleeping runtime takes about a minute to wake, and the gateway answers 503 meanwhile.
+export const CREATE_COLD_START_WINDOW_MS = 180_000;
+export const CREATE_COLD_START_RETRY_MS = 5_000;
