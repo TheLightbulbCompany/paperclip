@@ -32,6 +32,9 @@ export interface InstanceGeneralSettings {
   censorUsernameInLogs: boolean;
   feedbackDataSharingPreference: FeedbackDataSharingPreference;
   backupRetention: BackupRetentionPolicy;
+  /** Circuit breaker: auto-pause a routine after N consecutive failed runs (default-on). */
+  autoPauseDefaultEnabled: boolean;
+  autoPauseDefaultThreshold: number;
   /**
    * Execution policy. Absent/`"any"` = unrestricted; `"kubernetes"` forces the
    * Kubernetes sandbox provider and denies local/ssh execution.

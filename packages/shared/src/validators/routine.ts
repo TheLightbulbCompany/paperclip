@@ -12,6 +12,7 @@ import {
 } from "../constants.js";
 import {
   ISSUE_EXECUTION_WORKSPACE_PREFERENCES,
+  issueExecutionPolicySchema,
   issueExecutionWorkspaceSettingsSchema,
 } from "./issue.js";
 import { envConfigSchema } from "./secret.js";
@@ -76,8 +77,13 @@ export const createRoutineSchema = z.object({
   catchUpPolicy: z.enum(ROUTINE_CATCH_UP_POLICIES).optional().default("skip_missed"),
   activityGatePolicy: z.enum(ROUTINE_ACTIVITY_GATE_POLICIES).optional(),
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).optional(),
+  autoPauseEnabled: z.boolean().optional().nullable(),
+  autoPauseThreshold: z.number().int().min(1).max(100).optional().nullable(),
   variables: z.array(routineVariableSchema).optional().default([]),
   env: envConfigSchema.optional().nullable(),
+  // Stamped onto every run issue this routine generates, so routine work can be
+  // reviewed by the same issue execution-stage lifecycle as hand-created work.
+  executionPolicy: issueExecutionPolicySchema.optional().nullable(),
 });
 
 export type CreateRoutine = z.infer<typeof createRoutineSchema>;
@@ -103,9 +109,17 @@ export const routineRevisionSnapshotRoutineV1Schema = z.object({
   catchUpPolicy: z.enum(ROUTINE_CATCH_UP_POLICIES),
   activityGatePolicy: z.enum(ROUTINE_ACTIVITY_GATE_POLICIES).default("always"),
   activityGateScope: z.enum(ROUTINE_ACTIVITY_GATE_SCOPES).default("company"),
+  autoPauseEnabled: z.boolean().nullable().optional(),
+  autoPauseThreshold: z.number().int().min(1).max(100).nullable().optional(),
   variables: z.array(routineVariableSchema),
   env: envConfigSchema.nullable().default(null),
   responsibleUserId: z.string().nullable().default(null),
+  // Omitted (not null) when the routine has no policy, so snapshots of
+  // policy-less routines stay byte-identical to the ones written before this
+  // field existed — `snapshotsMatch` compares JSON.stringify output, and a
+  // stray `"executionPolicy":null` would make every pre-existing revision
+  // look changed and mint a spurious revision on the next edit.
+  executionPolicy: issueExecutionPolicySchema.optional(),
 }).strict();
 
 export const routineRevisionSnapshotTriggerV1Schema = z.object({
@@ -184,5 +198,19 @@ export const runRoutineSchema = z.object({
 
 export type RunRoutine = z.infer<typeof runRoutineSchema>;
 
-export const rotateRoutineTriggerSecretSchema = z.object({});
+export const rotateRoutineTriggerSecretSchema = z.preprocess(
+  // A body-less "rotate to a fresh random secret" POST leaves req.body
+  // undefined; coerce it to {} so an omitted body is accepted (the body — and
+  // the `secret` field within it — are both optional).
+  (value) => value ?? {},
+  z.object({
+    // Optional caller-supplied secret. Omitted -> a fresh random secret is
+    // generated (the default "rotate my secret" behaviour). Supplied -> the
+    // trigger is armed with THIS exact value, for a provider that imposes its
+    // own webhook signing secret (e.g. a Stripe endpoint's whsec_) so its
+    // native signature verifies against it. Restricted to board actors
+    // server-side — agents may not choose a trigger secret.
+    secret: z.string().min(1).max(512).optional(),
+  }),
+);
 export type RotateRoutineTriggerSecret = z.infer<typeof rotateRoutineTriggerSecretSchema>;

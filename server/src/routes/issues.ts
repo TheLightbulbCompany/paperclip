@@ -8,7 +8,7 @@ import { queuedInteractionId, readQueuedInteractionResponse, hasQueuedInteractio
 import { deliverConversationComments, isConversation } from "../services/agent-conversations.js";
 import { issueRecoveryActionReadModel } from "../services/issue-recovery-actions.js";
 import { getExecutionBlocker } from "../services/execution-blocker.js";
-import { requiresExecutionReconciliation } from "@paperclipai/shared";
+import { EXECUTION_RECONCILIATION_CAUSES, requiresExecutionReconciliation } from "@paperclipai/shared";
 import {
   validateExecutionReconciliation,
   markExecutionReconciliation,
@@ -3769,10 +3769,26 @@ export function issueRoutes(
   async function assertCrossIssueInfluenceWithinRunCap(
     req: Request,
     res: Response,
-    issue: { id: string; identifier?: string | null; companyId: string },
+    issue: {
+      id: string;
+      identifier?: string | null;
+      companyId: string;
+      assigneeAgentId?: string | null;
+    },
     kind: CrossIssueInfluenceKind,
   ) {
     if (req.actor.type !== "agent") return true;
+    // isol8: with NO run at all (a Lightbulb room turn on the agent key) there
+    // is no source issue to contain and no run budget to charge, so the agent's
+    // write to the issue it is ASSIGNED is not cross-issue influence. Without
+    // this it could not comment on or update its own issue from a room. Every
+    // other no-run write still fails closed; runs keep the upstream cap as-is.
+    if (
+      !req.actor.runId &&
+      req.actor.agentId &&
+      issue.assigneeAgentId === req.actor.agentId
+    )
+      return true;
     if (!req.actor.agentId || !req.actor.runId)
       throw crossIssueInfluenceRunContextError();
 
@@ -5341,6 +5357,12 @@ export function issueRoutes(
       return true;
     }
     if (issue.status !== "in_progress") {
+      return true;
+    }
+    // isol8: no heartbeat run (a Lightbulb room turn on the agent key). The
+    // run lock protects a LIVE run's checkout; once no live run holds the
+    // issue the assignee may edit it. A live lock still needs that run's id.
+    if (!req.actor.runId?.trim() && !(await svc.hasLiveRunLock(issue.id))) {
       return true;
     }
     const runId = requireAgentRunId(req, res);
@@ -9067,9 +9089,18 @@ export function issueRoutes(
       trigger: "read_projection",
       actor: getActorInfo(req),
     });
+    // Upstream #16169 (carried): a settled hold that still blocks replay is listed, so the
+    // board can see and reconcile it. isol8: the fork has no legacy workspace-recovery schema,
+    // so only the execution-reconciliation arm of upstream's or() applies.
+    const retainedHolds = await db.select().from(issueRecoveryActions).where(and(
+      eq(issueRecoveryActions.companyId, issue.companyId), eq(issueRecoveryActions.sourceIssueId, issue.id),
+      sql`${issueRecoveryActions.evidence}->'automaticRecovery'->>'replay' = 'blocked'`,
+      inArray(issueRecoveryActions.cause, [...EXECUTION_RECONCILIATION_CAUSES]),
+    )).orderBy(desc(issueRecoveryActions.createdAt));
     res.json({
       active,
-      actions: active ? [active] : [],
+      actions: [...(active ? [active] : []), ...retainedHolds
+        .filter(action => action.id !== active?.id).map(issueRecoveryActionReadModel)],
     });
   });
 

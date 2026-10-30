@@ -11,13 +11,34 @@ import {
   agentTaskSessions,
   agentWakeupRequests,
   activityLog,
+  approvalComments,
+  approvals,
+  assets,
+  budgetIncidents,
+  budgetPolicies,
+  companySkillTestRuns,
   costEvents,
+  decisionArchiveNotificationOutbox,
+  decisionBundles,
+  decisionQueueItems,
+  decisionQueues,
+  decisionRetention,
+  decisions,
+  decisionTriage,
+  decisionTriageEvents,
+  financeEvents,
+  goals,
   heartbeatRunEvents,
   heartbeatRuns,
   issueExecutionDecisions,
   issues,
   issueComments,
   principalPermissionGrants,
+  issueThreadInteractions,
+  issueWatchdogs,
+  joinRequests,
+  projects,
+  routines,
 } from "@paperclipai/db";
 import {
   AGENT_DEFAULT_MAX_CONCURRENT_RUNS,
@@ -1085,6 +1106,85 @@ export function agentService(db: Db) {
           .update(issues)
           .set({ assigneeAgentId: null, createdByAgentId: null })
           .where(or(eq(issues.assigneeAgentId, id), eq(issues.createdByAgentId, id)));
+        // Every remaining FK on agents.id has no ON DELETE rule, so each
+        // referencing table must be handled here or the final delete fails
+        // with a constraint violation (the assets FK bit first in prod).
+        // Nullable attribution columns are nulled — the record itself is
+        // business evidence (an asset, an approval, a goal) and outlives its
+        // author. NOT NULL agent columns are operational rows owned by the
+        // agent and are deleted with it.
+        await tx.update(assets).set({ createdByAgentId: null }).where(eq(assets.createdByAgentId, id));
+        await tx
+          .update(approvals)
+          .set({ requestedByAgentId: null })
+          .where(eq(approvals.requestedByAgentId, id));
+        await tx
+          .update(approvalComments)
+          .set({ authorAgentId: null })
+          .where(eq(approvalComments.authorAgentId, id));
+        await tx.update(financeEvents).set({ agentId: null }).where(eq(financeEvents.agentId, id));
+        await tx.update(goals).set({ ownerAgentId: null }).where(eq(goals.ownerAgentId, id));
+        await tx.update(projects).set({ leadAgentId: null }).where(eq(projects.leadAgentId, id));
+        await tx
+          .update(joinRequests)
+          .set({ createdAgentId: null })
+          .where(eq(joinRequests.createdAgentId, id));
+        await tx
+          .update(issueThreadInteractions)
+          .set({ createdByAgentId: null })
+          .where(eq(issueThreadInteractions.createdByAgentId, id));
+        await tx
+          .update(issueThreadInteractions)
+          .set({ resolvedByAgentId: null })
+          .where(eq(issueThreadInteractions.resolvedByAgentId, id));
+        await tx
+          .update(decisionQueues)
+          .set({ createdByAgentId: null })
+          .where(eq(decisionQueues.createdByAgentId, id));
+        await tx
+          .update(decisionQueueItems)
+          .set({ addedByAgentId: null })
+          .where(eq(decisionQueueItems.addedByAgentId, id));
+        await tx
+          .update(decisionTriage)
+          .set({ setByAgentId: null })
+          .where(eq(decisionTriage.setByAgentId, id));
+        await tx
+          .update(decisionTriageEvents)
+          .set({ actorAgentId: null })
+          .where(eq(decisionTriageEvents.actorAgentId, id));
+        await tx
+          .update(decisionRetention)
+          .set({ archivedByAgentId: null })
+          .where(eq(decisionRetention.archivedByAgentId, id));
+        // Decisions carry a NOT NULL origin agent AND a NOT NULL origin run,
+        // so they must go before heartbeatRuns below; their target/effect
+        // children cascade from decisions.id.
+        await tx.delete(decisions).where(eq(decisions.originAgentId, id));
+        await tx.delete(decisionBundles).where(eq(decisionBundles.originAgentId, id));
+        await tx
+          .delete(decisionArchiveNotificationOutbox)
+          .where(eq(decisionArchiveNotificationOutbox.originAgentId, id));
+        await tx.delete(issueWatchdogs).where(eq(issueWatchdogs.watchdogAgentId, id));
+        // Skill Studio test runs carry an ON DELETE RESTRICT agent FK — the
+        // harness rows are operational QA records owned by the executing
+        // agent and go with it (the skill and its versions survive).
+        await tx.delete(companySkillTestRuns).where(eq(companySkillTestRuns.agentId, id));
+        // Budget policies + incidents are scoped by `(scope_type, scope_id)`,
+        // a POLYMORPHIC text pair with no FK to agents.id — so unlike every
+        // other table here the final delete succeeds without clearing them and
+        // the rows are silently orphaned. That is not cosmetic: `budgets
+        // .overview()` resolves each policy's scope and used to throw
+        // notFound("Agent not found") on a dangling one, which 404'd
+        // /dashboard and /sidebar-badges for the whole company, permanently.
+        // Incidents go first — their policy_id references the policy row.
+        await tx
+          .delete(budgetIncidents)
+          .where(and(eq(budgetIncidents.scopeType, "agent"), eq(budgetIncidents.scopeId, id)));
+        await tx
+          .delete(budgetPolicies)
+          .where(and(eq(budgetPolicies.scopeType, "agent"), eq(budgetPolicies.scopeId, id)));
+        await tx.delete(costEvents).where(eq(costEvents.agentId, id));
         await tx.delete(heartbeatRunEvents).where(eq(heartbeatRunEvents.agentId, id));
         await tx.delete(agentTaskSessions).where(eq(agentTaskSessions.agentId, id));
         await tx.delete(activityLog).where(
@@ -1104,6 +1204,11 @@ export function agentService(db: Db) {
           eq(principalPermissionGrants.principalType, "agent"),
           eq(principalPermissionGrants.principalId, id),
         ));
+        // Routines assigned to this agent are its own schedules and cannot run
+        // without it. Their FK has no ON DELETE rule, so they must be cleared
+        // before the agent row or the delete fails with a constraint violation.
+        // routine_runs / routine_triggers / routine_revisions cascade from here.
+        await tx.delete(routines).where(eq(routines.assigneeAgentId, id));
         const deleted = await tx
           .delete(agents)
           .where(eq(agents.id, id))

@@ -41,6 +41,7 @@ import type { PluginJobStore } from "./plugin-job-store.js";
 import type { PluginWorkerManager } from "./plugin-worker-manager.js";
 import { parseCron, nextCronTick, validateCron } from "./cron.js";
 import { logger } from "../middleware/logger.js";
+import { noteServerActivity, startIdleBackoffInterval, type IdleBackoffInterval } from "./idle-backoff.js";
 
 // ---------------------------------------------------------------------------
 // Constants
@@ -221,7 +222,7 @@ export function createPluginJobScheduler(
   // -----------------------------------------------------------------------
 
   /** Timer handle for the tick loop. */
-  let tickTimer: ReturnType<typeof setInterval> | null = null;
+  let tickTimer: IdleBackoffInterval | null = null;
 
   /** Whether the scheduler is running. */
   let running = false;
@@ -278,6 +279,8 @@ export function createPluginJobScheduler(
       }
 
       log.debug({ count: dueJobs.length }, "found due jobs");
+      // isol8: due jobs are work; keep the base cadence while a backlog lasts.
+      noteServerActivity();
 
       // Dispatch each due job (respecting concurrency limits)
       const dispatches: Promise<void>[] = [];
@@ -698,7 +701,7 @@ export function createPluginJobScheduler(
     }
 
     running = true;
-    tickTimer = setInterval(() => {
+    tickTimer = startIdleBackoffInterval(() => {
       void tick();
     }, tickIntervalMs);
 
@@ -712,7 +715,7 @@ export function createPluginJobScheduler(
     // Always clear the timer defensively, even if `running` is already false,
     // to prevent leaked interval timers.
     if (tickTimer !== null) {
-      clearInterval(tickTimer);
+      tickTimer.stop();
       tickTimer = null;
     }
 

@@ -84,7 +84,7 @@ export const agentRuntimeConfigSchema = z.object({
   }
 });
 
-export const createAgentSchema = z.object({
+const createAgentInputSchema = z.object({
   name: z.string().min(1),
   role: z.enum(AGENT_ROLES).optional().default("general"),
   title: z.string().optional().nullable(),
@@ -118,6 +118,13 @@ export const createAgentSchema = z.object({
   onboardingFirstAgent: z.boolean().optional(),
 });
 
+export const createAgentSchema = createAgentInputSchema.extend({
+  // Isol8: agent-create idempotency is an HTTP-header contract. Reject body
+  // aliases so one logical operation cannot carry two competing keys.
+  idempotencyKey: z.never().optional(),
+  idempotencyReplayOnly: z.never().optional(),
+});
+
 export type CreateAgent = z.infer<typeof createAgentSchema>;
 
 export const builtInAgentProvisionSchema = z.object({
@@ -138,7 +145,9 @@ export const builtInAgentResetSchema = z.object({
 
 export type BuiltInAgentReset = z.infer<typeof builtInAgentResetSchema>;
 
-export const createAgentHireSchema = createAgentSchema.extend({
+export const createAgentHireSchema = createAgentInputSchema.extend({
+  idempotencyKey: z.never().optional(),
+  idempotencyReplayOnly: z.never().optional(),
   sourceIssueId: z.string().guid().optional().nullable(),
   sourceIssueIds: z.array(z.string().guid()).optional(),
   // Agent-authored hires may explicitly request the caller's native runner
@@ -149,10 +158,12 @@ export const createAgentHireSchema = createAgentSchema.extend({
 export type CreateAgentHire = z.infer<typeof createAgentHireSchema>;
 
 export const updateAgentSchema = objectWithoutDefaults(
-  createAgentSchema.omit({ permissions: true, onboardingFirstAgent: true }),
+  createAgentInputSchema.omit({ permissions: true, onboardingFirstAgent: true }),
 )
   .partial()
   .extend({
+    idempotencyKey: z.never().optional(),
+    idempotencyReplayOnly: z.never().optional(),
     permissions: z.never().optional(),
     replaceAdapterConfig: z.boolean().optional(),
     status: z.enum(AGENT_STATUSES).optional(),

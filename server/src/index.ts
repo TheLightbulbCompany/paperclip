@@ -17,6 +17,7 @@ import { deliverReconciledExecutions, settleUnrecoverableExecutions } from "./se
 import { reconcileSafeNativeReplacements } from "./services/native-runtime/native-safe-replacement.js";
 import { reconcileAbandonedExecutionControl } from "./services/execution-control-reconciliation.js";
 import { EXECUTION_RECONCILIATION_INTERVAL_MS } from "./services/execution-control-deadline.js";
+import { startIdleBackoffInterval, type IdleBackoffInterval } from "./services/idle-backoff.js";
 import { connectionIntentDeliveryService } from "./services/connection-intent-delivery.js";
 import { existsSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type RequestListener } from "node:http";
@@ -1144,7 +1145,7 @@ async function startServerWithDatabaseTeardown(
     drainRunIds?: string[];
   }>) | null = null;
   let heartbeatSchedulerStopped = false;
-  let heartbeatSchedulerInterval: ReturnType<typeof setInterval> | null = null;
+  let heartbeatSchedulerInterval: IdleBackoffInterval | null = null;
   const heartbeatSchedulerInFlight = new Set<Promise<void>>();
   const trackHeartbeatSchedulerWork = (work: Promise<unknown>) => {
     let tracked: Promise<void>;
@@ -1181,14 +1182,12 @@ async function startServerWithDatabaseTeardown(
         .finally(() => { executionControlSweepsInFlight.delete(queue); }));
     }
   };
-  const executionControlInterval = setInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
-  executionControlInterval.unref?.();
+  const executionControlInterval = startIdleBackoffInterval(sweepExecutionControl, EXECUTION_RECONCILIATION_INTERVAL_MS);
   sweepExecutionControl();
   const startHeartbeatSchedulerInterval = (callback: () => void) => {
-    heartbeatSchedulerInterval = setInterval(() => {
+    heartbeatSchedulerInterval = startIdleBackoffInterval(() => {
       if (!isWarmStandby()) callback();
     }, config.heartbeatSchedulerIntervalMs);
-    heartbeatSchedulerInterval?.unref?.();
   };
   const externalObjects = externalObjectService(db as any, {
     pluginWorkerManager,
@@ -1943,9 +1942,9 @@ async function startServerWithDatabaseTeardown(
     await systemdNotify(["--stopping", `--status=Stopping after ${signal}`]);
     heartbeatSchedulerStopped = true;
     unsubscribeChatCompletions();
-    clearInterval(executionControlInterval);
+    executionControlInterval.stop();
     if (heartbeatSchedulerInterval) {
-      clearInterval(heartbeatSchedulerInterval);
+      heartbeatSchedulerInterval.stop();
       heartbeatSchedulerInterval = null;
     }
 

@@ -1,3 +1,4 @@
+import { isServerIdle, lastServerActivityAt } from "../services/idle-backoff.js";
 import { supportsLocalAiLogin } from "../services/local-ai-login-policy.js";
 import { randomUUID, timingSafeEqual } from "node:crypto";
 import { Router } from "express";
@@ -230,6 +231,9 @@ export function healthRoutes(
     });
   });
 
+  // When bootstrap was last read as ready. Only a request (activity) can change
+  // it, so a reading newer than the last activity still holds.
+  let bootstrapReadyAt: number | null = null;
   router.get("/", async (req, res) => {
     const actorType = "actor" in req ? req.actor?.type : null;
     const exposeFullDetails = shouldExposeFullHealthDetails(
@@ -311,7 +315,14 @@ export function healthRoutes(
       return;
     }
 
-    try {
+    // isol8: an idle server answers the anonymous probe (the ECS container
+    // health check) without SQL. Probing SQL every 30 s kept the pool open and
+    // Aurora Serverless v2 from ever pausing. Only when bootstrap was read as
+    // ready after the last activity, so the bootstrap fields stay true.
+    const readStartedAt = Date.now();
+    const skipSql = bootstrapReadyAt !== null && bootstrapReadyAt >= lastServerActivityAt()
+      && !exposeFullDetails && !exposeWorkspaceReadiness && isServerIdle();
+    if (!skipSql) try {
       await db.execute(sql`SELECT 1`);
     } catch (error) {
       logger.warn({ err: error }, "Health check database probe failed");
@@ -342,7 +353,7 @@ export function healthRoutes(
     // bootstrap_pending forever and lock every managed tenant out at the
     // claim screen. Self-hosted deployments (neither canonical managed signal)
     // are unaffected.
-    if (opts.deploymentMode === "authenticated" && !isCloudManagedInstance(runtimeEnv)) {
+    if (!skipSql && opts.deploymentMode === "authenticated" && !isCloudManagedInstance(runtimeEnv)) {
       const roleCount = await db
         .select({ count: count() })
         .from(instanceUserRoles)
@@ -369,6 +380,7 @@ export function healthRoutes(
     }
 
     const persistedDevServerStatus = readPersistedDevServerStatus();
+    if (!skipSql) bootstrapReadyAt = bootstrapStatus === "ready" ? readStartedAt : null;
     let devServer: ReturnType<typeof toDevServerHealthStatus> | undefined;
     if (exposeDevServerDetails && persistedDevServerStatus && typeof (db as { select?: unknown }).select === "function") {
       const instanceSettings = instanceSettingsService(db);

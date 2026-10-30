@@ -1,4 +1,5 @@
 import { AgentAvatar } from "@/components/AgentAvatar";
+import { singleReviewerPolicyEditable } from "@/lib/issue-execution-policy";
 import { useMemo, useState } from "react";
 import {
   ArrowRight,
@@ -224,6 +225,47 @@ export function OverviewSection({
               );
             }}
           />
+          <span>reviewed by</span>
+          {!singleReviewerPolicyEditable(routine.executionPolicy) ? (
+            // This single-select can only express one agent reviewer, so saving
+            // it over an API-set multi-stage or multi-participant policy would
+            // silently delete the rest. Render the fact read-only instead.
+            <span className="rounded bg-muted/50 px-2 py-1 text-muted-foreground">
+              Review policy managed via API
+            </span>
+          ) : (
+          <InlineEntitySelector
+            value={editDraft.reviewerAgentId}
+            options={assigneeOptions}
+            recentOptionIds={recentAssigneeIds}
+            placeholder="Reviewer"
+            noneLabel="No reviewer"
+            searchPlaceholder="Search reviewers..."
+            emptyMessage="No reviewers found."
+            onChange={(reviewerAgentId) => setEditDraft((current) => ({ ...current, reviewerAgentId }))}
+            renderTriggerValue={(option) => {
+              const reviewer = option ? agentById.get(option.id) : null;
+              return option ? (
+                <>
+                  {reviewer ? <AgentAvatar agent={reviewer} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/> : null}
+                  <span className="truncate">{option.label}</span>
+                </>
+              ) : (
+                <span className="text-muted-foreground">Reviewer</span>
+              );
+            }}
+            renderOption={(option) => {
+              if (!option.id) return <span className="truncate">{option.label}</span>;
+              const reviewer = agentById.get(option.id);
+              return (
+                <>
+                  {reviewer ? <AgentAvatar agent={reviewer} size={16} className="h-3.5 w-3.5 shrink-0 text-muted-foreground"/> : null}
+                  <span className="truncate">{option.label}</span>
+                </>
+              );
+            }}
+          />
+          )}
         </div>
       </div>
 

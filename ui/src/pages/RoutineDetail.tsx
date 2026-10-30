@@ -67,10 +67,18 @@ import {
   RunsSection,
 } from "../components/routine-sections/operate-sections";
 import type {
+  IssueExecutionPolicy,
   RoutineDetail as RoutineDetailType,
   RoutineEnvConfig,
   RoutineVariable,
 } from "@paperclipai/shared";
+import {
+  buildExecutionPolicy,
+  principalFromSelectionValue,
+  selectionValueFromPrincipal,
+  singleReviewerPolicyEditable,
+  stageParticipantValues,
+} from "../lib/issue-execution-policy";
 
 export function buildRoutineProjectOptions(
   projects: ReadonlyArray<{ id: string; name: string; description?: string | null; archivedAt?: Date | string | null }>,
@@ -109,13 +117,39 @@ function getLocalTimezone(): string {
   }
 }
 
-function buildRoutineMutationPayload(input: RoutineEditDraft) {
+/** The single review-stage agent a routine's execution policy names, if any. */
+export function routineReviewerAgentId(policy: IssueExecutionPolicy | null | undefined): string {
+  return principalFromSelectionValue(stageParticipantValues(policy, "review")[0] ?? "")?.agentId ?? "";
+}
+
+export function buildRoutineMutationPayload(input: RoutineEditDraft, existingPolicy: IssueExecutionPolicy | null) {
+  const { reviewerAgentId, ...rest } = input;
+  // Omit executionPolicy entirely unless the reviewer actually changed — an
+  // absent key means "leave the policy alone", so a title edit does not rewrite
+  // the policy or churn a new revision out of freshly minted stage ids.
+  // (buildExecutionPolicy is what guarantees the API-only fields survive a
+  // reviewer change; this only keeps unrelated edits off the field at all.)
+  const reviewerChanged = reviewerAgentId !== routineReviewerAgentId(existingPolicy)
+    && singleReviewerPolicyEditable(existingPolicy);
   return {
-    ...input,
+    ...rest,
     description: input.description.trim() || null,
     projectId: input.projectId || null,
     assigneeAgentId: input.assigneeAgentId || null,
     env: input.env && Object.keys(input.env).length > 0 ? input.env : null,
+    ...(reviewerChanged
+      ? {
+        // existingPolicy still carries the approval stage through — this form
+        // has no control for it, so it must not drop it either.
+        executionPolicy: buildExecutionPolicy({
+          existingPolicy,
+          reviewerValues: reviewerAgentId
+            ? [selectionValueFromPrincipal({ type: "agent", agentId: reviewerAgentId, userId: null })]
+            : [],
+          approverValues: stageParticipantValues(existingPolicy, "approval"),
+        }),
+      }
+      : {}),
   };
 }
 
@@ -144,6 +178,7 @@ export function RoutineDetail() {
     description: "",
     projectId: "",
     assigneeAgentId: "",
+    reviewerAgentId: "",
     priority: "medium",
     concurrencyPolicy: "coalesce_if_active",
     catchUpPolicy: "skip_missed",
@@ -248,6 +283,7 @@ export function RoutineDetail() {
             description: routine.description ?? "",
             projectId: routine.projectId ?? "",
             assigneeAgentId: routine.assigneeAgentId ?? "",
+            reviewerAgentId: routineReviewerAgentId(routine.executionPolicy),
             priority: routine.priority,
             concurrencyPolicy: routine.concurrencyPolicy,
             catchUpPolicy: routine.catchUpPolicy,
@@ -271,6 +307,9 @@ export function RoutineDetail() {
     }
     if (editDraft.assigneeAgentId !== routineDefaults.assigneeAgentId) {
       result.push({ key: "assigneeAgentId", label: "the default agent" });
+    }
+    if (editDraft.reviewerAgentId !== routineDefaults.reviewerAgentId) {
+      result.push({ key: "reviewerAgentId", label: "the reviewer" });
     }
     if (editDraft.priority !== routineDefaults.priority) {
       result.push({ key: "priority", label: "the priority" });
@@ -362,7 +401,7 @@ export function RoutineDetail() {
 
   const saveRoutine = useMutation({
     mutationFn: () => {
-      const payload = buildRoutineMutationPayload(editDraft);
+      const payload = buildRoutineMutationPayload(editDraft, routine?.executionPolicy ?? null);
       const baseRevisionId = routine?.latestRevisionId ?? null;
       return routinesApi.update(routineId!, {
         ...payload,
@@ -379,7 +418,15 @@ export function RoutineDetail() {
       ]);
     },
     onError: (mutationError) => {
-      if (mutationError instanceof ApiError && mutationError.status === 409) {
+      // Only a REVISION conflict is "someone else edited this" — its body
+      // carries details.currentRevisionId. Other 409s (e.g. a terminated or
+      // cross-company reviewer, code "agent_not_assignable") must not latch
+      // the reload-and-discard-draft UI: the draft is exactly what the user
+      // needs to correct, so surface the server's message instead.
+      const errorBody = mutationError instanceof ApiError && mutationError.body && typeof mutationError.body === "object"
+        ? (mutationError.body as { details?: { currentRevisionId?: unknown } })
+        : null;
+      if (mutationError instanceof ApiError && mutationError.status === 409 && errorBody?.details?.currentRevisionId) {
         setSaveConflict(true);
         pushToast({
           title: "Routine changed",
@@ -639,6 +686,7 @@ export function RoutineDetail() {
         description: response.routine.description ?? "",
         projectId: response.routine.projectId ?? "",
         assigneeAgentId: response.routine.assigneeAgentId ?? "",
+        reviewerAgentId: routineReviewerAgentId(response.routine.executionPolicy),
         priority: response.routine.priority,
         concurrencyPolicy: response.routine.concurrencyPolicy,
         catchUpPolicy: response.routine.catchUpPolicy,
@@ -899,6 +947,26 @@ export function RoutineDetail() {
                   : "w-full"
             }
           >
+            {routine.status === "paused" && routine.autoPausedAt ? (
+              <div className="mb-6 flex w-full items-start gap-3 rounded-md border border-(--status-agent-paused)/40 bg-(--status-agent-paused)/10 px-4 py-3 text-sm">
+                <AlertCircle className="mt-0.5 h-4 w-4 shrink-0 text-(--status-agent-paused)" />
+                <div className="flex-1">
+                  <p className="font-medium text-foreground">Automatically paused after repeated failures</p>
+                  <p className="text-muted-foreground">
+                    This routine failed {routine.consecutiveFailureCount} runs in a row and was paused to
+                    stop a pile-up. Fix the underlying issue, then resume.
+                  </p>
+                </div>
+                <button
+                  type="button"
+                  disabled={automationToggleDisabled}
+                  onClick={() => updateRoutineStatus.mutate("active")}
+                  className="shrink-0 rounded-md border border-border px-3 py-1.5 text-xs font-medium hover:bg-muted disabled:opacity-50"
+                >
+                  Resume
+                </button>
+              </div>
+            ) : null}
             <h2 id="routine-section-title" className="mb-4 text-lg font-semibold">
               {SECTION_TITLES[section]}
             </h2>
