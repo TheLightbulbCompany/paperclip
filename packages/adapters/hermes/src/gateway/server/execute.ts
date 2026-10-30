@@ -18,6 +18,8 @@ import {
   DEFAULT_EVENT_RECONNECT_MS,
   DEFAULT_POLL_INTERVAL_MS,
   DEFAULT_TIMEOUT_SEC,
+  CREATE_COLD_START_RETRY_MS,
+  CREATE_COLD_START_WINDOW_MS,
   STOP_GRACE_MS,
 } from "../shared/constants.js";
 import {
@@ -523,6 +525,31 @@ async function delay(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
+// isol8: the gateway answers 502/503/504 while a sleeping runtime wakes (Lightbulb's run facade can
+// wait 25 s of the minute that takes), and the run's single try used to end there, leaving the issue
+// blocked with no retry and no notice. Idempotency-Key is the Paperclip run id, so a repeat is one run.
+const COLD_START_STATUSES = new Set([502, 503, 504]);
+
+async function createRunThroughColdStart(
+  ctx: AdapterExecutionContext,
+  url: string,
+  init: RequestInit,
+  signal: AbortSignal,
+): Promise<unknown> {
+  const deadline = Date.now() + CREATE_COLD_START_WINDOW_MS;
+  for (;;) {
+    try {
+      return await fetchJson(url, init);
+    } catch (err) {
+      const status = (err as HermesHttpError).status;
+      if (!status || !COLD_START_STATUSES.has(status) || signal.aborted || Date.now() >= deadline) throw err;
+      await ctx.onLog("stdout", `[hermes-gateway] runtime not ready (HTTP ${status}); retrying the create\n`);
+      await delay(CREATE_COLD_START_RETRY_MS, signal);
+      if (signal.aborted) throw err;
+    }
+  }
+}
+
 async function pollStatus(input: {
   ctx: AdapterExecutionContext;
   baseUrl: URL;
@@ -935,12 +962,12 @@ async function executeTurn(ctx: AdapterExecutionContext): Promise<AdapterExecuti
     // remote create request is its dispatch boundary. Report it before the
     // request can block so continuation gates may release their issue lock.
     ctx.onDispatch?.();
-    const created = await fetchJson(createRunUrl, {
+    const created = await createRunThroughColdStart(ctx, createRunUrl, {
       method: "POST",
       headers: runHeaders,
       body: JSON.stringify(body),
       signal: createSignal,
-    });
+    }, createSignal);
     runId = extractRunId(created);
     if (!runId) {
       return {

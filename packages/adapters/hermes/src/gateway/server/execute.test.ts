@@ -8,6 +8,8 @@ import { testEnvironment } from "./test.js";
 vi.mock("../shared/constants.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../shared/constants.js")>()),
   STOP_GRACE_MS: 200,
+  CREATE_COLD_START_WINDOW_MS: 400,
+  CREATE_COLD_START_RETRY_MS: 10,
 }));
 
 function makeCtx(config: Record<string, unknown>): AdapterExecutionContext {
@@ -582,6 +584,55 @@ describe("execute", () => {
     expect(result.exitCode).toBe(0);
     expect(result.summary).toBe("polled done");
     expect(fetchMock.mock.calls.some(([input]) => String(input).endsWith("/v1/runs/run-hermes-1"))).toBe(true);
+  });
+
+  it("retries a create the gateway answers 503 while the runtime wakes, with the same idempotency key", async () => {
+    let creates = 0;
+    const keys: unknown[] = [];
+    const fetchMock = vi.fn(async (input: RequestInfo | URL, init?: RequestInit) => {
+      const url = String(input);
+      if (url.endsWith("/v1/runs")) {
+        creates += 1;
+        keys.push(new Headers(init?.headers).get("Idempotency-Key"));
+        if (creates < 3) return new Response(JSON.stringify({ error: "waking" }), { status: 503 });
+        return new Response(JSON.stringify({ run_id: "run-hermes-1", status: "started" }), { status: 200 });
+      }
+      if (url.endsWith("/events")) return new Response("no stream", { status: 503 });
+      return new Response(JSON.stringify({ status: "completed", output: "done", session_id: "s" }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await execute(makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key", timeoutSec: 5, pollIntervalMs: 50 }));
+    expect(result.exitCode).toBe(0);
+    expect(creates).toBe(3);
+    expect(new Set(keys)).toEqual(new Set(["pc-run-1"]));
+  });
+
+  it("gives up on a create still answering 503 after the wake window, as a transient failure", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: "down" }), { status: 503 }));
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await execute(makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key" }));
+    expect(result.errorCode).toBe("hermes_gateway_upstream_error");
+    expect(result.errorFamily).toBe("transient_upstream");
+    expect(fetchMock.mock.calls.length).toBeGreaterThan(1);
+  });
+
+  it("does not retry a create refused outright", async () => {
+    const fetchMock = vi.fn(async () => new Response(JSON.stringify({ error: "nope" }), { status: 500 }));
+    vi.stubGlobal("fetch", fetchMock);
+    await execute(makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key" }));
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("stops retrying a create when the run is cancelled", async () => {
+    const abort = new AbortController();
+    const fetchMock = vi.fn(async () => {
+      abort.abort();
+      return new Response(JSON.stringify({ error: "waking" }), { status: 503 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await execute({ ...makeCtx({ apiBaseUrl: "http://127.0.0.1:8642", apiKey: "secret-key" }), signal: abort.signal });
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    expect(result.errorCode).toBe("hermes_gateway_cancelled");
   });
 
   it("maps HTTP auth failures", async () => {
